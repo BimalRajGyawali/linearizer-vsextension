@@ -101,8 +101,11 @@
     const flow = flowMap.get(parentId);
     const isExpanded = state.expandedParents.has(parentId);
     const title = extractDisplayName(parentId);
+    const tooltip = escapeAttribute(parentId);
     const chips = flow && Array.isArray(flow.sequence) && flow.sequence.length
-      ? '<div class="sequence-chips">' + flow.sequence.map((entry) => '<span class="chip">' + escapeHtml(extractDisplayName(entry)) + '</span>').join('') + '</div>'
+      ? '<div class="sequence-chips">' + flow.sequence
+        .map((entry) => '<span class="chip" title="' + escapeAttribute(entry) + '">' + escapeHtml(extractDisplayName(entry)) + '</span>')
+        .join('') + '</div>'
       : '';
     const body = isExpanded
       ? fn
@@ -112,7 +115,7 @@
 
     return '<article class="parent-block" data-parent-id="' + escapeAttribute(parentId) + '">' +
       '<header class="parent-header">' +
-      '<button type="button" class="parent-toggle" data-action="toggle-parent" data-parent="' + escapeAttribute(parentId) + '">' +
+      '<button type="button" class="parent-toggle" data-action="toggle-parent" data-parent="' + escapeAttribute(parentId) + '" title="' + tooltip + '">' +
       '<span class="chevron ' + (isExpanded ? 'open' : '') + '"></span>' +
       '<span class="parent-title">' + escapeHtml(title) + '</span>' +
       '</button>' +
@@ -188,8 +191,9 @@
             const callKey = context.functionId + '::' + context.lineIndex + '::' + targetId + '::' + callIndex;
             const isOpen = state.expandedCalls.has(callKey);
             const displayName = extractDisplayName(targetId);
+            const tooltip = escapeAttribute(targetId);
             calls.push({ callKey, targetId, displayName });
-            htmlParts.push('<button type="button" class="call-link ' + (isOpen ? 'is-open' : '') + '" data-action="toggle-call" data-call="' + escapeAttribute(callKey) + '">' +
+            htmlParts.push('<button type="button" class="call-link ' + (isOpen ? 'is-open' : '') + '" data-action="toggle-call" data-call="' + escapeAttribute(callKey) + '" title="' + tooltip + '">' +
               '<span class="tok tok-call">' + escapeHtml(token.value) + '</span>' +
               '</button>');
             callIndex += 1;
@@ -389,9 +393,23 @@
     if (typeof identifier !== 'string') {
       return '';
     }
-    const trimmed = identifier.startsWith('/') ? identifier.slice(1) : identifier;
-    const parts = trimmed.split('::');
-    return parts.length > 1 ? parts[parts.length - 1] : trimmed;
+    const trimmed = identifier.trim();
+    if (!trimmed) {
+      return '';
+    }
+    const withoutPrefix = trimmed.startsWith('/') ? trimmed.slice(1) : trimmed;
+    const parts = withoutPrefix.split('::');
+    if (parts.length > 1) {
+      const candidate = parts[parts.length - 1].trim();
+      if (candidate.length > 0) {
+        return candidate;
+      }
+    }
+    const lastSlash = withoutPrefix.lastIndexOf('/');
+    if (lastSlash >= 0 && lastSlash < withoutPrefix.length - 1) {
+      return withoutPrefix.slice(lastSlash + 1);
+    }
+    return withoutPrefix;
   }
 
   function normalisePath(value) {

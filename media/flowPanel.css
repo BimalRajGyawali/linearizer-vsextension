@@ -20,6 +20,7 @@ h2 {
   font-size: 1.2rem;
   margin-top: 32px;
   margin-bottom: 12px;
+  font-weight: 600;
 }
 
 .changed-list {
@@ -161,38 +162,41 @@ h2 {
 .code-block {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
   font-family: var(--vscode-editor-font-family, monospace);
   font-size: var(--vscode-editor-font-size, 12px);
   background: var(--vscode-editor-background);
   border: 1px solid var(--vscode-editorWidget-border);
   border-radius: 6px;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
+  box-shadow: inset 0 0 0 1px var(--vscode-editor-background);
 }
 
 .code-line {
-  display: flex;
-  gap: 12px;
-  padding: 4px 10px;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 12px;
   align-items: flex-start;
-}
-
-.code-line:nth-child(odd) {
-  background: rgba(255, 255, 255, 0.02);
+  padding: 2px 12px;
 }
 
 .line-number {
-  width: 48px;
+  min-width: 44px;
   text-align: right;
-  color: var(--vscode-descriptionForeground);
+  color: var(--vscode-editorLineNumber-foreground, var(--vscode-descriptionForeground));
+  background: var(--vscode-editorGutter-background, transparent);
+  padding-right: 8px;
+  border-right: 1px solid var(--vscode-editorWidget-border);
   user-select: none;
 }
 
 .code-snippet {
-  flex: 1;
   white-space: pre;
-  color: var(--vscode-foreground);
+  color: var(--vscode-editor-foreground, var(--vscode-foreground));
+  tab-size: 4;
 }
+
 
 .nested-block {
   margin-left: 32px;
@@ -234,32 +238,32 @@ h2 {
 }
 
 .tok-kw {
-  color: #c792ea;
+  color: var(--vscode-symbolIcon-keywordForeground, #c792ea);
   font-weight: 600;
 }
 
 .tok-builtin {
-  color: #ffcb8b;
+  color: var(--vscode-symbolIcon-functionForeground, #ffcb8b);
 }
 
 .tok-str {
-  color: #ecc48d;
+  color: var(--vscode-symbolIcon-stringForeground, #ecc48d);
 }
 
 .tok-num {
-  color: #f78c6c;
+  color: var(--vscode-symbolIcon-numberForeground, #f78c6c);
 }
 
 .tok-comment {
-  color: #637777;
+  color: var(--vscode-editorCodeLens-foreground, #637777);
   font-style: italic;
 }
 
 .tok-def-name {
-  color: #82aaff;
+  color: var(--vscode-symbolIcon-methodForeground, #82aaff);
   font-weight: 600;
 }
 
 .tok-call {
-  color: #7fdbca;
+  color: var(--vscode-textLink-foreground, #7fdbca);
 }

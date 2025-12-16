@@ -64,7 +64,7 @@ export function activate(context: vscode.ExtensionContext) {
 			outputChannel.clear();
 			renderChangedFunctions(outputChannel, changedFunctions);
 			renderWarnings(outputChannel, warnings);
-			showFlowPanel(context, repoRoot, changedFunctions, flows, warnings, functionBodies);
+			await showFlowPanel(context, repoRoot, changedFunctions, flows, warnings, functionBodies);
 
 			const quickPickItems = changedFunctions.map((entry) => ({
 				label: buildFunctionLabel(entry),
@@ -132,16 +132,17 @@ function buildFunctionLabel(entry: ChangedFunction): string {
 	return entry.functionName;
 }
 
-function showFlowPanel(
+async function showFlowPanel(
 	context: vscode.ExtensionContext,
 	repoRoot: string,
 	changedFunctions: ChangedFunction[],
 	flows: FlowEntry[],
 	warnings: string[],
 	functionBodies: Record<string, FunctionBody>,
-): void {
+): Promise<void> {
 	currentRepoRoot = repoRoot;
-	currentFunctionBodies = functionBodies;
+	const hydratedFunctionBodies = await hydrateFunctionBodies(repoRoot, functionBodies);
+	currentFunctionBodies = hydratedFunctionBodies;
 
 	if (!flowPanel) {
 		flowPanel = vscode.window.createWebviewPanel(
@@ -184,7 +185,7 @@ function showFlowPanel(
 			changedFunctions,
 			flows,
 			warnings,
-			functionBodies,
+			hydratedFunctionBodies,
 		);
 
 		flowPanelMessageDisposable = flowPanel.webview.onDidReceiveMessage(async (message) => {
@@ -219,11 +220,12 @@ function buildFlowWebviewHtml(
 	const changedList = changedFunctions.length
 		? `<ul class="changed-list">${changedFunctions
 				.map((fn) => {
-					const label = escapeHtml(buildFunctionLabel(fn));
+					const label = escapeHtml(extractDisplayNameFromId(fn.id, fn.functionName));
+					const tooltip = escapeAttribute(buildFunctionLabel(fn));
 					const hasBody = Boolean(functionBodies[fn.id]?.body?.length);
 					const interaction = hasBody
-						? `<button type="button" class="fn-trigger" data-action="scroll-parent" data-target="${escapeAttribute(fn.id)}"><span class="fn-name">${label}</span></button>`
-						: `<span class="fn-trigger disabled"><span class="fn-name">${label}</span></span>`;
+						? `<button type="button" class="fn-trigger" title="${tooltip}" data-action="scroll-parent" data-target="${escapeAttribute(fn.id)}"><span class="fn-name">${label}</span></button>`
+						: `<span class="fn-trigger disabled" title="${tooltip}"><span class="fn-name">${label}</span></span>`;
 					const meta = `<small>${escapeHtml(fn.file)}:${fn.line}</small>`;
 					return `<li>${interaction}${meta}</li>`;
 				})
@@ -299,6 +301,75 @@ function serialiseForScript(value: unknown): string {
 function getNonce(): string {
 	const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 	return Array.from({ length: 32 }, () => possible.charAt(Math.floor(Math.random() * possible.length))).join('');
+}
+
+async function hydrateFunctionBodies(
+	repoRoot: string,
+	original: Record<string, FunctionBody>,
+): Promise<Record<string, FunctionBody>> {
+	const entries = await Promise.all(
+		Object.entries(original).map(async ([id, body]) => {
+			if (!body || typeof body !== 'object') {
+				return [id, body] as const;
+			}
+			const relativeFile = body.file;
+			if (!relativeFile) {
+				return [id, body] as const;
+			}
+			let document: vscode.TextDocument;
+			try {
+				document = await vscode.workspace.openTextDocument(
+					vscode.Uri.file(path.join(repoRoot, relativeFile)),
+				);
+			} catch {
+				return [id, body] as const;
+			}
+
+			const fallbackText = typeof body.body === 'string' ? body.body : '';
+			const lineCount = Math.max(fallbackText.split(/\r?\n/).length, 1);
+			const startLine = Math.max((body.line ?? 1) - 1, 0);
+			const endLine = Math.min(startLine + lineCount, document.lineCount);
+			const range = new vscode.Range(
+				new vscode.Position(startLine, 0),
+				new vscode.Position(endLine, 0),
+			);
+			const extracted = document.getText(range).replace(/\r\n/g, '\n');
+			const normalised = extracted.endsWith('\n') ? extracted.slice(0, -1) : extracted;
+
+			return [
+				id,
+				{
+					...body,
+					body: normalised || fallbackText,
+				},
+			] as const;
+		}),
+	);
+
+	return Object.fromEntries(entries);
+}
+
+function extractDisplayNameFromId(identifier: string, fallback: string): string {
+	const trimmed = identifier.trim();
+	if (!trimmed) {
+		return fallback;
+	}
+	const withoutPrefix = trimmed.startsWith('/') ? trimmed.slice(1) : trimmed;
+	const parts = withoutPrefix.split('::');
+	if (parts.length > 1) {
+		const candidate = parts[parts.length - 1].trim();
+		if (candidate.length > 0) {
+			return candidate;
+		}
+	}
+	const lastSlash = withoutPrefix.lastIndexOf('/');
+	if (lastSlash >= 0 && lastSlash < withoutPrefix.length - 1) {
+		const candidate = withoutPrefix.slice(lastSlash + 1);
+		if (candidate.length > 0) {
+			return candidate;
+		}
+	}
+	return withoutPrefix || fallback;
 }
 
 function resolveFunctionBody(identifier: string): FunctionBody | undefined {
