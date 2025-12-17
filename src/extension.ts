@@ -217,24 +217,11 @@ function buildFlowWebviewHtml(
 	warnings: string[],
 	functionBodies: Record<string, FunctionBody>,
 ): string {
-	const changedList = changedFunctions.length
-		? `<ul class="changed-list">${changedFunctions
-				.map((fn) => {
-					const label = escapeHtml(extractDisplayNameFromId(fn.id, fn.functionName));
-					const tooltip = escapeAttribute(buildFunctionLabel(fn));
-					const hasBody = Boolean(functionBodies[fn.id]?.body?.length);
-					const interaction = hasBody
-						? `<button type="button" class="fn-trigger" title="${tooltip}" data-action="scroll-parent" data-target="${escapeAttribute(fn.id)}"><span class="fn-name">${label}</span></button>`
-						: `<span class="fn-trigger disabled" title="${tooltip}"><span class="fn-name">${label}</span></span>`;
-					const meta = `<small>${escapeHtml(fn.file)}:${fn.line}</small>`;
-					return `<li>${interaction}${meta}</li>`;
-				})
-				.join('')}</ul>`
-		: '<p class="placeholder">No changed Python functions detected.</p>';
-
-	const warningMarkup = warnings.length
-		? `<ul class="warnings">${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join('')}</ul>`
-		: '<p class="placeholder">No warnings.</p>';
+	const warningsSection = warnings.length
+		? `<section class="warnings-section"><h2>Warnings</h2><ul class="warnings">${warnings
+				.map((warning) => `<li>${escapeHtml(warning)}</li>`)
+				.join('')}</ul></section>`
+		: '';
 
 	const payload = {
 		changedFunctions,
@@ -257,20 +244,9 @@ function buildFlowWebviewHtml(
 		<link rel="stylesheet" href="${stylesUri}" />
 	</head>
 	<body>
-		<main>
-			<h1>Linearizer summary</h1>
-			<section>
-				<h2>Changed functions</h2>
-				${changedList}
-			</section>
-			<section>
-				<h2>Call flows</h2>
-				<div id="flow-root" class="flow-root" data-state="idle"></div>
-			</section>
-			<section>
-				<h2>Warnings</h2>
-				${warningMarkup}
-			</section>
+		<main class="layout">
+			<div id="flow-root" class="flow-root" data-state="idle"></div>
+			${warningsSection}
 		</main>
 		<script nonce="${nonce}">window.__INITIAL_DATA__ = ${serialiseForScript(payload)};</script>
 		<script nonce="${nonce}" src="${scriptUri}"></script>

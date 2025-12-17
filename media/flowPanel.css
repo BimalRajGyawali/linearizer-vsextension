@@ -5,21 +5,18 @@ body {
   margin: 0;
 }
 
-main {
+.layout {
   padding: 24px;
   max-width: 960px;
   margin: 0 auto;
-}
-
-h1 {
-  font-size: 1.4rem;
-  margin-bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
 }
 
 h2 {
   font-size: 1.2rem;
-  margin-top: 32px;
-  margin-bottom: 12px;
+  margin: 0 0 12px;
   font-weight: 600;
 }
 
@@ -79,6 +76,11 @@ h2 {
 .placeholder.mini {
   font-size: 0.85rem;
   margin: 4px 0;
+}
+
+.warnings-section {
+  border-top: 1px solid var(--vscode-editorWidget-border);
+  padding-top: 12px;
 }
 
 .warnings {
