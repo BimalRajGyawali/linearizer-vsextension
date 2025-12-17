@@ -492,20 +492,17 @@
       const lineClass = isTracerLine ? 'code-line tracer-active' : 'code-line';
       const callTargetAttr = formatted.calls.length === 1 ? ' data-call-target="' + escapeAttribute(formatted.calls[0].targetId) + '"' : '';
       
-      html += '<div class="' + lineClass + '">' +
-        '<button type="button" class="line-number" data-action="trace-line" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '"' + callTargetAttr + ' title="Click to execute up to this line">' + lineNumber + '</button>' +
-        '<span class="code-snippet">' + codeHtml + '</span>';
-      
       // Inline variable display (code-like execution view)
+      let inlineVarsHtml = '';
       if (regularEvents.length > 0 && !hasError) {
         const latestEvent = regularEvents[regularEvents.length - 1];
         const vars = pickVarsForLine(line, latestEvent.locals, latestEvent.globals);
         if (vars && vars.length > 0) {
-          html += '<div class="tracer-inline-vars">';
+          inlineVarsHtml = '<div class="tracer-inline-vars">';
           vars.forEach(function(v, idx) {
             const valueStr = formatValue(v.value);
             const valueType = getValueType(v.value);
-            html += '<span class="tracer-var-item">' +
+            inlineVarsHtml += '<span class="tracer-var-item">' +
               (v.isGlobal ? '<span class="tracer-var-global">global </span>' : '') +
               '<span class="tracer-var-name">' + escapeHtml(v.key) + '</span>' +
               '<span class="tracer-var-equals"> = </span>' +
@@ -513,11 +510,17 @@
               (idx < vars.length - 1 ? '<span class="tracer-var-separator"> </span>' : '') +
               '</span>';
           });
-          html += '</div>';
+          inlineVarsHtml += '</div>';
         }
       }
       
-      html += '</div>';
+      html += '<div class="' + lineClass + '">' +
+        '<button type="button" class="line-number" data-action="trace-line" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '"' + callTargetAttr + ' title="Click to execute up to this line">' + lineNumber + '</button>' +
+        '<div class="code-snippet-wrapper">' +
+        '<span class="code-snippet">' + codeHtml + '</span>' +
+        inlineVarsHtml +
+        '</div>' +
+        '</div>';
       
       // Error display (below line)
       if (errorEvents.length > 0) {

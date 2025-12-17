@@ -178,7 +178,7 @@ h2 {
 .code-line {
   position: relative;
   display: grid;
-  grid-template-columns: auto 1fr;
+  grid-template-columns: auto 1fr auto;
   column-gap: 12px;
   align-items: flex-start;
   padding: 2px 12px;
@@ -226,12 +226,23 @@ h2 {
   background: var(--vscode-list-activeSelectionBackground, rgba(128, 128, 128, 0.2));
 }
 
+.code-snippet-wrapper {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
 .code-snippet {
   white-space: pre;
   color: var(--vscode-editor-foreground, var(--vscode-foreground));
   tab-size: 4;
   position: relative;
   z-index: 1;
+  min-width: 0;
+  overflow: visible;
+  flex-shrink: 0;
 }
 
 
@@ -322,7 +333,6 @@ h2 {
 }
 
 .tracer-inline-vars {
-  margin-left: 12px;
   display: inline-flex;
   align-items: center;
   flex-wrap: wrap;
@@ -330,12 +340,9 @@ h2 {
   font-family: var(--vscode-editor-font-family, monospace);
   font-size: 12px;
   line-height: 1.4;
-  vertical-align: baseline;
-}
-
-.tracer-var-item {
-  display: inline;
+  padding-left: 8px;
   white-space: nowrap;
+  vertical-align: baseline;
 }
 
 .tracer-var-global {
