@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
+import { spawn, ChildProcess } from 'node:child_process';
+import * as fs from 'node:fs/promises';
 import {
   analyzeWithPython,
   ChangedFunction,
@@ -7,11 +9,422 @@ import {
   FunctionBody,
   resolveRepoRoot,
 } from './changedFunctions';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { log } from 'node:console';
+
+const execFileAsync = promisify(execFile);
 
 let flowPanel: vscode.WebviewPanel | undefined;
 let flowPanelMessageDisposable: vscode.Disposable | undefined;
 let currentFunctionBodies: Record<string, FunctionBody> = {};
 let currentRepoRoot: string | undefined;
+let activeTracer: TracerManager | undefined;
+let tracerOutputChannel: vscode.OutputChannel | undefined;
+
+interface TracerEvent {
+	event: string;
+	filename?: string;
+	function?: string;
+	line?: number;
+	locals?: Record<string, unknown>;
+	globals?: Record<string, unknown>;
+	error?: string;
+	traceback?: string;
+}
+
+interface TraceCallArgs {
+	args?: unknown[];
+	kwargs?: Record<string, unknown>;
+}
+
+interface NormalisedCallArgs {
+	args: unknown[];
+	kwargs: Record<string, unknown>;
+}
+
+const DEFAULT_PARENT_CALL_ARGS: NormalisedCallArgs = {
+	args: [],
+	kwargs: { metric_name: 'test', period: 'last_7_days' },
+};
+
+function isTraceCallArgs(value: unknown): value is TraceCallArgs {
+	if (!value || typeof value !== 'object') {
+		return false;
+	}
+	const candidate = value as TraceCallArgs;
+	const argsValid = !('args' in candidate) || Array.isArray(candidate.args);
+	const kwargsValid =
+		!('kwargs' in candidate) ||
+		(typeof candidate.kwargs === 'object' && candidate.kwargs !== null && !Array.isArray(candidate.kwargs));
+	return argsValid && kwargsValid;
+}
+
+function normaliseCallArgs(input?: TraceCallArgs): NormalisedCallArgs {
+	const args = input && Array.isArray(input.args) ? input.args : [];
+	const kwargs = input && input.kwargs && typeof input.kwargs === 'object' && !Array.isArray(input.kwargs)
+		? input.kwargs
+		: {};
+	return {
+		args: [...args],
+		kwargs: { ...kwargs } as Record<string, unknown>,
+	};
+}
+
+function cloneCallArgs(args: NormalisedCallArgs): NormalisedCallArgs {
+	return {
+		args: [...args.args],
+		kwargs: { ...args.kwargs },
+	};
+}
+
+class TracerManager {
+	private process: ChildProcess | undefined;
+	private outputChannel: vscode.OutputChannel;
+	private webview: vscode.Webview | undefined;
+	private currentFlow: string | undefined; // Track which function is currently being traced
+	private stderrBuffer: string = '';
+	private eventQueue: TracerEvent[] = [];
+	private pendingReadResolve: ((value: TracerEvent) => void) | undefined;
+	private pendingReadReject: ((error: Error) => void) | undefined;
+	private pendingDisplayLine: number | undefined;
+	private pendingDisplayFile: string | undefined;
+	private currentDisplayLine: number | undefined;
+	private currentDisplayFile: string | undefined;
+
+	constructor(outputChannel: vscode.OutputChannel, webview?: vscode.Webview) {
+		this.outputChannel = outputChannel;
+		this.webview = webview;
+	}
+
+	setWebview(webview?: vscode.Webview): void {
+		this.webview = webview;
+	}
+
+	private decorateEvent(event: TracerEvent): TracerEvent {
+		const decorated = { ...event };
+		const targetLine =
+			typeof this.pendingDisplayLine === 'number'
+				? this.pendingDisplayLine
+				: this.currentDisplayLine;
+		const targetFile = this.pendingDisplayFile ?? this.currentDisplayFile;
+
+		if (decorated.event === 'line') {
+			if (typeof targetLine === 'number') {
+				decorated.line = targetLine;
+			}
+			if (targetFile && !decorated.filename) {
+				decorated.filename = targetFile;
+			}
+		}
+		if (decorated.event === 'error') {
+			if (typeof targetLine === 'number' && typeof decorated.line !== 'number') {
+				decorated.line = targetLine;
+			}
+			if (targetFile && !decorated.filename) {
+				decorated.filename = targetFile;
+			}
+		}
+		return decorated;
+	}
+
+	private clearPendingDisplay(): void {
+		this.pendingDisplayLine = undefined;
+		this.pendingDisplayFile = undefined;
+	}
+
+	private processIncomingEvent(rawEvent: TracerEvent): void {
+		const decorated = this.decorateEvent(rawEvent);
+
+		if (this.pendingReadResolve) {
+			const resolver = this.pendingReadResolve;
+			this.pendingReadResolve = undefined;
+			this.pendingReadReject = undefined;
+			resolver(decorated);
+			this.clearPendingDisplay();
+		} else {
+			this.eventQueue.push(decorated);
+		}
+
+		this.emitTracerEvent(decorated);
+	}
+
+	private spawnTracer(
+		repoRoot: string,
+		entryFullId: string,
+		stopLine: number,
+		argsJson: string,
+		extensionPath: string,
+		pythonPath: string,
+	): void {
+		const tracerPath = path.join(extensionPath, 'python', 'tracer.py');
+
+		this.outputChannel.appendLine(`[Rust-like] Spawning tracer for ${entryFullId} at line ${stopLine}`);
+		this.outputChannel.show(true);
+
+		const args = [
+			'-u',
+			tracerPath,
+			'--repo_root', repoRoot,
+			'--entry_full_id', entryFullId,
+			'--args_json', argsJson,
+			'--stop_line', stopLine.toString(),
+		];
+
+		this.process = spawn(pythonPath, args, {
+			cwd: repoRoot,
+			stdio: ['pipe', 'pipe', 'pipe'],
+			env: {
+				...process.env,
+				PYTHONUNBUFFERED: '1',
+			},
+		});
+
+		this.stderrBuffer = '';
+		this.eventQueue = [];
+
+		// Handle stderr data - accumulate and parse JSON lines
+		this.process.stderr?.on('data', (data: Buffer) => {
+			const text = data.toString();
+			this.stderrBuffer += text;
+			
+			// Try to parse complete JSON lines
+			const lines = this.stderrBuffer.split('\n');
+			this.stderrBuffer = lines.pop() || '';
+			
+			for (const line of lines) {
+				if (line.trim()) {
+					try {
+						const rawEvent: TracerEvent = JSON.parse(line);
+						this.processIncomingEvent(rawEvent);
+					} catch {
+						// Not JSON, just log it
+						this.outputChannel.appendLine(`[Tracer] ${line}`);
+					}
+				}
+			}
+		});
+
+		this.process.stdout?.on('data', (data: Buffer) => {
+			this.outputChannel.appendLine(`[Tracer stdout] ${data.toString()}`);
+		});
+
+		this.process.on('error', (error) => {
+			this.outputChannel.appendLine(`[Tracer error] ${error.message}`);
+			if (this.pendingReadReject) {
+				this.pendingReadReject(new Error(error.message));
+				this.pendingReadResolve = undefined;
+				this.pendingReadReject = undefined;
+			}
+			if (this.webview) {
+				this.webview.postMessage({
+					type: 'tracer-error',
+					error: error.message,
+				});
+			}
+		});
+
+		this.process.on('exit', (code) => {
+			this.outputChannel.appendLine(`[Tracer] Process exited with code ${code}`);
+			if (this.pendingReadReject) {
+				this.pendingReadReject(new Error(`Python process exited with code ${code}`));
+				this.pendingReadResolve = undefined;
+				this.pendingReadReject = undefined;
+			}
+			this.process = undefined;
+			this.currentFlow = undefined;
+			this.clearPendingDisplay();
+			this.currentDisplayLine = undefined;
+			this.currentDisplayFile = undefined;
+		});
+	}
+
+	async getTracerData(
+		repoRoot: string,
+		entryFullId: string,
+		displayLine: number,
+		displayFile: string | undefined,
+		argsJson: string,
+		extensionPath: string,
+		pythonPath: string,
+	): Promise<TracerEvent> {
+		const firstTime = this.process === undefined;
+		const needsNewTracer = this.currentFlow !== entryFullId;
+
+		this.pendingDisplayLine = displayLine;
+		this.pendingDisplayFile = displayFile;
+		this.currentDisplayLine = displayLine;
+		this.currentDisplayFile = displayFile;
+
+		// Spawn tracer if not alive
+		if (firstTime) {
+			this.outputChannel.appendLine(`[Rust-like] First time - spawning tracer`);
+			this.currentFlow = entryFullId;
+			this.spawnTracer(repoRoot, entryFullId, displayLine + 1, argsJson, extensionPath, pythonPath);
+		}
+
+		// If new flow detected, kill old tracer and spawn new one
+		if (needsNewTracer && this.process) {
+			this.outputChannel.appendLine(
+				`[Rust-like] New flow detected (old: ${this.currentFlow}, new: ${entryFullId}), spawning new tracer`
+			);
+			
+			// Kill the old tracer process
+			if (this.process.stdin) {
+				this.process.stdin.write('0\n');
+			}
+			this.process.kill();
+			try {
+				this.process.kill('SIGTERM');
+				// Wait a bit for graceful shutdown
+				await new Promise(resolve => setTimeout(resolve, 100));
+				if (this.process && !this.process.killed) {
+					this.process.kill('SIGKILL');
+				}
+			} catch {
+				// Ignore errors
+			}
+			
+			// Spawn new tracer for the new function
+			this.currentFlow = entryFullId;
+			this.spawnTracer(repoRoot, entryFullId, displayLine + 1, argsJson, extensionPath, pythonPath);
+		}
+
+		// Determine if this is the first call for this tracer
+		const isFirstCall = firstTime || needsNewTracer;
+
+		// Send continue command if not first call
+		if (!isFirstCall && this.process && this.process.stdin && !this.process.stdin.destroyed) {
+			this.outputChannel.appendLine(`[Rust-like] Sending continue_to ${displayLine + 1}`);
+			this.process.stdin.write(`${displayLine + 1}\n`);
+		} else {
+			this.outputChannel.appendLine(`[Rust-like] First call for this function — Python will send initial event`);
+		}
+
+		// Read from stderr (Python writes events to stderr)
+		// Check if process is still alive before reading
+		if (this.process) {
+			const status = this.process.killed ? 'killed' : null;
+			if (status) {
+				throw new Error(`Python process was killed before reading event`);
+			}
+		}
+
+		// If there's already an event queued, return it immediately
+		if (this.eventQueue.length > 0) {
+			const queued = this.eventQueue.shift() as TracerEvent;
+			this.clearPendingDisplay();
+			return queued;
+		}
+
+		// Wait for event from stderr (async read)
+		return new Promise<TracerEvent>((resolve, reject) => {
+			const resolveWrapper = (event: TracerEvent) => {
+				clearTimeout(timeout);
+				resolve(event);
+			};
+
+			const rejectWrapper = (error: Error) => {
+				clearTimeout(timeout);
+				reject(error);
+				this.clearPendingDisplay();
+			};
+
+			// Set timeout (30 seconds like Python)
+			const timeout = setTimeout(() => {
+				if (this.pendingReadResolve === resolveWrapper) {
+					this.pendingReadResolve = undefined;
+					this.pendingReadReject = undefined;
+				}
+				reject(new Error(`Timeout waiting for function to reach line ${displayLine + 1}`));
+			}, 30000);
+
+			this.pendingReadResolve = resolveWrapper;
+			this.pendingReadReject = rejectWrapper;
+
+			// Check if we already have data in buffer
+			if (this.stderrBuffer) {
+				const lines = this.stderrBuffer.split('\n');
+				for (const line of lines) {
+					if (line.trim()) {
+						try {
+							const rawEvent: TracerEvent = JSON.parse(line);
+							this.processIncomingEvent(rawEvent);
+							clearTimeout(timeout);
+							return;
+						} catch {
+							// Not JSON, continue
+						}
+					}
+				}
+			}
+		});
+	}
+
+	private emitTracerEvent(event: TracerEvent): void {
+		if (event.event === 'line') {
+			this.outputChannel.appendLine(
+				`[Line ${event.line}] Function: ${event.function || 'unknown'}`
+			);
+			
+			if (event.locals) {
+				this.outputChannel.appendLine('  Locals:');
+				for (const [key, value] of Object.entries(event.locals)) {
+					this.outputChannel.appendLine(`    ${key} = ${JSON.stringify(value)}`);
+				}
+			}
+
+			if (event.globals) {
+				this.outputChannel.appendLine('  Globals:');
+				for (const [key, value] of Object.entries(event.globals)) {
+					this.outputChannel.appendLine(`    ${key} = ${JSON.stringify(value)}`);
+				}
+			}
+
+			if (this.webview) {
+				this.webview.postMessage({
+					type: 'tracer-event',
+					event: event,
+				});
+			}
+		} else if (event.event === 'error') {
+			this.outputChannel.appendLine(`[Tracer Error] ${event.error || 'Unknown error'}`);
+			if (event.traceback) {
+				this.outputChannel.appendLine(event.traceback);
+			}
+			if (this.webview) {
+				this.webview.postMessage({
+					type: 'tracer-error',
+					error: event.error || 'Unknown error',
+					traceback: event.traceback,
+					line: event.line,
+					filename: event.filename,
+				});
+			}
+		}
+	}
+
+	stop(): void {
+		if (this.process) {
+			if (this.process.stdin && !this.process.stdin.destroyed) {
+				this.process.stdin.write('0\n');
+			}
+			this.process.kill();
+			this.process = undefined;
+			this.currentFlow = undefined;
+		}
+		if (this.pendingReadReject) {
+			this.pendingReadReject(new Error('Tracer stopped'));
+			this.pendingReadResolve = undefined;
+			this.pendingReadReject = undefined;
+		}
+		this.stderrBuffer = '';
+		this.eventQueue = [];
+		this.clearPendingDisplay();
+		this.currentDisplayLine = undefined;
+		this.currentDisplayFile = undefined;
+	}
+}
 
 export function activate(context: vscode.ExtensionContext) {
 	const outputChannel = vscode.window.createOutputChannel('Linearizer');
@@ -47,6 +460,8 @@ export function activate(context: vscode.ExtensionContext) {
 		if (!selectedFolder) {
 			return;
 		}
+
+		console.log(`[extension] Analyzing folder: ${selectedFolder.name} at ${selectedFolder.uri.fsPath}`);
 
 		try {
 			const repoRoot = await resolveRepoRoot(selectedFolder.uri.fsPath);
@@ -95,7 +510,12 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(disposable);
 }
 
-export function deactivate() {}
+export function deactivate() {
+	if (activeTracer) {
+		activeTracer.stop();
+		activeTracer = undefined;
+	}
+}
 
 function renderChangedFunctions(channel: vscode.OutputChannel, changedFunctions: ChangedFunction[]): void {
 	channel.appendLine(`Changed Python functions (${changedFunctions.length})`);
@@ -158,6 +578,10 @@ async function showFlowPanel(
 		context.subscriptions.push(flowPanel);
 		flowPanel.onDidDispose(
 			() => {
+				if (activeTracer) {
+					activeTracer.stop();
+					activeTracer = undefined;
+				}
 				flowPanel = undefined;
 				currentFunctionBodies = {};
 				currentRepoRoot = undefined;
@@ -192,6 +616,7 @@ async function showFlowPanel(
 			if (!message || typeof message !== 'object') {
 				return;
 			}
+			console.log('[extension] Received message:', message.type);
 			if (message.type === 'open-source' && typeof message.identifier === 'string') {
 				const details = resolveFunctionBody(message.identifier);
 				if (!details || !currentRepoRoot) {
@@ -203,6 +628,22 @@ async function showFlowPanel(
 				const targetPosition = new vscode.Position(Math.max(details.line - 1, 0), 0);
 				editor.selection = new vscode.Selection(targetPosition, targetPosition);
 				editor.revealRange(new vscode.Range(targetPosition, targetPosition), vscode.TextEditorRevealType.InCenter);
+			} else if (message.type === 'trace-line' && typeof message.functionId === 'string' && typeof message.line === 'number') {
+				console.log('[extension] Handling trace-line:', message.functionId, message.line);
+				try {
+					const callArgs = isTraceCallArgs(message.callArgs) ? message.callArgs : undefined;
+					const stopLineCandidate = typeof message.stopLine === 'number' ? message.stopLine : message.line + 1;
+					const stopLine = Number.isFinite(stopLineCandidate) ? stopLineCandidate : message.line + 1;
+					await handleTraceLine(message.functionId, message.line, stopLine, context, callArgs);
+				} catch (error) {
+					console.error('[extension] Error in handleTraceLine:', error);
+					vscode.window.showErrorMessage(`Error tracing line: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			} else if (message.type === 'stop-trace') {
+				if (activeTracer) {
+					activeTracer.stop();
+					activeTracer = undefined;
+				}
 			}
 		});
 		context.subscriptions.push(flowPanelMessageDisposable);
@@ -403,4 +844,178 @@ function normaliseIdentifier(identifier: string): string {
 	const [file, func = ''] = withoutPrefix.split('::');
 	const normalisedFile = file.replace(/\\+/g, '/').replace(/^\.\//, '');
 	return `${normalisedFile}::${func}`.toLowerCase();
+}
+
+async function getPythonPath(): Promise<string> {
+	const config = vscode.workspace.getConfiguration('linearizer');
+	const configured = config.get<string>('pythonPath');
+	if (configured && configured.trim().length > 0) {
+		return configured.trim();
+	}
+	// Try common Python executables
+	const candidates = process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python'];
+	for (const candidate of candidates) {
+		try {
+			await execFileAsync(candidate, ['--version']);
+			return candidate;
+		} catch {
+			// Continue to next candidate
+		}
+	}
+	throw new Error('Python executable not found. Please configure linearizer.pythonPath');
+}
+
+async function getFunctionSignature(
+	pythonPath: string,
+	repoRoot: string,
+	entryFullId: string,
+	extensionPath: string,
+): Promise<{ params: string[]; param_count: number } | null> {
+	const tracerPath = path.join(extensionPath, 'python', 'tracer.py');
+
+	try {
+		await fs.access(tracerPath);
+	} catch {
+		return null;
+	}
+
+	try {
+		const { stdout } = await execFileAsync(pythonPath, [
+			tracerPath,
+			'--repo_root', repoRoot,
+			'--entry_full_id', entryFullId,
+			'--get_signature',
+		], { cwd: repoRoot });
+		
+		const result = JSON.parse(stdout);
+		if (result.error) {
+			return null;
+		}
+		return result;
+	} catch {
+		return null;
+	}
+}
+
+async function handleTraceLine(
+	functionId: string,
+	displayLine: number,
+	stopLine: number,
+	context: vscode.ExtensionContext,
+	callArgs?: TraceCallArgs,
+): Promise<void> {
+	if (!currentRepoRoot) {
+		vscode.window.showErrorMessage('No repository root available');
+		return;
+	}
+
+	const functionBody = resolveFunctionBody(functionId);
+	if (!functionBody) {
+		vscode.window.showErrorMessage(`Function ${functionId} not found`);
+		return;
+	}
+
+	const executionLine = Number.isFinite(stopLine) ? stopLine : displayLine + 1;
+
+	try {
+		const pythonPath = await getPythonPath();
+		const entryFullId = functionId.startsWith('/') ? functionId.slice(1) : functionId;
+		let resolvedArgs = callArgs ? normaliseCallArgs(callArgs) : cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+		let argsJson: string;
+
+		if (callArgs) {
+			argsJson = JSON.stringify(resolvedArgs);
+		} else {
+			const signature = await getFunctionSignature(pythonPath, currentRepoRoot, entryFullId, context.extensionPath);
+			const defaultJson = JSON.stringify(resolvedArgs);
+			if (signature && signature.params.length > 0) {
+				const paramInput = await vscode.window.showInputBox({
+					prompt: `Enter function arguments as JSON (params: ${signature.params.join(', ')}). Example: {"args": [1, 2], "kwargs": {"key": "value"}}`,
+					placeHolder: defaultJson,
+					value: defaultJson,
+				});
+
+				if (paramInput === undefined) {
+					return; // User cancelled
+				}
+
+				if (paramInput.trim()) {
+					try {
+						const parsed = JSON.parse(paramInput);
+						if (!isTraceCallArgs(parsed)) {
+							throw new Error('Invalid argument structure');
+						}
+						resolvedArgs = normaliseCallArgs(parsed);
+					} catch {
+						vscode.window.showErrorMessage('Invalid JSON format for arguments');
+						return;
+					}
+				} else {
+					resolvedArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+				}
+			}
+			argsJson = JSON.stringify(resolvedArgs);
+		}
+
+		// Create or reuse tracer
+		if (!tracerOutputChannel) {
+			tracerOutputChannel = vscode.window.createOutputChannel('Linearizer Tracer');
+		}
+		if (!activeTracer) {
+			activeTracer = new TracerManager(tracerOutputChannel, flowPanel?.webview);
+		}
+		// Update webview reference in case it changed
+		activeTracer.setWebview(flowPanel?.webview);
+		
+		try {
+			const event = await activeTracer.getTracerData(
+				currentRepoRoot,
+				entryFullId,
+				displayLine,
+				functionBody.file,
+				argsJson,
+				context.extensionPath,
+				pythonPath,
+			);
+
+			if (event.event === 'error') {
+				const errorMessage = event.error || 'Unknown tracer error';
+				vscode.window.showErrorMessage(`Tracer error: ${errorMessage}`);
+				return;
+			}
+
+			
+			if (flowPanel?.webview) {
+				// Ensure we only send one event with the exact displayLine
+				// Override any line number from the tracer to match the clicked line
+				const finalEvent = {
+					...event,
+					line: displayLine, // Always use the clicked line, not the tracer's line
+					filename: event.filename ?? functionBody.file,
+				};
+				flowPanel.webview.postMessage({
+					type: 'tracer-event',
+					event: finalEvent,
+				});
+			}
+
+			vscode.window.showInformationMessage(`Tracer reached line ${displayLine} in ${functionId}`);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			vscode.window.showErrorMessage(`Tracer error: ${message}`);
+			
+			// Send error event to webview
+			if (flowPanel?.webview) {
+				flowPanel.webview.postMessage({
+					type: 'tracer-error',
+					error: message,
+					line: displayLine,
+					filename: functionBody.file,
+				});
+			}
+		}
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		vscode.window.showErrorMessage(`Failed to start tracer: ${message}`);
+	}
 }
