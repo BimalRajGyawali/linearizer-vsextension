@@ -117,6 +117,7 @@ class TracerManager {
 
 	private decorateEvent(event: TracerEvent): TracerEvent {
 		const decorated = { ...event };
+		// Always prefer pendingDisplayLine, then currentDisplayLine
 		const targetLine =
 			typeof this.pendingDisplayLine === 'number'
 				? this.pendingDisplayLine
@@ -124,6 +125,8 @@ class TracerManager {
 		const targetFile = this.pendingDisplayFile ?? this.currentDisplayFile;
 
 		if (decorated.event === 'line') {
+			// ALWAYS override line number with targetLine if available
+			// This ensures the clicked line is always used, not the tracer's reported line
 			if (typeof targetLine === 'number') {
 				decorated.line = targetLine;
 			}
@@ -132,7 +135,8 @@ class TracerManager {
 			}
 		}
 		if (decorated.event === 'error') {
-			if (typeof targetLine === 'number' && typeof decorated.line !== 'number') {
+			// For errors, use targetLine if event doesn't have a line, or always override
+			if (typeof targetLine === 'number') {
 				decorated.line = targetLine;
 			}
 			if (targetFile && !decorated.filename) {
@@ -149,6 +153,11 @@ class TracerManager {
 
 	private processIncomingEvent(rawEvent: TracerEvent): void {
 		const decorated = this.decorateEvent(rawEvent);
+		
+		// Log for debugging first click issues
+		if (decorated.event === 'line') {
+			this.outputChannel.appendLine(`[processIncomingEvent] Decorated event: line=${decorated.line}, pendingDisplayLine=${this.pendingDisplayLine}, currentDisplayLine=${this.currentDisplayLine}, originalLine=${rawEvent.line}`);
+		}
 
 		if (this.pendingReadResolve) {
 			const resolver = this.pendingReadResolve;
@@ -156,11 +165,12 @@ class TracerManager {
 			this.pendingReadReject = undefined;
 			resolver(decorated);
 			this.clearPendingDisplay();
+			// Don't emit to webview here - handleTraceLine will send it with the correct line number
 		} else {
 			this.eventQueue.push(decorated);
+			// Only emit to webview if there's no pending resolver (queued events)
+			this.emitTracerEvent(decorated);
 		}
-
-		this.emitTracerEvent(decorated);
 	}
 
 	private spawnTracer(
