@@ -656,6 +656,60 @@ async function showFlowPanel(
 				const targetPosition = new vscode.Position(Math.max(details.line - 1, 0), 0);
 				editor.selection = new vscode.Selection(targetPosition, targetPosition);
 				editor.revealRange(new vscode.Range(targetPosition, targetPosition), vscode.TextEditorRevealType.InCenter);
+			} else if (message.type === 'reveal-function-file' && typeof message.functionId === 'string') {
+				// Reveal the file containing the function in the explorer
+				try {
+					let functionId = message.functionId;
+					console.log('[extension] Revealing function file for:', functionId);
+					
+					// Try to resolve the function body - resolveFunctionBody handles normalization
+					let details = resolveFunctionBody(functionId);
+					
+					// If not found, try adding leading slash (function IDs are stored with leading slash)
+					if (!details && !functionId.startsWith('/')) {
+						functionId = '/' + functionId;
+						console.log('[extension] Retrying with leading slash:', functionId);
+						details = resolveFunctionBody(functionId);
+					}
+					
+					if (!details || !currentRepoRoot) {
+						console.log('[extension] Could not resolve function body or repo root:', { 
+							originalFunctionId: message.functionId,
+							triedFunctionId: functionId,
+							details, 
+							currentRepoRoot,
+							availableKeys: Object.keys(currentFunctionBodies).slice(0, 10)
+						});
+						return;
+					}
+					
+					console.log('[extension] Resolved function body:', { file: details.file, line: details.line, id: details.id });
+					// details.file is already a relative path like "backend/services/analytics.py"
+					const filePath = details.file.startsWith('/') ? details.file.slice(1) : details.file;
+					const fullPath = path.join(currentRepoRoot, filePath);
+					const targetUri = vscode.Uri.file(fullPath);
+					console.log('[extension] Target URI:', targetUri.fsPath);
+					
+					// Verify file exists before revealing
+					try {
+						await fs.access(fullPath);
+						// Try revealing in explorer - this command should work even if file isn't open
+						await vscode.commands.executeCommand('revealInExplorer', targetUri);
+						console.log('[extension] Successfully revealed file in explorer');
+					} catch (error) {
+						console.error('[extension] File does not exist or cannot be accessed:', fullPath, error);
+						// Fallback: try to open the file first, then reveal
+						try {
+							const document = await vscode.workspace.openTextDocument(targetUri);
+							await vscode.window.showTextDocument(document, { preview: true });
+							await vscode.commands.executeCommand('revealInExplorer', targetUri);
+						} catch (fallbackError) {
+							console.error('[extension] Fallback also failed:', fallbackError);
+						}
+					}
+				} catch (error) {
+					console.error('[extension] Error in reveal-function-file handler:', error);
+				}
 			} else if (message.type === 'trace-line' && typeof message.functionId === 'string' && typeof message.line === 'number') {
 				console.log('[extension] Handling trace-line:', message.functionId, message.line);
 				try {

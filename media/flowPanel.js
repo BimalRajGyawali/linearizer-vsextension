@@ -312,8 +312,9 @@
       }
     } else if (action === 'toggle-call') {
       const call = target.getAttribute('data-call');
+      const targetId = target.getAttribute('data-target-id');
       if (call) {
-        toggleCall(call);
+        toggleCall(call, targetId);
       }
     } else if (action === 'open-source') {
       const identifier = target.getAttribute('data-target');
@@ -403,11 +404,19 @@
     render();
   }
 
-  function toggleCall(callKey) {
-    if (state.expandedCalls.has(callKey)) {
+  function toggleCall(callKey, targetFunctionId) {
+    const wasExpanded = state.expandedCalls.has(callKey);
+    if (wasExpanded) {
       state.expandedCalls.delete(callKey);
     } else {
       state.expandedCalls.add(callKey);
+      // Use the targetFunctionId passed as parameter instead of parsing callKey
+      // (callKey contains :: which conflicts with function IDs that also contain ::)
+      if (targetFunctionId) {
+        console.log('[flowPanel] Expanding call, targetFunctionId:', targetFunctionId);
+        // Send message to extension to reveal file in explorer
+        vscode.postMessage({ type: 'reveal-function-file', functionId: targetFunctionId });
+      }
     }
     render();
   }
@@ -604,7 +613,7 @@
             const displayName = extractDisplayName(targetId);
             const tooltip = escapeAttribute(targetId);
             calls.push({ callKey, targetId, displayName });
-            htmlParts.push('<button type="button" class="call-link ' + (isOpen ? 'is-open' : '') + '" data-action="toggle-call" data-call="' + escapeAttribute(callKey) + '" title="' + tooltip + '">' +
+            htmlParts.push('<button type="button" class="call-link ' + (isOpen ? 'is-open' : '') + '" data-action="toggle-call" data-call="' + escapeAttribute(callKey) + '" data-target-id="' + escapeAttribute(targetId) + '" title="' + tooltip + '">' +
               '<span class="tok tok-call">' + escapeHtml(token.value) + '</span>' +
               '</button>');
             callIndex += 1;
