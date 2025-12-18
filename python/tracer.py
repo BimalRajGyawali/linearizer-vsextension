@@ -205,6 +205,50 @@ def extract_call_arguments(repo_root: str, entry_full_id: str, call_line: int, l
                     log(f"Error evaluating keyword argument {key}: {e}", "WARNING")
                     kwargs_dict[key] = None
         
+        # Get the function signature to filter arguments to only those the function accepts
+        # We MUST get the signature to filter arguments correctly - otherwise we might pass
+        # arguments that the function doesn't accept
+        sig_result = get_function_signature(repo_root, entry_full_id)
+        if "error" not in sig_result:
+            accepted_params = set(sig_result.get("params", []))
+            log(f"Function accepts parameters: {accepted_params}")
+            
+            # Filter keyword arguments to only include those the function accepts
+            # This is the main fix: don't pass kwargs that the function doesn't accept
+            original_kwargs_keys = set(kwargs_dict.keys())
+            filtered_kwargs = {k: v for k, v in kwargs_dict.items() if k in accepted_params}
+            filtered_out_kwargs = original_kwargs_keys - set(filtered_kwargs.keys())
+            if filtered_out_kwargs:
+                log(f"Filtered out keyword arguments not accepted by function: {filtered_out_kwargs}")
+            
+            # Also check if any positional arguments should be converted to keyword arguments
+            # if they match parameter names (though this is less common)
+            
+            # For positional arguments, limit to the number of parameters the function has
+            # We want to be careful here: if there are more positional args than parameters,
+            # and some parameters are already provided as keywords, we need to account for that
+            num_total_params = len(accepted_params)
+            # Count how many positional params are NOT already in kwargs
+            positional_params_not_in_kwargs = [p for p in sig_result.get("params", []) if p not in filtered_kwargs]
+            max_positional = len(positional_params_not_in_kwargs)
+            
+            # Limit positional arguments to what the function can accept
+            if len(args_list) > max_positional:
+                log(f"Limiting positional arguments from {len(args_list)} to {max_positional} (function has {num_total_params} params, {len(filtered_kwargs)} provided as kwargs)")
+                filtered_args = args_list[:max_positional]
+            else:
+                filtered_args = args_list
+            
+            args_list = filtered_args
+            kwargs_dict = filtered_kwargs
+            log(f"Filtered arguments to match function signature: args={args_list}, kwargs={kwargs_dict}")
+        else:
+            # If we can't get the signature, we can't safely filter arguments
+            # Return an error rather than using unfiltered arguments
+            error_msg = sig_result.get('error', 'unknown error')
+            log(f"ERROR: Could not get function signature to filter arguments: {error_msg}", "ERROR")
+            return {"error": f"Could not get function signature to filter arguments: {error_msg}"}
+        
         result = {
             "args": {"args": args_list, "kwargs": kwargs_dict}
         }
@@ -230,71 +274,91 @@ class PersistentDebugger(bdb.Bdb):
         self.thread_exception = None  # Store exceptions from the debugger thread
 
     def user_line(self, frame):
-        lineno = frame.f_lineno
-        fname = os.path.abspath(frame.f_code.co_filename)
-        log(f"user_line called: line {lineno} in {fname}")
-        # Only stop for the main target file
-        if fname != self.target_file:
-            log(f"Skipping line {lineno} (not in target file {self.target_file})")
+        try:
+            lineno = frame.f_lineno
+            fname = os.path.abspath(frame.f_code.co_filename)
+            log(f"user_line called: line {lineno} in {fname}")
+            funcname = frame.f_code.co_name
+            
+            # Check if we're in the target function
+            in_target_function = self.target_function is None or funcname == self.target_function
+            
+            # Handle case where target_file might be None (shouldn't happen, but be safe)
+            if self.target_file is None:
+                log(f"WARNING: target_file is None, accepting line {lineno} in {fname}")
+                # Accept the line and set target_file (this should only happen in edge cases)
+                self.target_file = fname
+            # Only accept lines from the target file, OR if we're in the target function
+            # (this allows stepping through nested functions in different files)
+            elif fname != self.target_file:
+                # If we're in the target function but in a different file, update target_file
+                # to allow stepping through this nested function
+                if in_target_function and self.target_function is not None:
+                    log(f"Switching target_file from {self.target_file} to {fname} (target function {self.target_function} in different file)")
+                    self.target_file = fname
+                else:
+                    log(f"Skipping line {lineno} (not in target file {self.target_file}, not in target function {self.target_function})")
+                    return
+            locals_snapshot = {k: safe_json(v) for k, v in frame.f_locals.items()}
+            
+            # Capture only user-declared globals from the current file
+            globals_snapshot = {}
+            builtin_names = {'__builtins__', '__file__', '__name__', '__doc__', '__package__', 
+                            '__loader__', '__spec__', '__cached__', '__annotations__'}
+            
+            for k, v in frame.f_globals.items():
+                # Skip built-in names and system variables
+                if k in builtin_names or (k.startswith('__') and k.endswith('__')):
+                    continue
+                
+                # Skip imported modules
+                if isinstance(v, types.ModuleType):
+                    continue
+                
+                # Skip functions (only want variables)
+                if isinstance(v, types.FunctionType):
+                    continue
+                
+                # Skip classes (only want variables)
+                if isinstance(v, type):
+                    continue
+                
+                # Skip typing constructs (Dict, List, Optional, etc. from typing module)
+                if hasattr(v, '__module__') and v.__module__ == 'typing':
+                    continue
+                
+                # Skip typing._GenericAlias and similar typing constructs
+                if type(v).__module__ == 'typing':
+                    continue
+                
+                # Only include simple variable types: int, str, float, bool, None, list, dict, tuple, set
+                # These are the actual variable values the user declared
+                globals_snapshot[k] = safe_json(v)
+            self.last_event = {
+                "event": "line",
+                "filename": fname,
+                "function": funcname,
+                "line": lineno,
+                "locals": locals_snapshot,
+                "globals": globals_snapshot
+            }
+            log(f"Created line event: {funcname}:{lineno}, target_line={self.target_line}, target_function={self.target_function}")
+            # Stop if we've reached the target line AND we're in the target function
+            # This ensures we stop in the correct function, not in nested function calls
+            if self.target_line is not None and lineno >= self.target_line and in_target_function:
+                log(f"Reached target line {self.target_line} in target function {self.target_function} (current: {funcname}:{lineno}), stopping and waiting")
+                self.set_step()
+                # Notify main thread that we have a fresh event ready
+                self.ready_event.set()
+                log("Set ready_event, waiting for step_event")
+                # Wait until the main thread asks us to continue
+                self.step_event.clear()
+                self.step_event.wait()
+                log("Received step_event, continuing")
+        except Exception as e:
+            log_exception(e, "user_line")
+            # Don't crash, just skip this line
             return
-        funcname = frame.f_code.co_name
-        locals_snapshot = {k: safe_json(v) for k, v in frame.f_locals.items()}
-        
-        # Capture only user-declared globals from the current file
-        globals_snapshot = {}
-        builtin_names = {'__builtins__', '__file__', '__name__', '__doc__', '__package__', 
-                        '__loader__', '__spec__', '__cached__', '__annotations__'}
-        
-        for k, v in frame.f_globals.items():
-            # Skip built-in names and system variables
-            if k in builtin_names or (k.startswith('__') and k.endswith('__')):
-                continue
-            
-            # Skip imported modules
-            if isinstance(v, types.ModuleType):
-                continue
-            
-            # Skip functions (only want variables)
-            if isinstance(v, types.FunctionType):
-                continue
-            
-            # Skip classes (only want variables)
-            if isinstance(v, type):
-                continue
-            
-            # Skip typing constructs (Dict, List, Optional, etc. from typing module)
-            if hasattr(v, '__module__') and v.__module__ == 'typing':
-                continue
-            
-            # Skip typing._GenericAlias and similar typing constructs
-            if type(v).__module__ == 'typing':
-                continue
-            
-            # Only include simple variable types: int, str, float, bool, None, list, dict, tuple, set
-            # These are the actual variable values the user declared
-            globals_snapshot[k] = safe_json(v)
-        self.last_event = {
-            "event": "line",
-            "filename": fname,
-            "function": funcname,
-            "line": lineno,
-            "locals": locals_snapshot,
-            "globals": globals_snapshot
-        }
-        log(f"Created line event: {funcname}:{lineno}, target_line={self.target_line}, target_function={self.target_function}")
-        # Stop if we've reached the target line AND we're in the target function
-        # This ensures we stop in the correct function, not in nested function calls
-        in_target_function = self.target_function is None or funcname == self.target_function
-        if self.target_line is not None and lineno >= self.target_line and in_target_function:
-            log(f"Reached target line {self.target_line} in target function {self.target_function} (current: {funcname}:{lineno}), stopping and waiting")
-            self.set_step()
-            # Notify main thread that we have a fresh event ready
-            self.ready_event.set()
-            log("Set ready_event, waiting for step_event")
-            # Wait until the main thread asks us to continue
-            self.step_event.clear()
-            self.step_event.wait()
-            log("Received step_event, continuing")
 
     def continue_until(self, line, function_name=None):
         log(f"continue_until called with line={line}, function_name={function_name}")
@@ -507,6 +571,40 @@ def main():
         sys.exit(1)
     fn = getattr(mod, fn_name)
     log(f"Found function: {fn_name}, callable={callable(fn)}")
+    
+    # Filter arguments to match function signature - this ensures we don't pass
+    # arguments that the function doesn't accept (fixes issues like passing 'metric_name'
+    # to functions that don't accept it)
+    sig_result = get_function_signature(repo_root, entry_full_id)
+    if "error" not in sig_result:
+        accepted_params = set(sig_result.get("params", []))
+        log(f"Function accepts parameters: {accepted_params}")
+        
+        # Filter keyword arguments to only include those the function accepts
+        original_kwargs_keys = set(kwargs_dict.keys())
+        filtered_kwargs = {k: v for k, v in kwargs_dict.items() if k in accepted_params}
+        filtered_out_kwargs = original_kwargs_keys - set(filtered_kwargs.keys())
+        if filtered_out_kwargs:
+            log(f"Filtered out keyword arguments not accepted by function: {filtered_out_kwargs}")
+        
+        # For positional arguments, limit to what the function can accept
+        num_total_params = len(accepted_params)
+        positional_params_not_in_kwargs = [p for p in sig_result.get("params", []) if p not in filtered_kwargs]
+        max_positional = len(positional_params_not_in_kwargs)
+        
+        if len(args_list) > max_positional:
+            log(f"Limiting positional arguments from {len(args_list)} to {max_positional} (function has {num_total_params} params, {len(filtered_kwargs)} provided as kwargs)")
+            args_list = args_list[:max_positional]
+        
+        kwargs_dict = filtered_kwargs
+        log(f"Filtered arguments to match function signature: args={args_list}, kwargs={kwargs_dict}")
+    else:
+        # If we can't get the signature, we can't safely filter arguments
+        error_msg = sig_result.get('error', 'unknown error')
+        log(f"WARNING: Could not get function signature to filter arguments: {error_msg}, using unfiltered arguments", "WARNING")
+        # Note: We continue with unfiltered arguments here because this is the main entry point
+        # The user-provided args_json should already be correct, but nested calls will be filtered
+    
     dbg = PersistentDebugger()
     dbg.target_file = abs_path  # Only this file counts for stop_line
     dbg.target_function = fn_name  # Only stop in the target function
