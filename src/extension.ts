@@ -21,6 +21,7 @@ let currentFunctionBodies: Record<string, FunctionBody> = {};
 let currentRepoRoot: string | undefined;
 let activeTracer: TracerManager | undefined;
 let tracerOutputChannel: vscode.OutputChannel | undefined;
+const storedCallArgs: Map<string, NormalisedCallArgs> = new Map();
 
 interface TracerEvent {
 	event: string;
@@ -78,6 +79,14 @@ function cloneCallArgs(args: NormalisedCallArgs): NormalisedCallArgs {
 	};
 }
 
+function getStoredCallArgs(functionId: string): NormalisedCallArgs | undefined {
+	return storedCallArgs.get(functionId);
+}
+
+function setStoredCallArgs(functionId: string, args: NormalisedCallArgs): void {
+	storedCallArgs.set(functionId, cloneCallArgs(args));
+}
+
 class TracerManager {
 	private process: ChildProcess | undefined;
 	private outputChannel: vscode.OutputChannel;
@@ -91,6 +100,7 @@ class TracerManager {
 	private pendingDisplayFile: string | undefined;
 	private currentDisplayLine: number | undefined;
 	private currentDisplayFile: string | undefined;
+	private suppressWebviewEvents: boolean = false; // Suppress webview events for parent tracing
 
 	constructor(outputChannel: vscode.OutputChannel, webview?: vscode.Webview) {
 		this.outputChannel = outputChannel;
@@ -99,6 +109,10 @@ class TracerManager {
 
 	setWebview(webview?: vscode.Webview): void {
 		this.webview = webview;
+	}
+
+	setSuppressWebviewEvents(suppress: boolean): void {
+		this.suppressWebviewEvents = suppress;
 	}
 
 	private decorateEvent(event: TracerEvent): TracerEvent {
@@ -247,9 +261,13 @@ class TracerManager {
 		argsJson: string,
 		extensionPath: string,
 		pythonPath: string,
+		suppressWebview: boolean = false,
 	): Promise<TracerEvent> {
 		const firstTime = this.process === undefined;
 		const needsNewTracer = this.currentFlow !== entryFullId;
+
+		// Set suppress flag for parent tracing (don't show values at call site)
+		this.suppressWebviewEvents = suppressWebview;
 
 		this.pendingDisplayLine = displayLine;
 		this.pendingDisplayFile = displayFile;
@@ -381,7 +399,7 @@ class TracerManager {
 				}
 			}
 
-			if (this.webview) {
+			if (this.webview && !this.suppressWebviewEvents) {
 				this.webview.postMessage({
 					type: 'tracer-event',
 					event: event,
@@ -392,7 +410,7 @@ class TracerManager {
 			if (event.traceback) {
 				this.outputChannel.appendLine(event.traceback);
 			}
-			if (this.webview) {
+			if (this.webview && !this.suppressWebviewEvents) {
 				this.webview.postMessage({
 					type: 'tracer-error',
 					error: event.error || 'Unknown error',
@@ -634,7 +652,14 @@ async function showFlowPanel(
 					const callArgs = isTraceCallArgs(message.callArgs) ? message.callArgs : undefined;
 					const stopLineCandidate = typeof message.stopLine === 'number' ? message.stopLine : message.line + 1;
 					const stopLine = Number.isFinite(stopLineCandidate) ? stopLineCandidate : message.line + 1;
-					await handleTraceLine(message.functionId, message.line, stopLine, context, callArgs);
+					const parentContext = (message.isNested && typeof message.parentFunctionId === 'string' && typeof message.parentLine === 'number' && typeof message.callLine === 'number')
+						? {
+							parentFunctionId: message.parentFunctionId,
+							parentLine: message.parentLine,
+							callLine: message.callLine,
+						}
+						: undefined;
+					await handleTraceLine(message.functionId, message.line, stopLine, context, callArgs, parentContext);
 				} catch (error) {
 					console.error('[extension] Error in handleTraceLine:', error);
 					vscode.window.showErrorMessage(`Error tracing line: ${error instanceof Error ? error.message : String(error)}`);
@@ -865,6 +890,46 @@ async function getPythonPath(): Promise<string> {
 	throw new Error('Python executable not found. Please configure linearizer.pythonPath');
 }
 
+async function extractCallArguments(
+	pythonPath: string,
+	repoRoot: string,
+	nestedFunctionId: string,
+	parentFile: string,
+	callLine: number,
+	locals: Record<string, unknown>,
+	globals: Record<string, unknown>,
+	extensionPath: string,
+): Promise<TraceCallArgs | null> {
+	try {
+		const tracerScript = path.join(extensionPath, 'python', 'tracer.py');
+		const nestedEntryFullId = nestedFunctionId.startsWith('/') ? nestedFunctionId.slice(1) : nestedFunctionId;
+		
+		const result = await execFileAsync(pythonPath, [
+			tracerScript,
+			'--extract-call-args',
+			'--repo_root', repoRoot,
+			'--entry_full_id', nestedEntryFullId,
+			'--parent-file', parentFile,
+			'--call-line', String(callLine),
+			'--locals', JSON.stringify(locals),
+			'--globals', JSON.stringify(globals),
+		], {
+			timeout: 30000,
+			cwd: repoRoot,
+		});
+
+		const parsed = JSON.parse(result.stdout);
+		if (parsed.error) {
+			console.error('[extension] Error extracting call arguments:', parsed.error);
+			return null;
+		}
+		return parsed.args ? parsed.args : null;
+	} catch (error) {
+		console.error('[extension] Failed to extract call arguments:', error);
+		return null;
+	}
+}
+
 async function getFunctionSignature(
 	pythonPath: string,
 	repoRoot: string,
@@ -897,12 +962,19 @@ async function getFunctionSignature(
 	}
 }
 
+interface ParentContext {
+	parentFunctionId: string;
+	parentLine: number;
+	callLine: number;
+}
+
 async function handleTraceLine(
 	functionId: string,
 	displayLine: number,
 	stopLine: number,
 	context: vscode.ExtensionContext,
 	callArgs?: TraceCallArgs,
+	parentContext?: ParentContext,
 ): Promise<void> {
 	if (!currentRepoRoot) {
 		vscode.window.showErrorMessage('No repository root available');
@@ -915,15 +987,88 @@ async function handleTraceLine(
 		return;
 	}
 
-	const executionLine = Number.isFinite(stopLine) ? stopLine : displayLine + 1;
+		const executionLine = Number.isFinite(stopLine) ? stopLine : displayLine + 1;
 
 	try {
 		const pythonPath = await getPythonPath();
 		const entryFullId = functionId.startsWith('/') ? functionId.slice(1) : functionId;
 		let resolvedArgs = callArgs ? normaliseCallArgs(callArgs) : cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
 		let argsJson: string;
+		let hasExtractedArgs = false; // Track if we extracted args from parent
 
-		if (callArgs) {
+		// If this is a nested function, trace the parent first to get arguments
+		if (parentContext && !callArgs) {
+			const parentFunctionBody = resolveFunctionBody(parentContext.parentFunctionId);
+			if (!parentFunctionBody) {
+				vscode.window.showErrorMessage(`Parent function ${parentContext.parentFunctionId} not found`);
+				return;
+			}
+
+			// Get parent function's stored args or use defaults
+			const parentStoredArgs = getStoredCallArgs(parentContext.parentFunctionId);
+			const parentArgsJson = parentStoredArgs 
+				? JSON.stringify(parentStoredArgs)
+				: JSON.stringify(cloneCallArgs(DEFAULT_PARENT_CALL_ARGS));
+
+			// Create or get tracer for parent
+			if (!tracerOutputChannel) {
+				tracerOutputChannel = vscode.window.createOutputChannel('Linearizer Tracer');
+			}
+			if (!activeTracer) {
+				activeTracer = new TracerManager(tracerOutputChannel, flowPanel?.webview);
+			}
+			activeTracer.setWebview(flowPanel?.webview);
+
+			const parentEntryFullId = parentContext.parentFunctionId.startsWith('/') 
+				? parentContext.parentFunctionId.slice(1) 
+				: parentContext.parentFunctionId;
+
+			// Trace parent to the call line (including the call line itself)
+			// The Python tracer stops when lineno >= target_line, so we pass callLine as displayLine
+			// which becomes stopLine = callLine + 1, executing up to and including the call line
+			// Suppress webview events so we don't show values at the call site
+			const parentEvent = await activeTracer.getTracerData(
+				currentRepoRoot!,
+				parentEntryFullId,
+				parentContext.callLine, // Display line: this becomes stopLine = callLine + 1, executing the call line
+				parentFunctionBody.file,
+				parentArgsJson,
+				context.extensionPath,
+				pythonPath,
+				true, // suppressWebview = true: don't display parent events
+			);
+
+			if (parentEvent.event === 'error') {
+				vscode.window.showErrorMessage(`Error tracing parent function: ${parentEvent.error || 'Unknown error'}`);
+				return;
+			}
+
+			// Extract call arguments from parent's locals/globals
+			// We need to find the call to the nested function (functionId) on the call line in the parent
+			const extractedArgs = await extractCallArguments(
+				pythonPath,
+				currentRepoRoot!,
+				functionId, // The nested function being called
+				parentFunctionBody.file, // The parent function's file where the call happens
+				parentContext.callLine,
+				parentEvent.locals || {},
+				parentEvent.globals || {},
+				context.extensionPath,
+			);
+
+			if (extractedArgs) {
+				resolvedArgs = normaliseCallArgs(extractedArgs);
+				hasExtractedArgs = true; // Mark that we have extracted args
+			}
+			
+			// Reset suppress flag so nested function events will be displayed
+			if (activeTracer) {
+				activeTracer.setSuppressWebviewEvents(false);
+			}
+		}
+
+		// If we have callArgs or extracted args from parent, use them directly
+		if (callArgs || hasExtractedArgs) {
 			argsJson = JSON.stringify(resolvedArgs);
 		} else {
 			const signature = await getFunctionSignature(pythonPath, currentRepoRoot, entryFullId, context.extensionPath);

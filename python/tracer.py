@@ -8,6 +8,7 @@ import traceback
 import threading
 import bdb
 import inspect
+import ast
 from datetime import datetime
 
 # --------------------------
@@ -112,6 +113,105 @@ def get_function_signature(repo_root: str, entry_full_id: str):
         }
     except Exception as e:
         log_exception(e, "get_function_signature")
+        return {"error": str(e)}
+
+def extract_call_arguments(repo_root: str, entry_full_id: str, call_line: int, locals_dict: dict, globals_dict: dict, parent_file: str = None):
+    """Extract function call arguments from a specific line using parent's locals/globals."""
+    try:
+        log(f"extract_call_arguments called: entry_full_id={entry_full_id}, call_line={call_line}, parent_file={parent_file}")
+        if "::" not in entry_full_id:
+            return {"error": "invalid entry id"}
+        
+        rel_path, fn_name = entry_full_id.split("::", 1)
+        
+        # Use parent_file if provided, otherwise use the nested function's file
+        if parent_file:
+            # parent_file is relative to repo_root
+            if os.path.isabs(parent_file):
+                abs_path = parent_file
+            else:
+                abs_path = os.path.join(repo_root, parent_file.lstrip("/"))
+        else:
+            abs_path = os.path.join(repo_root, rel_path.lstrip("/"))
+        
+        if not os.path.isfile(abs_path):
+            return {"error": f"file not found: {abs_path}"}
+        
+        # Read the file and get the line
+        with open(abs_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        if call_line < 1 or call_line > len(lines):
+            return {"error": f"line {call_line} out of range"}
+        
+        call_line_text = lines[call_line - 1].strip()
+        log(f"Extracting call from line {call_line}: {call_line_text}")
+        
+        # Parse the line to find function calls
+        try:
+            tree = ast.parse(call_line_text, mode='eval')
+        except SyntaxError:
+            # Try parsing as a statement instead
+            try:
+                tree = ast.parse(call_line_text, mode='exec')
+            except SyntaxError as e:
+                return {"error": f"cannot parse line: {str(e)}"}
+        
+        # Find the function call
+        call_node = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                # Check if this call matches the function name
+                if isinstance(node.func, ast.Name) and node.func.id == fn_name:
+                    call_node = node
+                    break
+                elif isinstance(node.func, ast.Attribute):
+                    # Handle method calls like obj.method()
+                    if node.func.attr == fn_name:
+                        call_node = node
+                        break
+        
+        if not call_node:
+            return {"error": f"function call to {fn_name} not found on line {call_line}"}
+        
+        # Evaluate arguments using parent's locals/globals
+        args_list = []
+        kwargs_dict = {}
+        
+        # Create evaluation context from parent's locals and globals
+        eval_globals = dict(globals_dict)
+        eval_locals = dict(locals_dict)
+        
+        # Evaluate positional arguments
+        for arg in call_node.args:
+            try:
+                # Convert AST node to code and evaluate
+                code = compile(ast.Expression(arg), '<string>', 'eval')
+                value = eval(code, eval_globals, eval_locals)
+                args_list.append(safe_json(value))
+            except Exception as e:
+                log(f"Error evaluating positional argument: {e}", "WARNING")
+                args_list.append(None)
+        
+        # Evaluate keyword arguments
+        for kw in call_node.keywords:
+            key = kw.arg if kw.arg else None
+            if key:
+                try:
+                    code = compile(ast.Expression(kw.value), '<string>', 'eval')
+                    value = eval(code, eval_globals, eval_locals)
+                    kwargs_dict[key] = safe_json(value)
+                except Exception as e:
+                    log(f"Error evaluating keyword argument {key}: {e}", "WARNING")
+                    kwargs_dict[key] = None
+        
+        result = {
+            "args": {"args": args_list, "kwargs": kwargs_dict}
+        }
+        log(f"Extracted arguments: args={args_list}, kwargs={kwargs_dict}")
+        return result
+    except Exception as e:
+        log_exception(e, "extract_call_arguments")
         return {"error": str(e)}
 
 # --------------------------
@@ -295,6 +395,28 @@ def main():
         action="store_true",
         help="Get function signature instead of tracing"
     )
+    parser.add_argument(
+        "--extract-call-args",
+        action="store_true",
+        help="Extract call arguments from a line"
+    )
+    parser.add_argument(
+        "--call-line",
+        type=int,
+        help="Line number where function is called (for --extract-call-args)"
+    )
+    parser.add_argument(
+        "--locals",
+        help="JSON string of parent function's locals (for --extract-call-args)"
+    )
+    parser.add_argument(
+        "--globals",
+        help="JSON string of parent function's globals (for --extract-call-args)"
+    )
+    parser.add_argument(
+        "--parent-file",
+        help="File path where the call happens (for --extract-call-args)"
+    )
     args = parser.parse_args()
     
     log(f"Command line arguments: repo_root={args.repo_root}, entry_full_id={args.entry_full_id}, stop_line={args.stop_line}, get_signature={args.get_signature}")
@@ -304,6 +426,28 @@ def main():
         log("Getting function signature")
         result = get_function_signature(args.repo_root, args.entry_full_id)
         log(f"Signature result: {result}")
+        print(json.dumps(result), flush=True)
+        sys.exit(0)
+    
+    # If --extract-call-args is set, extract arguments and exit
+    if args.extract_call_args:
+        if args.call_line is None:
+            parser.error("--call-line is required when using --extract-call-args")
+        locals_dict = {}
+        globals_dict = {}
+        if args.locals:
+            try:
+                locals_dict = json.loads(args.locals)
+            except Exception as e:
+                log(f"Error parsing --locals: {e}", "WARNING")
+        if args.globals:
+            try:
+                globals_dict = json.loads(args.globals)
+            except Exception as e:
+                log(f"Error parsing --globals: {e}", "WARNING")
+        log("Extracting call arguments")
+        result = extract_call_arguments(args.repo_root, args.entry_full_id, args.call_line, locals_dict, globals_dict, args.parent_file)
+        log(f"Extraction result: {result}")
         print(json.dumps(result), flush=True)
         sys.exit(0)
     

@@ -206,7 +206,7 @@
         // Add or update event in the array
         const eventData = message.event;
         
-        // Remove only events for the same line and file (or adjacent lines) to prevent duplicates
+        // Remove only events for the EXACT same line and file to prevent duplicates
         // Keep events for other lines so previously clicked lines remain visible
         if (state.tracerEvents && eventData.filename && eventData.line !== undefined) {
           const eventFile = eventData.filename.replace(/\\/g, '/');
@@ -215,13 +215,12 @@
           state.tracerEvents = state.tracerEvents.filter(function(e) {
             if (!e.filename || e.line === undefined) return true; // Keep events without filename or line
             const eFile = e.filename.replace(/\\/g, '/');
-            // Only remove events for the same file AND same line (or adjacent lines within 1)
+            // Only remove events for the same file AND EXACT same line
             // This allows multiple lines to have events simultaneously
             if (eFile === eventFile || eventFile.endsWith(eFile) || eFile.endsWith(eventFile)) {
-              const lineDiff = Math.abs((e.line || 0) - eventLine);
-              // Remove only if it's the same line or adjacent (to prevent showing on multiple lines)
-              if (lineDiff <= 1) {
-                console.log('[flowPanel] Removing event at line:', e.line, 'for file:', eFile, '(same or adjacent to', eventLine, ')');
+              // Remove only if it's the EXACT same line (not adjacent)
+              if (e.line === eventLine) {
+                console.log('[flowPanel] Removing event at line:', e.line, 'for file:', eFile, '(exact match with', eventLine, ')');
                 return false;
               }
             }
@@ -325,14 +324,31 @@
       const functionId = target.getAttribute('data-function');
       const line = target.getAttribute('data-line');
       const callTarget = target.getAttribute('data-call-target');
-      console.log('[flowPanel] Trace-line clicked, functionId:', functionId, 'line:', line);
+      const parentFunctionId = target.getAttribute('data-parent-function');
+      const parentLine = target.getAttribute('data-parent-line');
+      const callLine = target.getAttribute('data-call-line');
+      
+      console.log('[flowPanel] Trace-line clicked, functionId:', functionId, 'line:', line, 'parent:', parentFunctionId, 'parentLine:', parentLine);
       if (functionId && line) {
         const lineNumber = parseInt(line, 10);
         
         // Don't clear events when clicking - allow multiple lines to show values simultaneously
         // The event handler will manage duplicates for the same line
         
-        const payload = { type: 'trace-line', functionId, line: lineNumber, stopLine: lineNumber + 1 };
+        const payload = { 
+          type: 'trace-line', 
+          functionId, 
+          line: lineNumber, 
+          stopLine: lineNumber + 1 
+        };
+
+        // If this is a nested function, include parent context
+        if (parentFunctionId && parentLine && callLine) {
+          payload.parentFunctionId = parentFunctionId;
+          payload.parentLine = parseInt(parentLine, 10);
+          payload.callLine = parseInt(callLine, 10);
+          payload.isNested = true;
+        }
 
         if (callTarget) {
           const pendingKey = makePendingKey(functionId, lineNumber);
@@ -417,7 +433,7 @@
       : '';
     const body = isExpanded
       ? fn
-        ? '<div class="function-container">' + renderFunctionBody(parentId, new Set([parentId])) + '</div>'
+        ? '<div class="function-container">' + renderFunctionBody(parentId, new Set([parentId]), null) + '</div>'
         : '<div class="placeholder mini">No function body captured for ' + escapeHtml(title) + '.</div>'
       : '';
 
@@ -433,7 +449,8 @@
       '</article>';
   }
 
-  function renderFunctionBody(functionId, stack) {
+  function renderFunctionBody(functionId, stack, parentContext) {
+    // parentContext: { parentFunctionId, parentLineNumber, callLineInParent } - tracks which parent function called this
     const fn = functions[functionId];
     if (!fn || typeof fn.body !== 'string') {
       return '<div class="placeholder mini">No function body captured.</div>';
@@ -441,7 +458,9 @@
 
     const startLine = typeof fn.line === 'number' ? fn.line : (typeof fn.start_line === 'number' ? fn.start_line : 1);
     const lines = fn.body.split(/\r?\n/);
-    let html = '<div class="code-block" data-function="' + escapeAttribute(functionId) + '">';
+    let html = '<div class="code-block" data-function="' + escapeAttribute(functionId) + '"' +
+      (parentContext ? ' data-parent-function="' + escapeAttribute(parentContext.parentFunctionId) + '" data-parent-line="' + parentContext.parentLineNumber + '" data-call-line="' + parentContext.callLineInParent + '"' : '') +
+      '>';
 
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index];
@@ -481,6 +500,11 @@
       const lineClass = isTracerLine ? 'code-line tracer-active' : 'code-line';
       const callTargetAttr = formatted.calls.length === 1 ? ' data-call-target="' + escapeAttribute(formatted.calls[0].targetId) + '"' : '';
       
+      // Add parent context attributes if this is a nested function
+      const parentAttrs = parentContext 
+        ? ' data-parent-function="' + escapeAttribute(parentContext.parentFunctionId) + '" data-parent-line="' + parentContext.parentLineNumber + '" data-call-line="' + parentContext.callLineInParent + '"'
+        : '';
+      
       // Inline variable display (code-like execution view)
       let inlineVarsHtml = '';
       if (regularEvents.length > 0 && !hasError) {
@@ -504,7 +528,7 @@
       }
       
       html += '<div class="' + lineClass + '">' +
-        '<button type="button" class="line-number" data-action="trace-line" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '"' + callTargetAttr + ' title="Click to execute up to this line">' + lineNumber + '</button>' +
+        '<button type="button" class="line-number" data-action="trace-line" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '"' + callTargetAttr + parentAttrs + ' title="Click to execute up to this line">' + lineNumber + '</button>' +
         '<div class="code-snippet-wrapper">' +
         '<span class="code-snippet">' + codeHtml + '</span>' +
         inlineVarsHtml +
@@ -541,7 +565,13 @@
           }
           const nextStack = new Set(stack);
           nextStack.add(call.targetId);
-          html += '<div class="nested-block">' + renderFunctionBody(call.targetId, nextStack) + '</div>';
+          // Pass parent context: which function called this, at what line in the parent, and what line in parent has the call
+          const parentContext = {
+            parentFunctionId: functionId,
+            parentLineNumber: lineNumber, // Line in parent where the call happens
+            callLineInParent: lineNumber, // Same as parentLineNumber for now
+          };
+          html += '<div class="nested-block">' + renderFunctionBody(call.targetId, nextStack, parentContext) + '</div>';
         }
       }
     }
