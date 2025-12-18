@@ -206,32 +206,30 @@
         // Add or update event in the array
         const eventData = message.event;
         
-        // Remove ALL existing events for this file to prevent showing on multiple lines
-        // When a new event arrives, it replaces all previous events for that file
-        if (state.tracerEvents && eventData.filename) {
+        // Remove only events for the same line and file (or adjacent lines) to prevent duplicates
+        // Keep events for other lines so previously clicked lines remain visible
+        if (state.tracerEvents && eventData.filename && eventData.line !== undefined) {
           const eventFile = eventData.filename.replace(/\\/g, '/');
           const eventLine = eventData.line;
           console.log('[flowPanel] Received event - line:', eventLine, 'file:', eventFile);
-          console.log('[flowPanel] Current events before filter:', state.tracerEvents.map(function(e) {
-            return 'line:' + e.line + ' file:' + (e.filename || 'none');
-          }));
           state.tracerEvents = state.tracerEvents.filter(function(e) {
-            if (!e.filename) return true; // Keep events without filename
+            if (!e.filename || e.line === undefined) return true; // Keep events without filename or line
             const eFile = e.filename.replace(/\\/g, '/');
-            // Remove ALL events for the same file (not just adjacent lines)
-            // This ensures only one event per file is shown at a time
+            // Only remove events for the same file AND same line (or adjacent lines within 1)
+            // This allows multiple lines to have events simultaneously
             if (eFile === eventFile || eventFile.endsWith(eFile) || eFile.endsWith(eventFile)) {
-              console.log('[flowPanel] Removing event at line:', e.line, 'for file:', eFile);
-              return false;
+              const lineDiff = Math.abs((e.line || 0) - eventLine);
+              // Remove only if it's the same line or adjacent (to prevent showing on multiple lines)
+              if (lineDiff <= 1) {
+                console.log('[flowPanel] Removing event at line:', e.line, 'for file:', eFile, '(same or adjacent to', eventLine, ')');
+                return false;
+              }
             }
-            return true;
+            return true; // Keep events for other lines or other files
           });
-          console.log('[flowPanel] Events after filter:', state.tracerEvents.map(function(e) {
-            return 'line:' + e.line + ' file:' + (e.filename || 'none');
-          }));
         }
         
-        // Double-check: ensure no duplicate event exists before adding
+        // Check if event already exists for this exact line and file
         const eventKey = `${eventData.line}:${eventData.filename || ''}`;
         const duplicateExists = state.tracerEvents.some(function(e) {
           const eKey = `${e.line}:${e.filename || ''}`;
@@ -239,11 +237,19 @@
         });
         
         if (!duplicateExists) {
-          // Add the new event (we've already cleared all events for this file above)
+          // Add the new event
           console.log('[flowPanel] Adding event at line:', eventData.line, 'for file:', eventData.filename);
           state.tracerEvents.push(eventData);
         } else {
-          console.log('[flowPanel] Duplicate event detected, skipping. Line:', eventData.line, 'file:', eventData.filename);
+          // Update existing event instead of adding duplicate
+          const existingIndex = state.tracerEvents.findIndex(function(e) {
+            const eKey = `${e.line}:${e.filename || ''}`;
+            return eKey === eventKey;
+          });
+          if (existingIndex >= 0) {
+            state.tracerEvents[existingIndex] = eventData;
+            console.log('[flowPanel] Updated existing event at line:', eventData.line);
+          }
         }
 
         const functionIdForEvent = findFunctionIdForEvent(eventData);
@@ -323,25 +329,8 @@
       if (functionId && line) {
         const lineNumber = parseInt(line, 10);
         
-        // Clear any existing events for this function/file to prevent showing on multiple lines
-        // This ensures we only show the event on the exact line that was clicked
-        if (state.tracerEvents) {
-          const fnFile = functions[functionId]?.file || '';
-          state.tracerEvents = state.tracerEvents.filter(function(e) {
-            // Remove ALL events for this function/file, regardless of line number
-            // This ensures that when we click a new line, we clear all previous events for this function
-            if (e.filename && fnFile) {
-              const eFile = e.filename.replace(/\\/g, '/');
-              const targetFile = fnFile.replace(/\\/g, '/');
-              // If this event is for the same file, remove it
-              if (eFile === targetFile || targetFile.endsWith(eFile) || eFile.endsWith(targetFile)) {
-                return false; // Remove events for this file
-              }
-            }
-            // Keep events for different files
-            return true;
-          });
-        }
+        // Don't clear events when clicking - allow multiple lines to show values simultaneously
+        // The event handler will manage duplicates for the same line
         
         const payload = { type: 'trace-line', functionId, line: lineNumber, stopLine: lineNumber + 1 };
 
