@@ -722,6 +722,7 @@ async function showFlowPanel(
 							parentFunctionId: message.parentFunctionId,
 							parentLine: message.parentLine,
 							callLine: message.callLine,
+							parentCallArgs: isTraceCallArgs(message.parentCallArgs) ? message.parentCallArgs : undefined,
 						}
 						: undefined;
 					await handleTraceLine(message.functionId, message.line, stopLine, context, callArgs, parentContext);
@@ -777,6 +778,18 @@ async function showFlowPanel(
 					console.error('[extension] Error getting function signature:', error);
 					vscode.window.showErrorMessage(`Error getting function signature: ${error instanceof Error ? error.message : String(error)}`);
 				}
+			} else if (message.type === 'store-call-args' && typeof message.functionId === 'string') {
+				// Store arguments in extension so recursive tracing can find them
+				console.log('[extension] Storing call args for function:', message.functionId);
+				try {
+					if (message.args && typeof message.args === 'object') {
+						const callArgs = normaliseCallArgs(message.args as TraceCallArgs);
+						setStoredCallArgs(message.functionId, callArgs);
+						console.log('[extension] Stored args for', message.functionId, ':', callArgs);
+					}
+				} catch (error) {
+					console.error('[extension] Error storing call args:', error);
+				}
 			} else if (message.type === 'execute-with-args' && typeof message.functionId === 'string') {
 				console.log('[extension] Executing function with user-provided arguments:', message.functionId);
 				try {
@@ -787,6 +800,8 @@ async function showFlowPanel(
 					let callArgs: NormalisedCallArgs;
 					if (message.args && typeof message.args === 'object') {
 						callArgs = normaliseCallArgs(message.args as TraceCallArgs);
+						// Also store in extension for recursive tracing
+						setStoredCallArgs(targetFunctionId, callArgs);
 					} else {
 						callArgs = { args: [], kwargs: {} };
 					}
@@ -1254,6 +1269,7 @@ interface ParentContext {
 	parentFunctionId: string;
 	parentLine: number;
 	callLine: number;
+	parentCallArgs?: TraceCallArgs;
 }
 
 async function handleTraceLine(
@@ -1284,108 +1300,211 @@ async function handleTraceLine(
 		let argsJson: string;
 		let hasExtractedArgs = false; // Track if we extracted args from parent
 
-		// If this is a nested function, trace the parent first to get arguments
+		// If this is a nested function, trace the parent chain recursively to get arguments
 		if (parentContext && !callArgs) {
-			const parentFunctionBody = resolveFunctionBody(parentContext.parentFunctionId);
-			if (!parentFunctionBody) {
-				vscode.window.showErrorMessage(`Parent function ${parentContext.parentFunctionId} not found`);
+			// Helper function to trace a parent function and return its execution context
+			async function traceParentFunction(
+				parentId: string,
+				callLine: number,
+				parentStoredArgs: NormalisedCallArgs | undefined
+			): Promise<{ locals: Record<string, unknown>, globals: Record<string, unknown>, file: string }> {
+				const parentBody = resolveFunctionBody(parentId);
+				if (!parentBody) {
+					throw new Error(`Parent function ${parentId} not found`);
+				}
+
+				const parentEntryFullId = parentId.startsWith('/') ? parentId.slice(1) : parentId;
+
+				// Check if parent function requires arguments
+				const parentSignature = await getFunctionSignature(pythonPath, currentRepoRoot!, parentEntryFullId, context.extensionPath);
+				const hasRequiredParams = parentSignature && parentSignature.params && parentSignature.params.length > 0;
+				
+				// If required params but no stored args, recursively trace up the chain to find a parent with stored args
+				if (hasRequiredParams && (!parentStoredArgs || (Object.keys(parentStoredArgs.kwargs || {}).length === 0 && (parentStoredArgs.args || []).length === 0))) {
+					console.log('[extension] Parent function requires args but has none, searching call sites:', parentId);
+					// Try to find call sites and trace from grandparent (recursive case)
+					const callSites = await findCallSites(pythonPath, currentRepoRoot!, parentId, context.extensionPath);
+					
+					if (callSites && callSites.length > 0) {
+						console.log('[extension] Found', callSites.length, 'call sites for parent function');
+						for (const callSite of callSites) {
+							if (callSite.calling_function_id) {
+								const grandParentId = callSite.calling_function_id.startsWith('/') 
+									? callSite.calling_function_id 
+									: '/' + callSite.calling_function_id;
+								const grandParentStoredArgs = getStoredCallArgs(grandParentId);
+								
+								console.log('[extension] Checking call site from:', grandParentId, 'has stored args:', !!grandParentStoredArgs);
+								
+								if (grandParentStoredArgs) {
+									console.log('[extension] Found grandparent with stored args, tracing recursively:', grandParentId);
+									// Recursively trace grandparent to get parent's args
+									const grandParentEvent = await traceParentFunction(
+										grandParentId,
+										callSite.line,
+										grandParentStoredArgs
+									);
+									
+									console.log('[extension] Extracting parent args from grandparent execution at line', callSite.line);
+									// Extract parent's args from grandparent's execution
+									const extractedParentArgs = await extractCallArguments(
+										pythonPath,
+										currentRepoRoot!,
+										parentId,
+										callSite.file,
+										callSite.line,
+										grandParentEvent.locals,
+										grandParentEvent.globals,
+										context.extensionPath,
+									);
+									
+									if (extractedParentArgs && !('error' in extractedParentArgs)) {
+										parentStoredArgs = normaliseCallArgs(extractedParentArgs);
+										console.log('[extension] Successfully extracted parent args from grandparent:', parentStoredArgs);
+										break;
+									} else {
+										const error = extractedParentArgs && 'error' in extractedParentArgs ? extractedParentArgs.error : 'Unknown error';
+										console.warn('[extension] Failed to extract parent args from call site:', error);
+									}
+								}
+							}
+						}
+					} else {
+						console.log('[extension] No call sites found for parent function:', parentId);
+					}
+					
+					// If still no args and function requires them, error
+					if (!parentStoredArgs || (Object.keys(parentStoredArgs.kwargs || {}).length === 0 && (parentStoredArgs.args || []).length === 0)) {
+						throw new Error(`Parent function ${parentId} requires arguments (${parentSignature.params.join(', ')}) but none were provided. Please provide arguments for the parent function first.`);
+					}
+				}
+				
+				// Use stored args if available, otherwise empty args (valid for no-param functions)
+				const parentArgsJson = parentStoredArgs 
+					? JSON.stringify(parentStoredArgs)
+					: JSON.stringify(cloneCallArgs(DEFAULT_PARENT_CALL_ARGS));
+
+				// Create or get tracer
+				if (!tracerOutputChannel) {
+					tracerOutputChannel = vscode.window.createOutputChannel('Linearizer Tracer');
+				}
+				if (!activeTracer) {
+					activeTracer = new TracerManager(tracerOutputChannel, flowPanel?.webview);
+				}
+				activeTracer.setWebview(flowPanel?.webview);
+
+				console.log('[extension] Tracing parent function:', parentEntryFullId, 'with args:', parentArgsJson);
+				
+				// Trace parent to the call line
+				const parentEvent = await activeTracer.getTracerData(
+					currentRepoRoot!,
+					parentEntryFullId,
+					callLine,
+					parentBody.file,
+					parentArgsJson,
+					context.extensionPath,
+					pythonPath,
+					true, // suppressWebview = true: don't display parent events
+				);
+
+				if (parentEvent.event === 'error') {
+					throw new Error(`Error tracing parent function ${parentId}: ${parentEvent.error || 'Unknown error'}`);
+				}
+
+				return {
+					locals: parentEvent.locals || {},
+					globals: parentEvent.globals || {},
+					file: parentBody.file,
+				};
+			}
+
+			try {
+				// Get parent's stored args (from message or stored state)
+				let parentStoredArgs: NormalisedCallArgs | undefined = parentContext.parentCallArgs
+					? normaliseCallArgs(parentContext.parentCallArgs)
+					: getStoredCallArgs(parentContext.parentFunctionId);
+
+				// Trace the parent function to get its execution context
+				const parentEvent = await traceParentFunction(
+					parentContext.parentFunctionId,
+					parentContext.callLine,
+					parentStoredArgs
+				);
+
+				// Extract call arguments for the nested function (functionId) from parent's execution
+				// This automatically filters args to match the nested function's signature
+				const extractedArgs = await extractCallArguments(
+					pythonPath,
+					currentRepoRoot!,
+					functionId, // The nested function being called
+					parentEvent.file, // The parent function's file where the call happens
+					parentContext.callLine,
+					parentEvent.locals,
+					parentEvent.globals,
+					context.extensionPath,
+				);
+
+				if (extractedArgs && !('error' in extractedArgs)) {
+					// extractCallArguments already filters args to match the function's signature
+					resolvedArgs = normaliseCallArgs(extractedArgs);
+					hasExtractedArgs = true; // Mark that we have extracted args
+					console.log('[extension] Extracted and filtered args for nested function:', resolvedArgs);
+				} else {
+					const errorMsg = extractedArgs && 'error' in extractedArgs ? extractedArgs.error : 'Failed to extract call arguments';
+					vscode.window.showErrorMessage(`Error extracting arguments from parent function: ${errorMsg}`);
+					return;
+				}
+				
+				// Reset suppress flag so nested function events will be displayed
+				if (activeTracer) {
+					activeTracer.setSuppressWebviewEvents(false);
+				}
+			} catch (error) {
+				vscode.window.showErrorMessage(`Error tracing parent function: ${error instanceof Error ? error.message : String(error)}`);
 				return;
-			}
-
-			// Get parent function's stored args or use defaults
-			const parentStoredArgs = getStoredCallArgs(parentContext.parentFunctionId);
-			const parentArgsJson = parentStoredArgs 
-				? JSON.stringify(parentStoredArgs)
-				: JSON.stringify(cloneCallArgs(DEFAULT_PARENT_CALL_ARGS));
-
-			// Create or get tracer for parent
-			if (!tracerOutputChannel) {
-				tracerOutputChannel = vscode.window.createOutputChannel('Linearizer Tracer');
-			}
-			if (!activeTracer) {
-				activeTracer = new TracerManager(tracerOutputChannel, flowPanel?.webview);
-			}
-			activeTracer.setWebview(flowPanel?.webview);
-
-			const parentEntryFullId = parentContext.parentFunctionId.startsWith('/') 
-				? parentContext.parentFunctionId.slice(1) 
-				: parentContext.parentFunctionId;
-
-			// Trace parent to the call line (including the call line itself)
-			// The Python tracer stops when lineno >= target_line, so we pass callLine as displayLine
-			// which becomes stopLine = callLine + 1, executing up to and including the call line
-			// Suppress webview events so we don't show values at the call site
-			const parentEvent = await activeTracer.getTracerData(
-				currentRepoRoot!,
-				parentEntryFullId,
-				parentContext.callLine, // Display line: this becomes stopLine = callLine + 1, executing the call line
-				parentFunctionBody.file,
-				parentArgsJson,
-				context.extensionPath,
-				pythonPath,
-				true, // suppressWebview = true: don't display parent events
-			);
-
-			if (parentEvent.event === 'error') {
-				vscode.window.showErrorMessage(`Error tracing parent function: ${parentEvent.error || 'Unknown error'}`);
-				return;
-			}
-
-			// Extract call arguments from parent's locals/globals
-			// We need to find the call to the nested function (functionId) on the call line in the parent
-			const extractedArgs = await extractCallArguments(
-				pythonPath,
-				currentRepoRoot!,
-				functionId, // The nested function being called
-				parentFunctionBody.file, // The parent function's file where the call happens
-				parentContext.callLine,
-				parentEvent.locals || {},
-				parentEvent.globals || {},
-				context.extensionPath,
-			);
-
-			if (extractedArgs) {
-				resolvedArgs = normaliseCallArgs(extractedArgs);
-				hasExtractedArgs = true; // Mark that we have extracted args
-			}
-			
-			// Reset suppress flag so nested function events will be displayed
-			if (activeTracer) {
-				activeTracer.setSuppressWebviewEvents(false);
 			}
 		}
 
 		// If we have callArgs or extracted args from parent, use them directly
+		// For nested functions, we should always extract args from parent - never prompt for input
 		if (callArgs || hasExtractedArgs) {
 			argsJson = JSON.stringify(resolvedArgs);
 		} else {
-			const signature = await getFunctionSignature(pythonPath, currentRepoRoot, entryFullId, context.extensionPath);
-			const defaultJson = JSON.stringify(resolvedArgs);
-			if (signature && signature.params.length > 0) {
-				const paramInput = await vscode.window.showInputBox({
-					prompt: `Enter function arguments as JSON (params: ${signature.params.join(', ')}). Example: {"args": [1, 2], "kwargs": {"key": "value"}}`,
-					placeHolder: defaultJson,
-					value: defaultJson,
-				});
+			// Only prompt for input if this is a top-level parent function (not nested)
+			// If nested, we should have extracted args from parent above
+			if (!parentContext) {
+				const signature = await getFunctionSignature(pythonPath, currentRepoRoot, entryFullId, context.extensionPath);
+				const defaultJson = JSON.stringify(resolvedArgs);
+				if (signature && signature.params.length > 0) {
+					const paramInput = await vscode.window.showInputBox({
+						prompt: `Enter function arguments as JSON (params: ${signature.params.join(', ')}). Example: {"args": [1, 2], "kwargs": {"key": "value"}}`,
+						placeHolder: defaultJson,
+						value: defaultJson,
+					});
 
-				if (paramInput === undefined) {
-					return; // User cancelled
-				}
-
-				if (paramInput.trim()) {
-					try {
-						const parsed = JSON.parse(paramInput);
-						if (!isTraceCallArgs(parsed)) {
-							throw new Error('Invalid argument structure');
-						}
-						resolvedArgs = normaliseCallArgs(parsed);
-					} catch {
-						vscode.window.showErrorMessage('Invalid JSON format for arguments');
-						return;
+					if (paramInput === undefined) {
+						return; // User cancelled
 					}
-				} else {
-					resolvedArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+
+					if (paramInput.trim()) {
+						try {
+							const parsed = JSON.parse(paramInput);
+							if (!isTraceCallArgs(parsed)) {
+								throw new Error('Invalid argument structure');
+							}
+							resolvedArgs = normaliseCallArgs(parsed);
+						} catch {
+							vscode.window.showErrorMessage('Invalid JSON format for arguments');
+							return;
+						}
+					} else {
+						resolvedArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+					}
 				}
+			} else {
+				// This is a nested function but we somehow didn't extract args
+				// This shouldn't happen, but just use empty args as fallback
+				resolvedArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
 			}
 			argsJson = JSON.stringify(resolvedArgs);
 		}

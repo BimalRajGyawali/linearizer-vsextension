@@ -619,13 +619,30 @@ h2 {
 }
 
 .args-form-info {
-  margin-bottom: 16px;
+  margin-bottom: 20px;
+  padding: 0;
+}
+
+.args-form-function-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 12px;
   background: var(--vscode-textBlockQuote-background);
   border-left: 3px solid var(--vscode-textLink-foreground);
   border-radius: 4px;
   font-size: 0.9rem;
-  color: var(--vscode-foreground);
+}
+
+.info-label {
+  font-weight: 600;
+  color: var(--vscode-descriptionForeground);
+}
+
+.info-value {
+  color: var(--vscode-textLink-foreground);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.95rem;
 }
 
 .args-form {
@@ -671,6 +688,26 @@ h2 {
   font-size: 0.9rem;
   margin: 0;
   font-style: italic;
+}
+
+.form-help-text {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 12px;
+  background: var(--vscode-inputValidation-infoBackground, rgba(100, 181, 246, 0.1));
+  border: 1px solid var(--vscode-inputValidation-infoBorder, rgba(100, 181, 246, 0.3));
+  border-radius: 4px;
+  font-size: 0.85rem;
+  color: var(--vscode-foreground);
+  line-height: 1.5;
+  margin-top: 4px;
+}
+
+.help-icon {
+  font-size: 1rem;
+  flex-shrink: 0;
+  margin-top: 1px;
 }
 
 .form-actions {

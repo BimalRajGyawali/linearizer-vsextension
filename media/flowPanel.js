@@ -359,18 +359,20 @@
         }
       });
       
+      // Store arguments locally - execution will happen when user clicks a line
+      setCallArgsForFunction(functionId, { args: [], kwargs: kwargs });
+      
+      // Also notify extension to store the args so recursive tracing can find them
+      vscode.postMessage({
+        type: 'store-call-args',
+        functionId: functionId,
+        args: { args: [], kwargs: kwargs },
+      });
+      
       // Hide form
       state.argsFormVisible = false;
       state.argsFormData = null;
       render();
-      
-      // Send arguments to extension
-      vscode.postMessage({
-        type: 'execute-with-args',
-        functionId: functionId,
-        args: { args: [], kwargs: kwargs },
-        line: 1,
-      });
       return;
     }
   });
@@ -481,6 +483,17 @@
           payload.parentLine = parseInt(parentLine, 10);
           payload.callLine = parseInt(callLine, 10);
           payload.isNested = true;
+          
+          // Always include parent's stored arguments so extension can execute parent function
+          // If parent doesn't have stored args, we need to prevent execution
+          const parentStoredArgs = getCallArgsForFunction(parentFunctionId);
+          if (!parentStoredArgs) {
+            console.warn('[flowPanel] Nested function clicked but parent has no stored args:', parentFunctionId);
+            // Show message to user (can't use vscode.window in webview, so we'll let extension handle it)
+            // But we should still send the message so extension can show proper error
+          } else {
+            payload.parentCallArgs = parentStoredArgs;
+          }
         }
 
         if (callTarget) {
@@ -615,18 +628,25 @@
       <div class="args-form-overlay" data-action="close-args-form">
         <div class="args-form-modal">
           <div class="args-form-header">
-            <h3 class="args-form-title">Provide Arguments</h3>
+            <h3 class="args-form-title">Function Arguments</h3>
             <button type="button" class="args-form-close" data-action="close-args-form" aria-label="Close">&times;</button>
           </div>
           <div class="args-form-body">
             <div class="args-form-info">
-              <strong>Function:</strong> ${escapeHtml(functionDisplay)}
+              <div class="args-form-function-name">
+                <span class="info-label">Function:</span>
+                <span class="info-value">${escapeHtml(functionDisplay)}</span>
+              </div>
             </div>
             <form class="args-form" data-function-id="${escapeAttribute(functionId)}">
               ${formFields}
+              <div class="form-help-text">
+                <span class="help-icon">💡</span>
+                <span>After saving, click any line number in the function to execute it with these arguments.</span>
+              </div>
               <div class="form-actions">
                 <button type="button" class="form-btn form-btn-secondary" data-action="close-args-form">Cancel</button>
-                <button type="submit" class="form-btn form-btn-primary">Execute</button>
+                <button type="submit" class="form-btn form-btn-primary">Done</button>
               </div>
             </form>
           </div>
