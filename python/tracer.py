@@ -447,7 +447,8 @@ def main():
     parser.add_argument(
         "--args_json",
         required=False,
-        default='{"kwargs": {"metric_name": "test", "period": "last_7_days"}}'
+        # No default business-specific kwargs; start with empty args/kwargs
+        default='{"args": [], "kwargs": {}}'
     )
     parser.add_argument(
         "--stop_line",

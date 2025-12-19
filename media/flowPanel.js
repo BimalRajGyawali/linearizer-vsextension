@@ -5,9 +5,10 @@
   const flows = Array.isArray(data.flows) ? data.flows : [];
   const changed = Array.isArray(data.changedFunctions) ? data.changedFunctions : [];
 
+  // Baseline empty arguments for parents – real values come from user input or extracted call context
   const DEFAULT_PARENT_ARGS = {
     args: [],
-    kwargs: { metric_name: 'test', period: 'last_7_days' },
+    kwargs: {},
   };
 
   const state = {
@@ -16,6 +17,9 @@
     tracerEvents: [], // Array of trace events: { event, line, filename, function, locals, globals, error, traceback }
     callArgsByFunction: new Map(), // functionId -> { args: [], kwargs: {} }
     pendingCallTargets: new Map(), // key (functionId:line) -> callee functionId
+    callSitesByFunction: new Map(), // functionId -> Array of call sites
+    loadingCallSites: new Set(), // Set of functionIds for which we're loading call sites
+    selectedCallSite: new Map(), // functionId -> selected call site
   };
   
   // Helper function to format values for display
@@ -201,7 +205,17 @@
   // Listen for messages from extension
   window.addEventListener('message', (event) => {
     const message = event.data;
-    if (message.type === 'tracer-event') {
+    if (message.type === 'call-sites-found' && typeof message.functionId === 'string' && Array.isArray(message.callSites)) {
+      state.loadingCallSites.delete(message.functionId);
+      state.callSitesByFunction.set(message.functionId, message.callSites);
+      console.log('[flowPanel] Received call sites for', message.functionId, ':', message.callSites.length, 'sites');
+      render();
+    } else if (message.type === 'call-sites-error' && typeof message.functionId === 'string') {
+      state.loadingCallSites.delete(message.functionId);
+      console.error('[flowPanel] Error finding call sites:', message.error);
+      // Still render to show error state
+      render();
+    } else if (message.type === 'tracer-event') {
       if (message.event) {
         // Add or update event in the array
         const eventData = message.event;
@@ -316,6 +330,34 @@
       if (call) {
         toggleCall(call, targetId);
       }
+    } else if (action === 'select-call-site') {
+      const parentId = target.getAttribute('data-parent-id');
+      const callSiteIndex = target.getAttribute('data-call-site-index');
+      if (parentId && callSiteIndex !== null) {
+        const index = parseInt(callSiteIndex, 10);
+        const callSites = state.callSitesByFunction.get(parentId);
+        if (callSites && callSites[index]) {
+          const callSite = callSites[index];
+          state.selectedCallSite.set(parentId, callSite);
+          render();
+          
+          // Execute from this call site
+          vscode.postMessage({
+            type: 'execute-from-call-site',
+            functionId: parentId,
+            callSite: callSite,
+          });
+        }
+      }
+    } else if (action === 'execute-with-args') {
+      const parentId = target.getAttribute('data-parent-id');
+      if (parentId) {
+        vscode.postMessage({
+          type: 'execute-with-args',
+          functionId: parentId,
+          line: 1, // Start from line 1 by default
+        });
+      }
     } else if (action === 'open-source') {
       const identifier = target.getAttribute('data-target');
       if (identifier) {
@@ -360,7 +402,20 @@
         if (storedArgs) {
           payload.callArgs = storedArgs;
         } else if (parents.indexOf(functionId) >= 0) {
-          payload.callArgs = cloneArgs(DEFAULT_PARENT_ARGS);
+          // For parent functions without stored args, don't execute automatically
+          // User must either select a call site (which auto-executes) or use the "Provide Arguments" button
+          const callSites = state.callSitesByFunction.get(functionId);
+          if (!callSites || callSites.length === 0) {
+            // No call sites - user must use the button
+            // Note: We can't use vscode.window here since this is in the webview
+            // Instead, we'll just return silently - the button is visible in the UI
+            console.log('[flowPanel] No stored args and no call sites - user should use "Provide Arguments" button');
+            return;
+          } else {
+            // Call sites exist - user should select one or use the button
+            console.log('[flowPanel] No stored args but call sites exist - user should select a call site or use "Provide Arguments" button');
+            return;
+          }
         }
 
         console.log('[flowPanel] Sending trace-line message', payload);
@@ -400,6 +455,11 @@
       state.expandedParents.delete(parentId);
     } else {
       state.expandedParents.add(parentId);
+      // Request call sites when expanding a parent function
+      if (!state.callSitesByFunction.has(parentId) && !state.loadingCallSites.has(parentId)) {
+        state.loadingCallSites.add(parentId);
+        vscode.postMessage({ type: 'find-call-sites', functionId: parentId });
+      }
     }
     render();
   }
@@ -429,6 +489,49 @@
     root.innerHTML = parents.map((parentId) => renderParentBlock(parentId)).join('');
   }
 
+  function renderCallSitesSection(parentId) {
+    const callSites = state.callSitesByFunction.get(parentId);
+    const loading = state.loadingCallSites.has(parentId);
+    const selected = state.selectedCallSite.get(parentId);
+
+    if (loading) {
+      return '<div class="call-sites-section"><div class="placeholder mini">Loading call sites...</div></div>';
+    }
+
+    if (!callSites || callSites.length === 0) {
+      return '<div class="call-sites-section">' +
+        '<div class="placeholder mini">No call sites found. Provide arguments to execute this function.</div>' +
+        '<button type="button" class="execute-with-args-btn" data-action="execute-with-args" data-parent-id="' + escapeAttribute(parentId) + '">Provide Arguments</button>' +
+        '</div>';
+    }
+
+    let html = '<div class="call-sites-section">';
+    html += '<div class="call-sites-header">Call Sites (' + callSites.length + '):</div>';
+    html += '<button type="button" class="execute-with-args-btn" data-action="execute-with-args" data-parent-id="' + escapeAttribute(parentId) + '" title="Click to provide function arguments manually">Provide Arguments Manually</button>';
+    html += '<div class="call-sites-list">';
+    
+    callSites.forEach(function(callSite, index) {
+      const isSelected = selected && selected.line === callSite.line && selected.file === callSite.file;
+      const callingFunctionName = callSite.calling_function || '&lt;top-level&gt;';
+      const fileDisplay = callSite.file.split('/').pop() || callSite.file;
+      const callSiteKey = parentId + '::' + callSite.file + '::' + callSite.line;
+      
+      html += '<div class="call-site-item ' + (isSelected ? 'selected' : '') + '" data-call-site-index="' + index + '" data-action="select-call-site" data-parent-id="' + escapeAttribute(parentId) + '">';
+      html += '<div class="call-site-header">';
+      html += '<span class="call-site-file">' + escapeHtml(fileDisplay) + '</span>';
+      html += '<span class="call-site-line">:' + callSite.line + '</span>';
+      html += '<span class="call-site-function"> in ' + escapeHtml(callingFunctionName) + '()</span>';
+      html += '</div>';
+      html += '<div class="call-site-code">' + escapeHtml(callSite.call_line) + '</div>';
+      html += '</div>';
+    });
+    
+    html += '</div>';
+    html += '</div>';
+    
+    return html;
+  }
+
   function renderParentBlock(parentId) {
     const fn = functions[parentId];
     const flow = flowMap.get(parentId);
@@ -440,10 +543,13 @@
         .map((entry) => '<span class="chip" title="' + escapeAttribute(entry) + '">' + escapeHtml(extractDisplayName(entry)) + '</span>')
         .join('') + '</div>'
       : '';
+    
+    const callSitesSection = isExpanded ? renderCallSitesSection(parentId) : '';
+    
     const body = isExpanded
-      ? fn
+      ? (callSitesSection + (fn
         ? '<div class="function-container">' + renderFunctionBody(parentId, new Set([parentId]), null) + '</div>'
-        : '<div class="placeholder mini">No function body captured for ' + escapeHtml(title) + '.</div>'
+        : '<div class="placeholder mini">No function body captured for ' + escapeHtml(title) + '.</div>'))
       : '';
 
     return '<article class="parent-block" data-parent-id="' + escapeAttribute(parentId) + '">' +

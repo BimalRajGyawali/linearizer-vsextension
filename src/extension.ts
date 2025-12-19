@@ -44,9 +44,10 @@ interface NormalisedCallArgs {
 	kwargs: Record<string, unknown>;
 }
 
+// Baseline empty arguments for parent functions – actual values come from user input
 const DEFAULT_PARENT_CALL_ARGS: NormalisedCallArgs = {
 	args: [],
-	kwargs: { metric_name: 'test', period: 'last_7_days' },
+	kwargs: {},
 };
 
 function isTraceCallArgs(value: unknown): value is TraceCallArgs {
@@ -184,7 +185,7 @@ class TracerManager {
 		const tracerPath = path.join(extensionPath, 'python', 'tracer.py');
 
 		this.outputChannel.appendLine(`[Rust-like] Spawning tracer for ${entryFullId} at line ${stopLine}`);
-		this.outputChannel.show(true);
+		// Don't show output channel automatically - user can open it manually if needed
 
 		const args = [
 			'-u',
@@ -728,6 +729,155 @@ async function showFlowPanel(
 					console.error('[extension] Error in handleTraceLine:', error);
 					vscode.window.showErrorMessage(`Error tracing line: ${error instanceof Error ? error.message : String(error)}`);
 				}
+			} else if (message.type === 'find-call-sites' && typeof message.functionId === 'string') {
+				console.log('[extension] Finding call sites for:', message.functionId);
+				try {
+					const pythonPath = await getPythonPath();
+					const callSites = await findCallSites(pythonPath, currentRepoRoot!, message.functionId, context.extensionPath);
+					if (flowPanel) {
+						flowPanel.webview.postMessage({
+							type: 'call-sites-found',
+							functionId: message.functionId,
+							callSites: callSites,
+						});
+					}
+				} catch (error) {
+					console.error('[extension] Error finding call sites:', error);
+					if (flowPanel) {
+						flowPanel.webview.postMessage({
+							type: 'call-sites-error',
+							functionId: message.functionId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				}
+			} else if (message.type === 'execute-with-args' && typeof message.functionId === 'string') {
+				console.log('[extension] Executing function with user-provided arguments:', message.functionId);
+				try {
+					const pythonPath = await getPythonPath();
+					const targetFunctionId = message.functionId;
+					const entryFullId = targetFunctionId.startsWith('/') ? targetFunctionId.slice(1) : targetFunctionId;
+					const targetLine = typeof message.line === 'number' ? message.line : 1;
+					
+					// Get function signature to show user what parameters are expected
+					const signature = await getFunctionSignature(pythonPath, currentRepoRoot!, entryFullId, context.extensionPath);
+					
+					let argsJson: string;
+					if (signature && signature.params.length > 0) {
+						// Show individual input fields for each parameter
+						const kwargs: Record<string, unknown> = {};
+						
+						for (let i = 0; i < signature.params.length; i++) {
+							const paramName = signature.params[i];
+							const paramInput = await vscode.window.showInputBox({
+								prompt: `Enter value for parameter "${paramName}" (${i + 1}/${signature.params.length})`,
+								placeHolder: `Enter value for ${paramName} (JSON format: strings use quotes, numbers/booleans without quotes)`,
+								ignoreFocusOut: true, // Keep dialog open if user clicks away
+							});
+
+							if (paramInput === undefined) {
+								// User cancelled - stop collecting parameters
+								return;
+							}
+
+							if (paramInput.trim()) {
+								// Try to parse as JSON first (supports strings, numbers, booleans, null, arrays, objects)
+								try {
+									const parsed = JSON.parse(paramInput.trim());
+									kwargs[paramName] = parsed;
+								} catch {
+									// If JSON parsing fails, treat as a plain string
+									kwargs[paramName] = paramInput.trim();
+								}
+							}
+							// If empty string, skip this parameter (it will be missing from kwargs)
+						}
+						
+						argsJson = JSON.stringify({ args: [], kwargs });
+					} else {
+						// No parameters, use empty args
+						argsJson = JSON.stringify({ args: [], kwargs: {} });
+					}
+					
+					// Execute the function with provided arguments at the specified line
+					await handleTraceLine(
+						targetFunctionId,
+						targetLine,
+						targetLine,
+						context,
+						JSON.parse(argsJson) as NormalisedCallArgs,
+						undefined, // No parent context
+					);
+				} catch (error) {
+					console.error('[extension] Error executing with arguments:', error);
+					vscode.window.showErrorMessage(`Error executing function: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			} else if (message.type === 'execute-from-call-site' && typeof message.functionId === 'string' && typeof message.callSite === 'object') {
+				console.log('[extension] Executing from call site:', message.callSite);
+				try {
+					// The call site contains: file, line, calling_function_id
+					// We need to execute up to that line in the calling function, then extract arguments
+					const callSite = message.callSite as CallSite;
+					if (callSite.calling_function_id && typeof callSite.line === 'number') {
+						const pythonPath = await getPythonPath();
+						const targetFunctionId = message.functionId; // The parent function to execute
+						
+						// First, execute up to the call site line to get the runtime context
+						// We need to ensure activeTracer exists or create one
+						if (!activeTracer) {
+							if (!tracerOutputChannel) {
+								tracerOutputChannel = vscode.window.createOutputChannel('Linearizer Tracer');
+								context.subscriptions.push(tracerOutputChannel);
+							}
+							activeTracer = new TracerManager(tracerOutputChannel);
+						}
+						
+						const callSiteEvent = await activeTracer.getTracerData(
+							currentRepoRoot!,
+							callSite.calling_function_id.startsWith('/') ? callSite.calling_function_id.slice(1) : callSite.calling_function_id,
+							callSite.line - 1, // displayLine is 0-indexed, callSite.line is 1-indexed
+							callSite.file,
+							JSON.stringify({ args: [], kwargs: {} }), // Dummy args - we'll extract real ones
+							context.extensionPath,
+							pythonPath,
+							false, // suppressWebview
+						);
+						
+						// Now extract the call arguments at that line
+						const extractedArgs = await extractCallArguments(
+							pythonPath,
+							currentRepoRoot!,
+							targetFunctionId.startsWith('/') ? targetFunctionId.slice(1) : targetFunctionId,
+							callSite.file,
+							callSite.line,
+							callSiteEvent.locals || {},
+							callSiteEvent.globals || {},
+							context.extensionPath,
+						);
+						
+						// Now execute the target function with the extracted arguments
+						if (extractedArgs && !('error' in extractedArgs)) {
+							const normalisedArgs = normaliseCallArgs(extractedArgs);
+							const argsJson = JSON.stringify(normalisedArgs);
+							
+							// Execute the target function with extracted arguments
+							await handleTraceLine(
+								targetFunctionId,
+								1, // Start from first line
+								1,
+								context,
+								normalisedArgs,
+								undefined, // No parent context - this is a top-level execution
+							);
+						} else {
+							const errorMsg = extractedArgs && 'error' in extractedArgs ? extractedArgs.error : 'Failed to extract call arguments';
+							vscode.window.showErrorMessage(`Error extracting arguments from call site: ${errorMsg}`);
+						}
+					}
+				} catch (error) {
+					console.error('[extension] Error executing from call site:', error);
+					vscode.window.showErrorMessage(`Error executing from call site: ${error instanceof Error ? error.message : String(error)}`);
+				}
 			} else if (message.type === 'stop-trace') {
 				if (activeTracer) {
 					activeTracer.stop();
@@ -737,6 +887,29 @@ async function showFlowPanel(
 		});
 		context.subscriptions.push(flowPanelMessageDisposable);
 	}
+}
+
+async function getSyntaxHighlightingStyles(): Promise<string> {
+	// Get semantic token colors from VS Code theme for Python syntax highlighting
+	// This makes the code display use the same colors as VS Code's editor
+	const colorMap = await vscode.commands.executeCommand<[string, string][]>('vscode.getColorMap');
+	
+	if (!colorMap || colorMap.length === 0) {
+		// Fallback: return empty string, CSS will use CSS variables
+		return '';
+	}
+
+	// Map TextMate scopes to token types we use
+	// VS Code uses TextMate scopes for syntax highlighting
+	// We'll inject styles that use the actual theme colors
+	const styles: string[] = [];
+	
+	// Note: VS Code doesn't expose TextMate token colors directly via API
+	// Instead, we rely on CSS variables that VS Code provides
+	// The CSS already uses the right variables, so this function is a placeholder
+	// for future enhancement if we want to inject specific colors
+	
+	return styles.join('\n');
 }
 
 function buildFlowWebviewHtml(
@@ -768,7 +941,7 @@ function buildFlowWebviewHtml(
 	<html lang="en">
 	<head>
 		<meta charset="UTF-8" />
-		<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} https: data:; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';" />
+		<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} https: data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';" />
 		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 		<title>Linearizer Call Flows</title>
 		<link rel="stylesheet" href="${stylesUri}" />
@@ -991,6 +1164,65 @@ async function extractCallArguments(
 	} catch (error) {
 		console.error('[extension] Failed to extract call arguments:', error);
 		return null;
+	}
+}
+
+interface CallSite {
+	file: string;
+	line: number;
+	column: number;
+	call_line: string;
+	context: string[];
+	calling_function: string | null;
+	calling_function_id: string | null;
+}
+
+async function findCallSites(
+	pythonPath: string,
+	repoRoot: string,
+	functionId: string,
+	extensionPath: string,
+): Promise<CallSite[]> {
+	const scriptPath = path.join(extensionPath, 'python', 'find_call_sites.py');
+	
+	try {
+		const entryFullId = functionId.startsWith('/') ? functionId.slice(1) : functionId;
+		console.log('[extension] Calling find_call_sites.py with:', { pythonPath, scriptPath, repoRoot, entryFullId });
+		
+		const { stdout, stderr } = await execFileAsync(
+			pythonPath,
+			[
+				'-u', // Unbuffered output
+				scriptPath,
+				'--repo', repoRoot,
+				'--function-id', entryFullId,
+			],
+			{ cwd: repoRoot, maxBuffer: 10 * 1024 * 1024 },
+		);
+		
+		if (stderr && stderr.trim()) {
+			console.warn('[extension] find_call_sites.py stderr:', stderr);
+		}
+		
+		console.log('[extension] find_call_sites.py stdout:', stdout);
+		const trimmed = stdout.trim();
+		if (!trimmed) {
+			console.warn('[extension] find_call_sites.py returned empty output');
+			return [];
+		}
+		
+		const result = JSON.parse(trimmed);
+		const callSites = result.call_sites || [];
+		console.log('[extension] Found call sites:', callSites.length);
+		return callSites;
+	} catch (error: any) {
+		const errorMessage = error instanceof Error ? error.message : String(error);
+		const errorStdout = (error as any)?.stdout ? String((error as any).stdout) : '';
+		const errorStderr = (error as any)?.stderr ? String((error as any).stderr) : '';
+		console.error('[extension] Error finding call sites:', errorMessage);
+		if (errorStdout) console.error('[extension] stdout:', errorStdout);
+		if (errorStderr) console.error('[extension] stderr:', errorStderr);
+		throw error; // Re-throw so the caller can handle it
 	}
 }
 
