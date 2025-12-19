@@ -20,6 +20,8 @@
     callSitesByFunction: new Map(), // functionId -> Array of call sites
     loadingCallSites: new Set(), // Set of functionIds for which we're loading call sites
     selectedCallSite: new Map(), // functionId -> selected call site
+    argsFormVisible: false, // Whether the arguments form modal is visible
+    argsFormData: null, // { functionId, params: [] }
   };
   
   // Helper function to format values for display
@@ -302,10 +304,89 @@
         state.tracerEvents.push(errorEvent);
         render();
       }
+    } else if (message.type === 'show-args-form' && typeof message.functionId === 'string') {
+      // Show the arguments form modal
+      state.argsFormVisible = true;
+      state.argsFormData = {
+        functionId: message.functionId,
+        params: Array.isArray(message.params) ? message.params : [],
+        functionName: typeof message.functionName === 'string' ? message.functionName : null,
+      };
+      render();
+      
+      // Focus first input field
+      setTimeout(function() {
+        const firstInput = root.querySelector('.form-input');
+        if (firstInput) {
+          firstInput.focus();
+        }
+      }, 100);
+    }
+  });
+
+  // Handle Escape key to close modal
+  document.addEventListener('keydown', function(event) {
+    if (event.key === 'Escape' && state.argsFormVisible) {
+      state.argsFormVisible = false;
+      state.argsFormData = null;
+      render();
+    }
+  });
+
+  // Handle form submission
+  root.addEventListener('submit', (event) => {
+    if (event.target instanceof HTMLFormElement && event.target.classList.contains('args-form')) {
+      event.preventDefault();
+      const form = event.target;
+      const functionId = form.getAttribute('data-function-id');
+      if (!functionId) return;
+      
+      const inputs = form.querySelectorAll('.form-input');
+      const kwargs = {};
+      
+      inputs.forEach(function(input) {
+        const paramName = input.getAttribute('data-param');
+        const value = input.value.trim();
+        
+        if (value) {
+          // Try to parse as JSON first (supports strings, numbers, booleans, null, arrays, objects)
+          try {
+            kwargs[paramName] = JSON.parse(value);
+          } catch {
+            // If JSON parsing fails, treat as a plain string
+            kwargs[paramName] = value;
+          }
+        }
+      });
+      
+      // Hide form
+      state.argsFormVisible = false;
+      state.argsFormData = null;
+      render();
+      
+      // Send arguments to extension
+      vscode.postMessage({
+        type: 'execute-with-args',
+        functionId: functionId,
+        args: { args: [], kwargs: kwargs },
+        line: 1,
+      });
+      return;
     }
   });
 
   root.addEventListener('click', (event) => {
+    // Prevent clicks inside the modal from closing it (except for buttons with actions)
+    const modal = root.querySelector('.args-form-modal');
+    if (modal && modal.contains(event.target)) {
+      const clickedElement = event.target;
+      // Allow clicks on buttons with data-action (like Cancel, Close buttons)
+      if (clickedElement.tagName !== 'BUTTON' || !clickedElement.hasAttribute('data-action')) {
+        // For non-button elements or buttons without actions, stop here to prevent closing
+        return;
+      }
+    }
+    
     const target = findActionTarget(event.target);
     if (!target) {
       return;
@@ -352,11 +433,20 @@
     } else if (action === 'execute-with-args') {
       const parentId = target.getAttribute('data-parent-id');
       if (parentId) {
+        // Request function signature first, then show form
         vscode.postMessage({
-          type: 'execute-with-args',
+          type: 'request-args-form',
           functionId: parentId,
-          line: 1, // Start from line 1 by default
         });
+      }
+    } else if (action === 'close-args-form') {
+      // Only close if clicking directly on the overlay, not on the modal content
+      const clickedElement = event.target;
+      const modal = root.querySelector('.args-form-modal');
+      if (modal && (clickedElement === target || !modal.contains(clickedElement))) {
+        state.argsFormVisible = false;
+        state.argsFormData = null;
+        render();
       }
     } else if (action === 'open-source') {
       const identifier = target.getAttribute('data-target');
@@ -482,11 +572,67 @@
   }
 
   function render() {
+    let content = '';
     if (!parents.length) {
-      root.innerHTML = '<p class="placeholder">No call flows available.</p>';
-      return;
+      content = '<p class="placeholder">No call flows available.</p>';
+    } else {
+      content = parents.map((parentId) => renderParentBlock(parentId)).join('');
     }
-    root.innerHTML = parents.map((parentId) => renderParentBlock(parentId)).join('');
+    content += renderArgsFormModal();
+    root.innerHTML = content;
+  }
+
+  function renderArgsFormModal() {
+    if (!state.argsFormVisible || !state.argsFormData) {
+      return '';
+    }
+    
+    const { functionId, params, functionName } = state.argsFormData;
+    const functionDisplay = functionName || extractDisplayName(functionId);
+    
+    let formFields = '';
+    if (params && params.length > 0) {
+      params.forEach(function(paramName, index) {
+        formFields += `
+          <div class="form-field">
+            <label for="param-${index}" class="form-label">${escapeHtml(paramName)}</label>
+            <input 
+              type="text" 
+              id="param-${index}" 
+              class="form-input" 
+              data-param="${escapeAttribute(paramName)}"
+              placeholder="Enter value (JSON: strings use quotes, numbers/booleans without quotes)"
+              autocomplete="off"
+            />
+          </div>
+        `;
+      });
+    } else {
+      formFields = '<div class="form-field"><p class="form-info">This function has no parameters.</p></div>';
+    }
+    
+    return `
+      <div class="args-form-overlay" data-action="close-args-form">
+        <div class="args-form-modal">
+          <div class="args-form-header">
+            <h3 class="args-form-title">Provide Arguments</h3>
+            <button type="button" class="args-form-close" data-action="close-args-form" aria-label="Close">&times;</button>
+          </div>
+          <div class="args-form-body">
+            <div class="args-form-info">
+              <strong>Function:</strong> ${escapeHtml(functionDisplay)}
+            </div>
+            <form class="args-form" data-function-id="${escapeAttribute(functionId)}">
+              ${formFields}
+              <div class="form-actions">
+                <button type="button" class="form-btn form-btn-secondary" data-action="close-args-form">Cancel</button>
+                <button type="submit" class="form-btn form-btn-primary">Execute</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+    `;
   }
 
   function renderCallSitesSection(parentId) {

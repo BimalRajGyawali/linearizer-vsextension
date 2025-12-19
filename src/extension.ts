@@ -751,52 +751,44 @@ async function showFlowPanel(
 						});
 					}
 				}
-			} else if (message.type === 'execute-with-args' && typeof message.functionId === 'string') {
-				console.log('[extension] Executing function with user-provided arguments:', message.functionId);
+			} else if (message.type === 'request-args-form' && typeof message.functionId === 'string') {
+				// Webview is requesting to show the args form - send function signature
+				console.log('[extension] Requesting args form for:', message.functionId);
 				try {
 					const pythonPath = await getPythonPath();
 					const targetFunctionId = message.functionId;
 					const entryFullId = targetFunctionId.startsWith('/') ? targetFunctionId.slice(1) : targetFunctionId;
-					const targetLine = typeof message.line === 'number' ? message.line : 1;
 					
-					// Get function signature to show user what parameters are expected
 					const signature = await getFunctionSignature(pythonPath, currentRepoRoot!, entryFullId, context.extensionPath);
 					
-					let argsJson: string;
-					if (signature && signature.params.length > 0) {
-						// Show individual input fields for each parameter
-						const kwargs: Record<string, unknown> = {};
-						
-						for (let i = 0; i < signature.params.length; i++) {
-							const paramName = signature.params[i];
-							const paramInput = await vscode.window.showInputBox({
-								prompt: `Enter value for parameter "${paramName}" (${i + 1}/${signature.params.length})`,
-								placeHolder: `Enter value for ${paramName} (JSON format: strings use quotes, numbers/booleans without quotes)`,
-								ignoreFocusOut: true, // Keep dialog open if user clicks away
-							});
-
-							if (paramInput === undefined) {
-								// User cancelled - stop collecting parameters
-								return;
-							}
-
-							if (paramInput.trim()) {
-								// Try to parse as JSON first (supports strings, numbers, booleans, null, arrays, objects)
-								try {
-									const parsed = JSON.parse(paramInput.trim());
-									kwargs[paramName] = parsed;
-								} catch {
-									// If JSON parsing fails, treat as a plain string
-									kwargs[paramName] = paramInput.trim();
-								}
-							}
-							// If empty string, skip this parameter (it will be missing from kwargs)
-						}
-						
-						argsJson = JSON.stringify({ args: [], kwargs });
+					// Extract function name for display
+					const functionName = entryFullId.split('::').pop() || entryFullId;
+					
+					// Send signature to webview to show the form
+					if (flowPanel) {
+						flowPanel.webview.postMessage({
+							type: 'show-args-form',
+							functionId: targetFunctionId,
+							params: signature?.params || [],
+							functionName: functionName,
+						});
+					}
+				} catch (error) {
+					console.error('[extension] Error getting function signature:', error);
+					vscode.window.showErrorMessage(`Error getting function signature: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			} else if (message.type === 'execute-with-args' && typeof message.functionId === 'string') {
+				console.log('[extension] Executing function with user-provided arguments:', message.functionId);
+				try {
+					const targetFunctionId = message.functionId;
+					const targetLine = typeof message.line === 'number' ? message.line : 1;
+					
+					// Get arguments from message (provided by webview form)
+					let callArgs: NormalisedCallArgs;
+					if (message.args && typeof message.args === 'object') {
+						callArgs = normaliseCallArgs(message.args as TraceCallArgs);
 					} else {
-						// No parameters, use empty args
-						argsJson = JSON.stringify({ args: [], kwargs: {} });
+						callArgs = { args: [], kwargs: {} };
 					}
 					
 					// Execute the function with provided arguments at the specified line
@@ -805,7 +797,7 @@ async function showFlowPanel(
 						targetLine,
 						targetLine,
 						context,
-						JSON.parse(argsJson) as NormalisedCallArgs,
+						callArgs,
 						undefined, // No parent context
 					);
 				} catch (error) {
