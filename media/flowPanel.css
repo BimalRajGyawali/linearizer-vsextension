@@ -165,6 +165,89 @@ h2 {
   background: var(--vscode-editor-background);
 }
 
+.parent-args-section {
+  padding: 12px;
+  border-bottom: 1px solid var(--vscode-editorWidget-border);
+  background: var(--vscode-editor-background);
+}
+
+.parent-args-header {
+  font-weight: 600;
+  margin-bottom: 12px;
+  font-size: 0.9rem;
+  color: var(--vscode-foreground);
+}
+
+.parent-args-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.args-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.args-group-label {
+  font-weight: 500;
+  font-size: 0.85rem;
+  color: var(--vscode-descriptionForeground);
+  margin-bottom: 4px;
+}
+
+.arg-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.arg-label {
+  min-width: 80px;
+  font-size: 0.85rem;
+  color: var(--vscode-foreground);
+  font-weight: 500;
+}
+
+.arg-input {
+  flex: 1;
+  padding: 6px 8px;
+  font-family: var(--vscode-editor-font-family, 'Courier New', Consolas, monospace);
+  font-size: 0.85rem;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border);
+  border-radius: 2px;
+}
+
+.arg-input:focus {
+  outline: none;
+  border-color: var(--vscode-focusBorder);
+}
+
+.save-args-btn {
+  margin-top: 8px;
+  padding: 8px 16px;
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #ffffff);
+  border: none;
+  border-radius: 4px;
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+  align-self: flex-start;
+}
+
+.save-args-btn:hover {
+  background: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+.save-args-btn:active {
+  background: var(--vscode-button-activeBackground, #0a4d73);
+}
+
 .call-sites-header {
   font-weight: 600;
   margin-bottom: 8px;

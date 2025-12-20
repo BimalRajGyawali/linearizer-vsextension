@@ -800,6 +800,35 @@ async function showFlowPanel(
 						});
 					}
 				}
+			} else if (message.type === 'request-function-signature' && typeof message.functionId === 'string') {
+				// Webview is requesting function signature (for displaying parameter names)
+				console.log('[extension] Requesting function signature for:', message.functionId);
+				try {
+					const pythonPath = await getPythonPath();
+					const targetFunctionId = message.functionId;
+					const entryFullId = targetFunctionId.startsWith('/') ? targetFunctionId.slice(1) : targetFunctionId;
+					
+					const signature = await getFunctionSignature(pythonPath, currentRepoRoot!, entryFullId, context.extensionPath);
+					
+					// Send signature to webview
+					if (flowPanel) {
+						flowPanel.webview.postMessage({
+							type: 'function-signature',
+							functionId: targetFunctionId,
+							params: signature?.params || [],
+						});
+					}
+				} catch (error) {
+					console.error('[extension] Error getting function signature:', error);
+					// Don't show error message, just send empty params
+					if (flowPanel) {
+						flowPanel.webview.postMessage({
+							type: 'function-signature',
+							functionId: message.functionId,
+							params: [],
+						});
+					}
+				}
 			} else if (message.type === 'request-args-form' && typeof message.functionId === 'string') {
 				// Webview is requesting to show the args form - send function signature
 				console.log('[extension] Requesting args form for:', message.functionId);
@@ -928,22 +957,26 @@ async function showFlowPanel(
 								context.extensionPath,
 							);
 							
-							// Now execute the target function with the extracted arguments
+							// Send extracted arguments to webview to display and allow editing
 							if (extractedArgs && !('error' in extractedArgs)) {
 								const normalisedArgs = normaliseCallArgs(extractedArgs);
-								
-								// Execute the target function with extracted arguments
-								await handleTraceLine(
-									targetFunctionId,
-									1, // Start from first line
-									1,
-									context,
-									normalisedArgs,
-									undefined, // No parent context - this is a top-level execution
-								);
+								if (flowPanel?.webview) {
+									flowPanel.webview.postMessage({
+										type: 'call-site-args-extracted',
+										functionId: targetFunctionId,
+										callSite: callSite,
+										args: normalisedArgs,
+									});
+								}
 							} else {
 								const errorMsg = extractedArgs && 'error' in extractedArgs ? extractedArgs.error : 'Failed to extract call arguments';
-								vscode.window.showErrorMessage(`Error extracting arguments from call site: ${errorMsg}`);
+								if (flowPanel?.webview) {
+									flowPanel.webview.postMessage({
+										type: 'call-site-args-error',
+										functionId: targetFunctionId,
+										error: errorMsg,
+									});
+								}
 							}
 						} else {
 							// No calling function ID (from fallback text search) - try to extract from call line directly
@@ -963,22 +996,32 @@ async function showFlowPanel(
 								
 								if (extractedArgs && !('error' in extractedArgs)) {
 									const normalisedArgs = normaliseCallArgs(extractedArgs);
-									
-									// Execute the target function with extracted arguments
-									await handleTraceLine(
-										targetFunctionId,
-										1, // Start from first line
-										1,
-										context,
-										normalisedArgs,
-										undefined, // No parent context - this is a top-level execution
-									);
+									if (flowPanel?.webview) {
+										flowPanel.webview.postMessage({
+											type: 'call-site-args-extracted',
+											functionId: targetFunctionId,
+											callSite: callSite,
+											args: normalisedArgs,
+										});
+									}
 								} else {
 									const errorMsg = extractedArgs && 'error' in extractedArgs ? extractedArgs.error : 'Failed to extract call arguments from call line';
-									vscode.window.showErrorMessage(`Cannot execute from call site: ${errorMsg}. The calling function could not be determined. Please use "Provide Arguments" to manually enter function arguments.`);
+									if (flowPanel?.webview) {
+										flowPanel.webview.postMessage({
+											type: 'call-site-args-error',
+											functionId: targetFunctionId,
+											error: errorMsg,
+										});
+									}
 								}
 							} else {
-								vscode.window.showErrorMessage('Cannot execute from call site: The calling function could not be determined and the call line is not available. Please use "Provide Arguments" to manually enter function arguments.');
+								if (flowPanel?.webview) {
+									flowPanel.webview.postMessage({
+										type: 'call-site-args-error',
+										functionId: targetFunctionId,
+										error: 'The calling function could not be determined and the call line is not available.',
+									});
+								}
 							}
 						}
 					} else {

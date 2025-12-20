@@ -20,6 +20,9 @@
     callSitesByFunction: new Map(), // functionId -> Array of call sites
     loadingCallSites: new Set(), // Set of functionIds for which we're loading call sites
     selectedCallSite: new Map(), // functionId -> selected call site
+    functionSignatures: new Map(), // functionId -> Array of parameter names
+    loadingSignatures: new Set(), // Set of functionIds for which we're loading signatures
+    lastClickedLine: new Map(), // functionId -> { line, stopLine } - track last clicked line for execution
     argsFormVisible: false, // Whether the arguments form modal is visible
     argsFormData: null, // { functionId, params: [] }
     tracingParent: new Set(), // Set of parent functionIds currently being traced
@@ -219,6 +222,15 @@
       console.error('[flowPanel] Error finding call sites:', message.error);
       // Still render to show error state
       render();
+    } else if (message.type === 'call-site-args-extracted' && typeof message.functionId === 'string' && message.args) {
+      // Arguments extracted from call site - store them and update UI
+      console.log('[flowPanel] Received extracted args for', message.functionId, ':', message.args);
+      state.callArgsByFunction.set(message.functionId, cloneArgs(message.args));
+      render();
+    } else if (message.type === 'call-site-args-error' && typeof message.functionId === 'string') {
+      console.error('[flowPanel] Error extracting args from call site:', message.error);
+      // Show error but don't prevent rendering
+      render();
     } else if (message.type === 'tracer-event') {
       if (message.event) {
         // Add or update event in the array
@@ -306,6 +318,11 @@
         state.tracerEvents.push(errorEvent);
         render();
       }
+    } else if (message.type === 'function-signature' && typeof message.functionId === 'string' && Array.isArray(message.params)) {
+      // Store function signature
+      state.loadingSignatures.delete(message.functionId);
+      state.functionSignatures.set(message.functionId, message.params);
+      render();
     } else if (message.type === 'show-args-form' && typeof message.functionId === 'string') {
       // Show the arguments form modal
       state.argsFormVisible = true;
@@ -314,6 +331,10 @@
         params: Array.isArray(message.params) ? message.params : [],
         functionName: typeof message.functionName === 'string' ? message.functionName : null,
       };
+      // Also store signature for later use
+      if (Array.isArray(message.params)) {
+        state.functionSignatures.set(message.functionId, message.params);
+      }
       render();
       
       // Focus first input field
@@ -442,12 +463,78 @@
           state.selectedCallSite.set(parentId, callSite);
           render();
           
-          // Execute from this call site
+          // Extract arguments from this call site (don't execute immediately)
           vscode.postMessage({
             type: 'execute-from-call-site',
             functionId: parentId,
             callSite: callSite,
           });
+        }
+      }
+    } else if (action === 'save-parent-args') {
+      const parentId = target.getAttribute('data-parent-id');
+      if (parentId) {
+        // Collect all argument inputs
+        const argsSection = target.closest('.parent-args-section');
+        if (argsSection) {
+          const argInputs = argsSection.querySelectorAll('.arg-input');
+          const args = [];
+          const kwargs = {};
+          
+          // First collect all args and kwargs separately
+          const argsMap = new Map();
+          argInputs.forEach(function(input) {
+            const argType = input.getAttribute('data-arg-type');
+            const value = input.value.trim();
+            
+            if (value) {
+              try {
+                // Try to parse as JSON first
+                const parsedValue = JSON.parse(value);
+                if (argType === 'args') {
+                  const index = parseInt(input.getAttribute('data-arg-index'), 10);
+                  argsMap.set(index, parsedValue);
+                } else if (argType === 'kwargs') {
+                  const key = input.getAttribute('data-arg-key');
+                  kwargs[key] = parsedValue;
+                }
+              } catch {
+                // If JSON parsing fails, treat as plain string
+                if (argType === 'args') {
+                  const index = parseInt(input.getAttribute('data-arg-index'), 10);
+                  argsMap.set(index, value);
+                } else if (argType === 'kwargs') {
+                  const key = input.getAttribute('data-arg-key');
+                  kwargs[key] = value;
+                }
+              }
+            }
+          });
+          
+          // Convert argsMap to array (in order)
+          const sortedIndices = Array.from(argsMap.keys()).sort(function(a, b) { return a - b; });
+          sortedIndices.forEach(function(index) {
+            args.push(argsMap.get(index));
+          });
+          
+          // Store the updated arguments
+          state.callArgsByFunction.set(parentId, { args: args, kwargs: kwargs });
+          console.log('[flowPanel] Saved arguments for', parentId, ':', { args, kwargs });
+          
+          // If there's a last clicked line, execute at that position
+          const lastClicked = state.lastClickedLine.get(parentId);
+          if (lastClicked) {
+            console.log('[flowPanel] Executing function with updated args at line', lastClicked.line);
+            vscode.postMessage({
+              type: 'trace-line',
+              functionId: parentId,
+              line: lastClicked.line,
+              stopLine: lastClicked.stopLine,
+              callArgs: { args: args, kwargs: kwargs },
+            });
+          }
+          
+          render();
         }
       }
     } else if (action === 'execute-with-args') {
@@ -476,6 +563,7 @@
     } else if (action === 'trace-line') {
       const functionId = target.getAttribute('data-function');
       const line = target.getAttribute('data-line');
+      const stopLine = target.getAttribute('data-stop-line');
       const callTarget = target.getAttribute('data-call-target');
       const parentFunctionId = target.getAttribute('data-parent-function');
       const parentLine = target.getAttribute('data-parent-line');
@@ -484,6 +572,11 @@
       console.log('[flowPanel] Trace-line clicked, functionId:', functionId, 'line:', line, 'parent:', parentFunctionId, 'parentLine:', parentLine);
       if (functionId && line) {
         const lineNumber = parseInt(line, 10);
+        const stopLineCandidate = stopLine ? parseInt(stopLine, 10) : lineNumber + 1;
+        const stopLineNum = Number.isFinite(stopLineCandidate) ? stopLineCandidate : lineNumber + 1;
+        
+        // Store the clicked line for auto-execution after args update
+        state.lastClickedLine.set(functionId, { line: lineNumber, stopLine: stopLineNum });
         
         // Don't clear events when clicking - allow multiple lines to show values simultaneously
         // The event handler will manage duplicates for the same line
@@ -492,7 +585,7 @@
           type: 'trace-line', 
           functionId, 
           line: lineNumber, 
-          stopLine: lineNumber + 1 
+          stopLine: stopLineNum 
         };
 
         // If this is a nested function, include parent context
@@ -698,6 +791,67 @@
     `;
   }
 
+  function renderParentArgsSection(parentId) {
+    const storedArgs = getCallArgsForFunction(parentId);
+    if (!storedArgs || (storedArgs.args.length === 0 && Object.keys(storedArgs.kwargs || {}).length === 0)) {
+      return '<div class="parent-args-section"><div class="placeholder mini">No arguments set. Select a call site or provide arguments manually.</div></div>';
+    }
+
+    // Get function signature to map parameter names
+    const params = state.functionSignatures.get(parentId);
+    if (!params && !state.loadingSignatures.has(parentId)) {
+      // Request function signature
+      state.loadingSignatures.add(parentId);
+      vscode.postMessage({
+        type: 'request-function-signature',
+        functionId: parentId,
+      });
+    }
+
+    let html = '<div class="parent-args-section">';
+    html += '<div class="parent-args-header">Function Arguments:</div>';
+    html += '<div class="parent-args-content">';
+    
+    // Render positional arguments with parameter names
+    if (storedArgs.args && storedArgs.args.length > 0) {
+      html += '<div class="args-group">';
+      html += '<div class="args-group-label">Positional Arguments:</div>';
+      storedArgs.args.forEach(function(arg, index) {
+        // Format value for display - use JSON.stringify for all values
+        const valueStr = JSON.stringify(arg);
+        // Use parameter name if available, otherwise use index
+        const paramName = params && params[index] ? params[index] : '[' + index + ']';
+        html += '<div class="arg-item">';
+        html += '<label class="arg-label">' + escapeHtml(paramName) + ':</label>';
+        html += '<input type="text" class="arg-input" data-arg-type="args" data-arg-index="' + index + '" value="' + escapeAttribute(valueStr) + '" />';
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+    
+    // Render keyword arguments
+    if (storedArgs.kwargs && Object.keys(storedArgs.kwargs).length > 0) {
+      html += '<div class="args-group">';
+      html += '<div class="args-group-label">Keyword Arguments:</div>';
+      Object.keys(storedArgs.kwargs).forEach(function(key) {
+        const argValue = storedArgs.kwargs[key];
+        // Format value for display - use JSON.stringify for all values
+        const valueStr = JSON.stringify(argValue);
+        html += '<div class="arg-item">';
+        html += '<label class="arg-label">' + escapeHtml(key) + ':</label>';
+        html += '<input type="text" class="arg-input" data-arg-type="kwargs" data-arg-key="' + escapeAttribute(key) + '" value="' + escapeAttribute(valueStr) + '" />';
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+    
+    html += '<button type="button" class="save-args-btn" data-action="save-parent-args" data-parent-id="' + escapeAttribute(parentId) + '">Save Arguments</button>';
+    html += '</div>';
+    html += '</div>';
+    
+    return html;
+  }
+
   function renderCallSitesSection(parentId) {
     const callSites = state.callSitesByFunction.get(parentId);
     const loading = state.loadingCallSites.has(parentId);
@@ -754,9 +908,10 @@
       : '';
     
     const callSitesSection = isExpanded ? renderCallSitesSection(parentId) : '';
+    const parentArgsSection = isExpanded ? renderParentArgsSection(parentId) : '';
     
     const body = isExpanded
-      ? (callSitesSection + (fn
+      ? (callSitesSection + parentArgsSection + (fn
         ? '<div class="function-container">' + renderFunctionBody(parentId, new Set([parentId]), null) + '</div>'
         : '<div class="placeholder mini">No function body captured for ' + escapeHtml(title) + '.</div>'))
       : '';
