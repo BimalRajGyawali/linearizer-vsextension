@@ -1036,6 +1036,14 @@ async function showFlowPanel(
 					activeTracer.stop();
 					activeTracer = undefined;
 				}
+			} else if (message.type === 'reset-tracer' && typeof message.functionId === 'string') {
+				// Reset tracer when arguments are updated - this ensures a new tracer is created
+				// with the new arguments on the next execution
+				console.log('[extension] Resetting tracer for function:', message.functionId);
+				if (activeTracer) {
+					activeTracer.stop();
+					activeTracer = undefined;
+				}
 			}
 		});
 		context.subscriptions.push(flowPanelMessageDisposable);

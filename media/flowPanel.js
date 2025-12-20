@@ -481,56 +481,76 @@
           const args = [];
           const kwargs = {};
           
-          // First collect all args and kwargs separately
-          const argsMap = new Map();
+          // Collect all args and kwargs from inputs
+          // Use arrays to maintain order for positional args
+          const argsByIndex = [];
           argInputs.forEach(function(input) {
             const argType = input.getAttribute('data-arg-type');
             const value = input.value.trim();
             
-            if (value) {
-              try {
-                // Try to parse as JSON first
-                const parsedValue = JSON.parse(value);
-                if (argType === 'args') {
-                  const index = parseInt(input.getAttribute('data-arg-index'), 10);
-                  argsMap.set(index, parsedValue);
-                } else if (argType === 'kwargs') {
-                  const key = input.getAttribute('data-arg-key');
-                  kwargs[key] = parsedValue;
+            if (argType === 'args') {
+              const index = parseInt(input.getAttribute('data-arg-index'), 10);
+              if (value) {
+                try {
+                  // Try to parse as JSON first
+                  argsByIndex[index] = JSON.parse(value);
+                } catch {
+                  // If JSON parsing fails, treat as plain string
+                  argsByIndex[index] = value;
                 }
-              } catch {
-                // If JSON parsing fails, treat as plain string
-                if (argType === 'args') {
-                  const index = parseInt(input.getAttribute('data-arg-index'), 10);
-                  argsMap.set(index, value);
-                } else if (argType === 'kwargs') {
-                  const key = input.getAttribute('data-arg-key');
+              } else {
+                // Empty value - skip this argument (don't include it)
+              }
+            } else if (argType === 'kwargs') {
+              const key = input.getAttribute('data-arg-key');
+              if (value) {
+                try {
+                  // Try to parse as JSON first
+                  kwargs[key] = JSON.parse(value);
+                } catch {
+                  // If JSON parsing fails, treat as plain string
                   kwargs[key] = value;
                 }
               }
+              // If empty, just don't include this kwarg (which removes it)
             }
           });
           
-          // Convert argsMap to array (in order)
-          const sortedIndices = Array.from(argsMap.keys()).sort(function(a, b) { return a - b; });
-          sortedIndices.forEach(function(index) {
-            args.push(argsMap.get(index));
+          // Convert argsByIndex to array, skipping undefined values but maintaining order
+          for (let i = 0; i < argsByIndex.length; i++) {
+            if (argsByIndex[i] !== undefined) {
+              args.push(argsByIndex[i]);
+            }
+          }
+          
+          // Store the updated arguments (create new object to ensure reference is updated)
+          // Use Object.assign or spread to ensure we create a completely new object
+          const newArgs = { 
+            args: JSON.parse(JSON.stringify(args)), // Deep clone to ensure new reference
+            kwargs: JSON.parse(JSON.stringify(kwargs)) 
+          };
+          state.callArgsByFunction.set(parentId, newArgs);
+          console.log('[flowPanel] Saved arguments for', parentId, ':', newArgs);
+          // Force a verification read to ensure it's stored
+          const verifyStored = state.callArgsByFunction.get(parentId);
+          console.log('[flowPanel] Verified stored args after save:', verifyStored);
+          
+          // Stop/reset the tracer so a new one will be created with the new arguments
+          vscode.postMessage({
+            type: 'reset-tracer',
+            functionId: parentId,
           });
           
-          // Store the updated arguments
-          state.callArgsByFunction.set(parentId, { args: args, kwargs: kwargs });
-          console.log('[flowPanel] Saved arguments for', parentId, ':', { args, kwargs });
-          
-          // If there's a last clicked line, execute at that position
-          const lastClicked = state.lastClickedLine.get(parentId);
-          if (lastClicked) {
-            console.log('[flowPanel] Executing function with updated args at line', lastClicked.line);
-            vscode.postMessage({
-              type: 'trace-line',
-              functionId: parentId,
-              line: lastClicked.line,
-              stopLine: lastClicked.stopLine,
-              callArgs: { args: args, kwargs: kwargs },
+          // Clear any previous execution state for this function so next click is fresh
+          // Remove tracer events for this function to start fresh
+          const fn = functions[parentId];
+          if (fn && fn.file) {
+            const fnFile = fn.file.replace(/\\/g, '/');
+            state.tracerEvents = state.tracerEvents.filter(function(e) {
+              // Keep events that are not for this function
+              if (!e.filename) return true;
+              const eFile = e.filename.replace(/\\/g, '/');
+              return eFile !== fnFile && !fnFile.endsWith(eFile) && !eFile.endsWith(fnFile);
             });
           }
           
@@ -612,8 +632,10 @@
           state.pendingCallTargets.set(pendingKey, callTarget);
         }
 
+        // Always get the latest stored arguments (in case they were just updated)
         const storedArgs = getCallArgsForFunction(functionId);
         if (storedArgs) {
+          console.log('[flowPanel] Using stored args for', functionId, ':', storedArgs);
           payload.callArgs = storedArgs;
         } else if (parents.indexOf(functionId) >= 0) {
           // For parent functions without stored args, don't execute automatically
