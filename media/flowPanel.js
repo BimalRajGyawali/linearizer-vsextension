@@ -5,9 +5,10 @@
   const flows = Array.isArray(data.flows) ? data.flows : [];
   const changed = Array.isArray(data.changedFunctions) ? data.changedFunctions : [];
 
+  // Baseline empty arguments for parents – real values come from user input or extracted call context
   const DEFAULT_PARENT_ARGS = {
     args: [],
-    kwargs: { metric_name: 'test', period: 'last_7_days' },
+    kwargs: {},
   };
 
   const state = {
@@ -16,6 +17,16 @@
     tracerEvents: [], // Array of trace events: { event, line, filename, function, locals, globals, error, traceback }
     callArgsByFunction: new Map(), // functionId -> { args: [], kwargs: {} }
     pendingCallTargets: new Map(), // key (functionId:line) -> callee functionId
+    callSitesByFunction: new Map(), // functionId -> Array of call sites
+    loadingCallSites: new Set(), // Set of functionIds for which we're loading call sites
+    selectedCallSite: new Map(), // functionId -> selected call site
+    functionSignatures: new Map(), // functionId -> Array of parameter names
+    loadingSignatures: new Set(), // Set of functionIds for which we're loading signatures
+    lastClickedLine: new Map(), // functionId -> { line, stopLine } - track last clicked line for execution
+    argsFormVisible: false, // Whether the arguments form modal is visible
+    argsFormData: null, // { functionId, params: [] }
+    tracingParent: new Set(), // Set of parent functionIds currently being traced
+    tracingChild: new Set(), // Set of child functionIds currently being traced
   };
   
   // Helper function to format values for display
@@ -201,37 +212,53 @@
   // Listen for messages from extension
   window.addEventListener('message', (event) => {
     const message = event.data;
-    if (message.type === 'tracer-event') {
+    if (message.type === 'call-sites-found' && typeof message.functionId === 'string' && Array.isArray(message.callSites)) {
+      state.loadingCallSites.delete(message.functionId);
+      state.callSitesByFunction.set(message.functionId, message.callSites);
+      console.log('[flowPanel] Received call sites for', message.functionId, ':', message.callSites.length, 'sites');
+      render();
+    } else if (message.type === 'call-sites-error' && typeof message.functionId === 'string') {
+      state.loadingCallSites.delete(message.functionId);
+      console.error('[flowPanel] Error finding call sites:', message.error);
+      // Still render to show error state
+      render();
+    } else if (message.type === 'call-site-args-extracted' && typeof message.functionId === 'string' && message.args) {
+      // Arguments extracted from call site - store them and update UI
+      console.log('[flowPanel] Received extracted args for', message.functionId, ':', message.args);
+      state.callArgsByFunction.set(message.functionId, cloneArgs(message.args));
+      render();
+    } else if (message.type === 'call-site-args-error' && typeof message.functionId === 'string') {
+      console.error('[flowPanel] Error extracting args from call site:', message.error);
+      // Show error but don't prevent rendering
+      render();
+    } else if (message.type === 'tracer-event') {
       if (message.event) {
         // Add or update event in the array
         const eventData = message.event;
         
-        // Remove ALL existing events for this file to prevent showing on multiple lines
-        // When a new event arrives, it replaces all previous events for that file
-        if (state.tracerEvents && eventData.filename) {
+        // Remove only events for the EXACT same line and file to prevent duplicates
+        // Keep events for other lines so previously clicked lines remain visible
+        if (state.tracerEvents && eventData.filename && eventData.line !== undefined) {
           const eventFile = eventData.filename.replace(/\\/g, '/');
           const eventLine = eventData.line;
           console.log('[flowPanel] Received event - line:', eventLine, 'file:', eventFile);
-          console.log('[flowPanel] Current events before filter:', state.tracerEvents.map(function(e) {
-            return 'line:' + e.line + ' file:' + (e.filename || 'none');
-          }));
           state.tracerEvents = state.tracerEvents.filter(function(e) {
-            if (!e.filename) return true; // Keep events without filename
+            if (!e.filename || e.line === undefined) return true; // Keep events without filename or line
             const eFile = e.filename.replace(/\\/g, '/');
-            // Remove ALL events for the same file (not just adjacent lines)
-            // This ensures only one event per file is shown at a time
+            // Only remove events for the same file AND EXACT same line
+            // This allows multiple lines to have events simultaneously
             if (eFile === eventFile || eventFile.endsWith(eFile) || eFile.endsWith(eventFile)) {
-              console.log('[flowPanel] Removing event at line:', e.line, 'for file:', eFile);
-              return false;
+              // Remove only if it's the EXACT same line (not adjacent)
+              if (e.line === eventLine) {
+                console.log('[flowPanel] Removing event at line:', e.line, 'for file:', eFile, '(exact match with', eventLine, ')');
+                return false;
+              }
             }
-            return true;
+            return true; // Keep events for other lines or other files
           });
-          console.log('[flowPanel] Events after filter:', state.tracerEvents.map(function(e) {
-            return 'line:' + e.line + ' file:' + (e.filename || 'none');
-          }));
         }
         
-        // Double-check: ensure no duplicate event exists before adding
+        // Check if event already exists for this exact line and file
         const eventKey = `${eventData.line}:${eventData.filename || ''}`;
         const duplicateExists = state.tracerEvents.some(function(e) {
           const eKey = `${e.line}:${e.filename || ''}`;
@@ -239,11 +266,19 @@
         });
         
         if (!duplicateExists) {
-          // Add the new event (we've already cleared all events for this file above)
+          // Add the new event
           console.log('[flowPanel] Adding event at line:', eventData.line, 'for file:', eventData.filename);
           state.tracerEvents.push(eventData);
         } else {
-          console.log('[flowPanel] Duplicate event detected, skipping. Line:', eventData.line, 'file:', eventData.filename);
+          // Update existing event instead of adding duplicate
+          const existingIndex = state.tracerEvents.findIndex(function(e) {
+            const eKey = `${e.line}:${e.filename || ''}`;
+            return eKey === eventKey;
+          });
+          if (existingIndex >= 0) {
+            state.tracerEvents[existingIndex] = eventData;
+            console.log('[flowPanel] Updated existing event at line:', eventData.line);
+          }
         }
 
         const functionIdForEvent = findFunctionIdForEvent(eventData);
@@ -283,10 +318,116 @@
         state.tracerEvents.push(errorEvent);
         render();
       }
+    } else if (message.type === 'function-signature' && typeof message.functionId === 'string' && Array.isArray(message.params)) {
+      // Store function signature
+      state.loadingSignatures.delete(message.functionId);
+      state.functionSignatures.set(message.functionId, message.params);
+      render();
+    } else if (message.type === 'show-args-form' && typeof message.functionId === 'string') {
+      // Show the arguments form modal
+      state.argsFormVisible = true;
+      state.argsFormData = {
+        functionId: message.functionId,
+        params: Array.isArray(message.params) ? message.params : [],
+        functionName: typeof message.functionName === 'string' ? message.functionName : null,
+      };
+      // Also store signature for later use
+      if (Array.isArray(message.params)) {
+        state.functionSignatures.set(message.functionId, message.params);
+      }
+      render();
+      
+      // Focus first input field
+      setTimeout(function() {
+        const firstInput = root.querySelector('.form-input');
+        if (firstInput) {
+          firstInput.focus();
+        }
+      }, 100);
+    } else if (message.type === 'tracing-parent' && typeof message.parentId === 'string') {
+      // Update loading state for parent tracing
+      if (message.show) {
+        state.tracingParent.add(message.parentId);
+      } else {
+        state.tracingParent.delete(message.parentId);
+      }
+      render();
+    } else if (message.type === 'tracing-child' && typeof message.childId === 'string') {
+      // Update loading state for child tracing
+      if (message.show) {
+        state.tracingChild.add(message.childId);
+      } else {
+        state.tracingChild.delete(message.childId);
+      }
+      render();
+    }
+  });
+
+  // Handle Escape key to close modal
+  document.addEventListener('keydown', function(event) {
+    if (event.key === 'Escape' && state.argsFormVisible) {
+      state.argsFormVisible = false;
+      state.argsFormData = null;
+      render();
+    }
+  });
+
+  // Handle form submission
+  root.addEventListener('submit', (event) => {
+    if (event.target instanceof HTMLFormElement && event.target.classList.contains('args-form')) {
+      event.preventDefault();
+      const form = event.target;
+      const functionId = form.getAttribute('data-function-id');
+      if (!functionId) return;
+      
+      const inputs = form.querySelectorAll('.form-input');
+      const kwargs = {};
+      
+      inputs.forEach(function(input) {
+        const paramName = input.getAttribute('data-param');
+        const value = input.value.trim();
+        
+        if (value) {
+          // Try to parse as JSON first (supports strings, numbers, booleans, null, arrays, objects)
+          try {
+            kwargs[paramName] = JSON.parse(value);
+          } catch {
+            // If JSON parsing fails, treat as a plain string
+            kwargs[paramName] = value;
+          }
+        }
+      });
+      
+      // Store arguments locally - execution will happen when user clicks a line
+      setCallArgsForFunction(functionId, { args: [], kwargs: kwargs });
+      
+      // Also notify extension to store the args so recursive tracing can find them
+      vscode.postMessage({
+        type: 'store-call-args',
+        functionId: functionId,
+        args: { args: [], kwargs: kwargs },
+      });
+      
+      // Hide form
+      state.argsFormVisible = false;
+      state.argsFormData = null;
+      render();
+      return;
     }
   });
 
   root.addEventListener('click', (event) => {
+    // Prevent clicks inside the modal from closing it (except for buttons with actions)
+    const modal = root.querySelector('.args-form-modal');
+    if (modal && modal.contains(event.target)) {
+      const clickedElement = event.target;
+      // Allow clicks on buttons with data-action (like Cancel, Close buttons)
+      if (clickedElement.tagName !== 'BUTTON' || !clickedElement.hasAttribute('data-action')) {
+        // For non-button elements or buttons without actions, stop here to prevent closing
+        return;
+      }
+    }
+    
     const target = findActionTarget(event.target);
     if (!target) {
       return;
@@ -307,8 +448,132 @@
       }
     } else if (action === 'toggle-call') {
       const call = target.getAttribute('data-call');
+      const targetId = target.getAttribute('data-target-id');
       if (call) {
-        toggleCall(call);
+        toggleCall(call, targetId);
+      }
+    } else if (action === 'select-call-site') {
+      const parentId = target.getAttribute('data-parent-id');
+      const callSiteIndex = target.getAttribute('data-call-site-index');
+      if (parentId && callSiteIndex !== null) {
+        const index = parseInt(callSiteIndex, 10);
+        const callSites = state.callSitesByFunction.get(parentId);
+        if (callSites && callSites[index]) {
+          const callSite = callSites[index];
+          state.selectedCallSite.set(parentId, callSite);
+          render();
+          
+          // Extract arguments from this call site (don't execute immediately)
+          vscode.postMessage({
+            type: 'execute-from-call-site',
+            functionId: parentId,
+            callSite: callSite,
+          });
+        }
+      }
+    } else if (action === 'save-parent-args') {
+      const parentId = target.getAttribute('data-parent-id');
+      if (parentId) {
+        // Collect all argument inputs
+        const argsSection = target.closest('.parent-args-section');
+        if (argsSection) {
+          const argInputs = argsSection.querySelectorAll('.arg-input');
+          const args = [];
+          const kwargs = {};
+          
+          // Collect all args and kwargs from inputs
+          // Use arrays to maintain order for positional args
+          const argsByIndex = [];
+          argInputs.forEach(function(input) {
+            const argType = input.getAttribute('data-arg-type');
+            const value = input.value.trim();
+            
+            if (argType === 'args') {
+              const index = parseInt(input.getAttribute('data-arg-index'), 10);
+              if (value) {
+                try {
+                  // Try to parse as JSON first
+                  argsByIndex[index] = JSON.parse(value);
+                } catch {
+                  // If JSON parsing fails, treat as plain string
+                  argsByIndex[index] = value;
+                }
+              } else {
+                // Empty value - skip this argument (don't include it)
+              }
+            } else if (argType === 'kwargs') {
+              const key = input.getAttribute('data-arg-key');
+              if (value) {
+                try {
+                  // Try to parse as JSON first
+                  kwargs[key] = JSON.parse(value);
+                } catch {
+                  // If JSON parsing fails, treat as plain string
+                  kwargs[key] = value;
+                }
+              }
+              // If empty, just don't include this kwarg (which removes it)
+            }
+          });
+          
+          // Convert argsByIndex to array, skipping undefined values but maintaining order
+          for (let i = 0; i < argsByIndex.length; i++) {
+            if (argsByIndex[i] !== undefined) {
+              args.push(argsByIndex[i]);
+            }
+          }
+          
+          // Store the updated arguments (create new object to ensure reference is updated)
+          // Use Object.assign or spread to ensure we create a completely new object
+          const newArgs = { 
+            args: JSON.parse(JSON.stringify(args)), // Deep clone to ensure new reference
+            kwargs: JSON.parse(JSON.stringify(kwargs)) 
+          };
+          state.callArgsByFunction.set(parentId, newArgs);
+          console.log('[flowPanel] Saved arguments for', parentId, ':', newArgs);
+          // Force a verification read to ensure it's stored
+          const verifyStored = state.callArgsByFunction.get(parentId);
+          console.log('[flowPanel] Verified stored args after save:', verifyStored);
+          
+          // Stop/reset the tracer so a new one will be created with the new arguments
+          vscode.postMessage({
+            type: 'reset-tracer',
+            functionId: parentId,
+          });
+          
+          // Clear any previous execution state for this function so next click is fresh
+          // Remove tracer events for this function to start fresh
+          const fn = functions[parentId];
+          if (fn && fn.file) {
+            const fnFile = fn.file.replace(/\\/g, '/');
+            state.tracerEvents = state.tracerEvents.filter(function(e) {
+              // Keep events that are not for this function
+              if (!e.filename) return true;
+              const eFile = e.filename.replace(/\\/g, '/');
+              return eFile !== fnFile && !fnFile.endsWith(eFile) && !eFile.endsWith(fnFile);
+            });
+          }
+          
+          render();
+        }
+      }
+    } else if (action === 'execute-with-args') {
+      const parentId = target.getAttribute('data-parent-id');
+      if (parentId) {
+        // Request function signature first, then show form
+        vscode.postMessage({
+          type: 'request-args-form',
+          functionId: parentId,
+        });
+      }
+    } else if (action === 'close-args-form') {
+      // Only close if clicking directly on the overlay, not on the modal content
+      const clickedElement = event.target;
+      const modal = root.querySelector('.args-form-modal');
+      if (modal && (clickedElement === target || !modal.contains(clickedElement))) {
+        state.argsFormVisible = false;
+        state.argsFormData = null;
+        render();
       }
     } else if (action === 'open-source') {
       const identifier = target.getAttribute('data-target');
@@ -318,43 +583,75 @@
     } else if (action === 'trace-line') {
       const functionId = target.getAttribute('data-function');
       const line = target.getAttribute('data-line');
+      const stopLine = target.getAttribute('data-stop-line');
       const callTarget = target.getAttribute('data-call-target');
-      console.log('[flowPanel] Trace-line clicked, functionId:', functionId, 'line:', line);
+      const parentFunctionId = target.getAttribute('data-parent-function');
+      const parentLine = target.getAttribute('data-parent-line');
+      const callLine = target.getAttribute('data-call-line');
+      
+      console.log('[flowPanel] Trace-line clicked, functionId:', functionId, 'line:', line, 'parent:', parentFunctionId, 'parentLine:', parentLine);
       if (functionId && line) {
         const lineNumber = parseInt(line, 10);
+        const stopLineCandidate = stopLine ? parseInt(stopLine, 10) : lineNumber + 1;
+        const stopLineNum = Number.isFinite(stopLineCandidate) ? stopLineCandidate : lineNumber + 1;
         
-        // Clear any existing events for this function/file to prevent showing on multiple lines
-        // This ensures we only show the event on the exact line that was clicked
-        if (state.tracerEvents) {
-          const fnFile = functions[functionId]?.file || '';
-          state.tracerEvents = state.tracerEvents.filter(function(e) {
-            // Remove ALL events for this function/file, regardless of line number
-            // This ensures that when we click a new line, we clear all previous events for this function
-            if (e.filename && fnFile) {
-              const eFile = e.filename.replace(/\\/g, '/');
-              const targetFile = fnFile.replace(/\\/g, '/');
-              // If this event is for the same file, remove it
-              if (eFile === targetFile || targetFile.endsWith(eFile) || eFile.endsWith(targetFile)) {
-                return false; // Remove events for this file
-              }
-            }
-            // Keep events for different files
-            return true;
-          });
+        // Store the clicked line for auto-execution after args update
+        state.lastClickedLine.set(functionId, { line: lineNumber, stopLine: stopLineNum });
+        
+        // Don't clear events when clicking - allow multiple lines to show values simultaneously
+        // The event handler will manage duplicates for the same line
+        
+        const payload = { 
+          type: 'trace-line', 
+          functionId, 
+          line: lineNumber, 
+          stopLine: stopLineNum 
+        };
+
+        // If this is a nested function, include parent context
+        if (parentFunctionId && parentLine && callLine) {
+          payload.parentFunctionId = parentFunctionId;
+          payload.parentLine = parseInt(parentLine, 10);
+          payload.callLine = parseInt(callLine, 10);
+          payload.isNested = true;
+          
+          // Always include parent's stored arguments so extension can execute parent function
+          // If parent doesn't have stored args, we need to prevent execution
+          const parentStoredArgs = getCallArgsForFunction(parentFunctionId);
+          if (!parentStoredArgs) {
+            console.warn('[flowPanel] Nested function clicked but parent has no stored args:', parentFunctionId);
+            // Show message to user (can't use vscode.window in webview, so we'll let extension handle it)
+            // But we should still send the message so extension can show proper error
+          } else {
+            payload.parentCallArgs = parentStoredArgs;
+          }
         }
-        
-        const payload = { type: 'trace-line', functionId, line: lineNumber, stopLine: lineNumber + 1 };
 
         if (callTarget) {
           const pendingKey = makePendingKey(functionId, lineNumber);
           state.pendingCallTargets.set(pendingKey, callTarget);
         }
 
+        // Always get the latest stored arguments (in case they were just updated)
         const storedArgs = getCallArgsForFunction(functionId);
         if (storedArgs) {
+          console.log('[flowPanel] Using stored args for', functionId, ':', storedArgs);
           payload.callArgs = storedArgs;
         } else if (parents.indexOf(functionId) >= 0) {
-          payload.callArgs = cloneArgs(DEFAULT_PARENT_ARGS);
+          // For parent functions without stored args, don't execute automatically
+          // User must either select a call site (which auto-executes) or use the "Provide Arguments" button
+          const callSites = state.callSitesByFunction.get(functionId);
+          if (!callSites || callSites.length === 0) {
+            // No call sites - user must use the button
+            // Note: We can't use vscode.window here since this is in the webview
+            // Instead, we'll just return silently - the button is visible in the UI
+            console.log('[flowPanel] No stored args and no call sites - user should use "Provide Arguments" button');
+            return;
+          } else {
+            // Call sites exist - user should select one or use the button
+            console.log('[flowPanel] No stored args but call sites exist - user should select a call site or use "Provide Arguments" button');
+            return;
+          }
         }
 
         console.log('[flowPanel] Sending trace-line message', payload);
@@ -394,25 +691,230 @@
       state.expandedParents.delete(parentId);
     } else {
       state.expandedParents.add(parentId);
+      // Request call sites when expanding a parent function
+      if (!state.loadingCallSites.has(parentId)) {
+        state.loadingCallSites.add(parentId);
+        console.log('[flowPanel] Requesting call sites for parent:', parentId);
+        vscode.postMessage({ type: 'find-call-sites', functionId: parentId });
+      }
     }
     render();
   }
 
-  function toggleCall(callKey) {
-    if (state.expandedCalls.has(callKey)) {
+  function toggleCall(callKey, targetFunctionId) {
+    const wasExpanded = state.expandedCalls.has(callKey);
+    if (wasExpanded) {
       state.expandedCalls.delete(callKey);
     } else {
       state.expandedCalls.add(callKey);
+      // Use the targetFunctionId passed as parameter instead of parsing callKey
+      // (callKey contains :: which conflicts with function IDs that also contain ::)
+      if (targetFunctionId) {
+        console.log('[flowPanel] Expanding call, targetFunctionId:', targetFunctionId);
+        // Send message to extension to reveal file in explorer
+        vscode.postMessage({ type: 'reveal-function-file', functionId: targetFunctionId });
+      }
     }
     render();
   }
 
   function render() {
+    let content = '';
     if (!parents.length) {
-      root.innerHTML = '<p class="placeholder">No call flows available.</p>';
-      return;
+      content = '<p class="placeholder">No call flows available.</p>';
+    } else {
+      content = parents.map((parentId) => renderParentBlock(parentId)).join('');
     }
-    root.innerHTML = parents.map((parentId) => renderParentBlock(parentId)).join('');
+    content += renderArgsFormModal();
+    content += renderLoadingOverlay();
+    root.innerHTML = content;
+  }
+
+  function renderLoadingOverlay() {
+    const isTracingParent = state.tracingParent.size > 0;
+    const isTracingChild = state.tracingChild.size > 0;
+    
+    if (!isTracingParent && !isTracingChild) {
+      return '';
+    }
+
+    let message = '';
+    if (isTracingParent && isTracingChild) {
+      message = 'Preparing execution context...';
+    } else if (isTracingParent) {
+      message = 'Tracing parent function...';
+    } else if (isTracingChild) {
+      message = 'Preparing to execute...';
+    }
+
+    return '<div class="loading-overlay">' +
+      '<div class="loading-spinner"></div>' +
+      '<div class="loading-message">' + escapeHtml(message) + '</div>' +
+      '</div>';
+  }
+
+  function renderArgsFormModal() {
+    if (!state.argsFormVisible || !state.argsFormData) {
+      return '';
+    }
+    
+    const { functionId, params, functionName } = state.argsFormData;
+    const functionDisplay = functionName || extractDisplayName(functionId);
+    
+    let formFields = '';
+    if (params && params.length > 0) {
+      params.forEach(function(paramName, index) {
+        formFields += `
+          <div class="form-field">
+            <label for="param-${index}" class="form-label">${escapeHtml(paramName)}</label>
+            <input 
+              type="text" 
+              id="param-${index}" 
+              class="form-input" 
+              data-param="${escapeAttribute(paramName)}"
+              placeholder="Enter value (JSON: strings use quotes, numbers/booleans without quotes)"
+              autocomplete="off"
+            />
+          </div>
+        `;
+      });
+    } else {
+      formFields = '<div class="form-field"><p class="form-info">This function has no parameters.</p></div>';
+    }
+    
+    return `
+      <div class="args-form-overlay" data-action="close-args-form">
+        <div class="args-form-modal">
+          <div class="args-form-header">
+            <h3 class="args-form-title">Function Arguments</h3>
+            <button type="button" class="args-form-close" data-action="close-args-form" aria-label="Close">&times;</button>
+          </div>
+          <div class="args-form-body">
+            <div class="args-form-info">
+              <div class="args-form-function-name">
+                <span class="info-label">Function:</span>
+                <span class="info-value">${escapeHtml(functionDisplay)}</span>
+              </div>
+            </div>
+            <form class="args-form" data-function-id="${escapeAttribute(functionId)}">
+              ${formFields}
+              <div class="form-help-text">
+                <span class="help-icon">💡</span>
+                <span>After saving, click any line number in the function to execute it with these arguments.</span>
+              </div>
+              <div class="form-actions">
+                <button type="button" class="form-btn form-btn-secondary" data-action="close-args-form">Cancel</button>
+                <button type="submit" class="form-btn form-btn-primary">Done</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderParentArgsSection(parentId) {
+    const storedArgs = getCallArgsForFunction(parentId);
+    if (!storedArgs || (storedArgs.args.length === 0 && Object.keys(storedArgs.kwargs || {}).length === 0)) {
+      return '<div class="parent-args-section"><div class="placeholder mini">No arguments set. Select a call site or provide arguments manually.</div></div>';
+    }
+
+    // Get function signature to map parameter names
+    const params = state.functionSignatures.get(parentId);
+    if (!params && !state.loadingSignatures.has(parentId)) {
+      // Request function signature
+      state.loadingSignatures.add(parentId);
+      vscode.postMessage({
+        type: 'request-function-signature',
+        functionId: parentId,
+      });
+    }
+
+    let html = '<div class="parent-args-section">';
+    html += '<div class="parent-args-header">Function Arguments:</div>';
+    html += '<div class="parent-args-content">';
+    
+    // Render positional arguments with parameter names
+    if (storedArgs.args && storedArgs.args.length > 0) {
+      html += '<div class="args-group">';
+      html += '<div class="args-group-label">Positional Arguments:</div>';
+      storedArgs.args.forEach(function(arg, index) {
+        // Format value for display - use JSON.stringify for all values
+        const valueStr = JSON.stringify(arg);
+        // Use parameter name if available, otherwise use index
+        const paramName = params && params[index] ? params[index] : '[' + index + ']';
+        html += '<div class="arg-item">';
+        html += '<label class="arg-label">' + escapeHtml(paramName) + ':</label>';
+        html += '<input type="text" class="arg-input" data-arg-type="args" data-arg-index="' + index + '" value="' + escapeAttribute(valueStr) + '" />';
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+    
+    // Render keyword arguments
+    if (storedArgs.kwargs && Object.keys(storedArgs.kwargs).length > 0) {
+      html += '<div class="args-group">';
+      html += '<div class="args-group-label">Keyword Arguments:</div>';
+      Object.keys(storedArgs.kwargs).forEach(function(key) {
+        const argValue = storedArgs.kwargs[key];
+        // Format value for display - use JSON.stringify for all values
+        const valueStr = JSON.stringify(argValue);
+        html += '<div class="arg-item">';
+        html += '<label class="arg-label">' + escapeHtml(key) + ':</label>';
+        html += '<input type="text" class="arg-input" data-arg-type="kwargs" data-arg-key="' + escapeAttribute(key) + '" value="' + escapeAttribute(valueStr) + '" />';
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+    
+    html += '<button type="button" class="save-args-btn" data-action="save-parent-args" data-parent-id="' + escapeAttribute(parentId) + '">Save Arguments</button>';
+    html += '</div>';
+    html += '</div>';
+    
+    return html;
+  }
+
+  function renderCallSitesSection(parentId) {
+    const callSites = state.callSitesByFunction.get(parentId);
+    const loading = state.loadingCallSites.has(parentId);
+    const selected = state.selectedCallSite.get(parentId);
+
+    if (loading) {
+      return '<div class="call-sites-section"><div class="placeholder mini">Loading call sites...</div></div>';
+    }
+
+    if (!callSites || callSites.length === 0) {
+      return '<div class="call-sites-section">' +
+        '<div class="placeholder mini">No call sites found. Provide arguments to execute this function.</div>' +
+        '<button type="button" class="execute-with-args-btn" data-action="execute-with-args" data-parent-id="' + escapeAttribute(parentId) + '">Provide Arguments</button>' +
+        '</div>';
+    }
+
+    let html = '<div class="call-sites-section">';
+    html += '<div class="call-sites-header">Call Sites (' + callSites.length + '):</div>';
+    html += '<button type="button" class="execute-with-args-btn" data-action="execute-with-args" data-parent-id="' + escapeAttribute(parentId) + '" title="Click to provide function arguments manually">Provide Arguments Manually</button>';
+    html += '<div class="call-sites-list">';
+    
+    callSites.forEach(function(callSite, index) {
+      const isSelected = selected && selected.line === callSite.line && selected.file === callSite.file;
+      const callingFunctionName = callSite.calling_function || '&lt;top-level&gt;';
+      const fileDisplay = callSite.file.split('/').pop() || callSite.file;
+      const callSiteKey = parentId + '::' + callSite.file + '::' + callSite.line;
+      
+      html += '<div class="call-site-item ' + (isSelected ? 'selected' : '') + '" data-call-site-index="' + index + '" data-action="select-call-site" data-parent-id="' + escapeAttribute(parentId) + '">';
+      html += '<div class="call-site-header">';
+      html += '<span class="call-site-file">' + escapeHtml(fileDisplay) + '</span>';
+      html += '<span class="call-site-line">:' + callSite.line + '</span>';
+      html += '<span class="call-site-function"> in ' + escapeHtml(callingFunctionName) + '()</span>';
+      html += '</div>';
+      html += '<div class="call-site-code">' + escapeHtml(callSite.call_line) + '</div>';
+      html += '</div>';
+    });
+    
+    html += '</div>';
+    html += '</div>';
+    
+    return html;
   }
 
   function renderParentBlock(parentId) {
@@ -426,10 +928,14 @@
         .map((entry) => '<span class="chip" title="' + escapeAttribute(entry) + '">' + escapeHtml(extractDisplayName(entry)) + '</span>')
         .join('') + '</div>'
       : '';
+    
+    const callSitesSection = isExpanded ? renderCallSitesSection(parentId) : '';
+    const parentArgsSection = isExpanded ? renderParentArgsSection(parentId) : '';
+    
     const body = isExpanded
-      ? fn
-        ? '<div class="function-container">' + renderFunctionBody(parentId, new Set([parentId])) + '</div>'
-        : '<div class="placeholder mini">No function body captured for ' + escapeHtml(title) + '.</div>'
+      ? (callSitesSection + parentArgsSection + (fn
+        ? '<div class="function-container">' + renderFunctionBody(parentId, new Set([parentId]), null) + '</div>'
+        : '<div class="placeholder mini">No function body captured for ' + escapeHtml(title) + '.</div>'))
       : '';
 
     return '<article class="parent-block" data-parent-id="' + escapeAttribute(parentId) + '">' +
@@ -444,7 +950,8 @@
       '</article>';
   }
 
-  function renderFunctionBody(functionId, stack) {
+  function renderFunctionBody(functionId, stack, parentContext) {
+    // parentContext: { parentFunctionId, parentLineNumber, callLineInParent } - tracks which parent function called this
     const fn = functions[functionId];
     if (!fn || typeof fn.body !== 'string') {
       return '<div class="placeholder mini">No function body captured.</div>';
@@ -452,7 +959,9 @@
 
     const startLine = typeof fn.line === 'number' ? fn.line : (typeof fn.start_line === 'number' ? fn.start_line : 1);
     const lines = fn.body.split(/\r?\n/);
-    let html = '<div class="code-block" data-function="' + escapeAttribute(functionId) + '">';
+    let html = '<div class="code-block" data-function="' + escapeAttribute(functionId) + '"' +
+      (parentContext ? ' data-parent-function="' + escapeAttribute(parentContext.parentFunctionId) + '" data-parent-line="' + parentContext.parentLineNumber + '" data-call-line="' + parentContext.callLineInParent + '"' : '') +
+      '>';
 
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index];
@@ -492,6 +1001,11 @@
       const lineClass = isTracerLine ? 'code-line tracer-active' : 'code-line';
       const callTargetAttr = formatted.calls.length === 1 ? ' data-call-target="' + escapeAttribute(formatted.calls[0].targetId) + '"' : '';
       
+      // Add parent context attributes if this is a nested function
+      const parentAttrs = parentContext 
+        ? ' data-parent-function="' + escapeAttribute(parentContext.parentFunctionId) + '" data-parent-line="' + parentContext.parentLineNumber + '" data-call-line="' + parentContext.callLineInParent + '"'
+        : '';
+      
       // Inline variable display (code-like execution view)
       let inlineVarsHtml = '';
       if (regularEvents.length > 0 && !hasError) {
@@ -515,7 +1029,7 @@
       }
       
       html += '<div class="' + lineClass + '">' +
-        '<button type="button" class="line-number" data-action="trace-line" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '"' + callTargetAttr + ' title="Click to execute up to this line">' + lineNumber + '</button>' +
+        '<button type="button" class="line-number" data-action="trace-line" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '"' + callTargetAttr + parentAttrs + ' title="Click to execute up to this line">' + lineNumber + '</button>' +
         '<div class="code-snippet-wrapper">' +
         '<span class="code-snippet">' + codeHtml + '</span>' +
         inlineVarsHtml +
@@ -552,7 +1066,13 @@
           }
           const nextStack = new Set(stack);
           nextStack.add(call.targetId);
-          html += '<div class="nested-block">' + renderFunctionBody(call.targetId, nextStack) + '</div>';
+          // Pass parent context: which function called this, at what line in the parent, and what line in parent has the call
+          const parentContext = {
+            parentFunctionId: functionId,
+            parentLineNumber: lineNumber, // Line in parent where the call happens
+            callLineInParent: lineNumber, // Same as parentLineNumber for now
+          };
+          html += '<div class="nested-block">' + renderFunctionBody(call.targetId, nextStack, parentContext) + '</div>';
         }
       }
     }
@@ -585,7 +1105,7 @@
             const displayName = extractDisplayName(targetId);
             const tooltip = escapeAttribute(targetId);
             calls.push({ callKey, targetId, displayName });
-            htmlParts.push('<button type="button" class="call-link ' + (isOpen ? 'is-open' : '') + '" data-action="toggle-call" data-call="' + escapeAttribute(callKey) + '" title="' + tooltip + '">' +
+            htmlParts.push('<button type="button" class="call-link ' + (isOpen ? 'is-open' : '') + '" data-action="toggle-call" data-call="' + escapeAttribute(callKey) + '" data-target-id="' + escapeAttribute(targetId) + '" title="' + tooltip + '">' +
               '<span class="tok tok-call">' + escapeHtml(token.value) + '</span>' +
               '</button>');
             callIndex += 1;

@@ -8,6 +8,7 @@ import traceback
 import threading
 import bdb
 import inspect
+import ast
 from datetime import datetime
 
 # --------------------------
@@ -82,29 +83,143 @@ def safe_json(value):
         return f"<unserializable {type(value).__name__}>"
 
 def get_function_signature(repo_root: str, entry_full_id: str):
-    """Get the function signature (parameter names) for a given function."""
+    """Get the function signature (parameter names) for a given function using AST parsing."""
     try:
         log(f"get_function_signature called: repo_root={repo_root}, entry_full_id={entry_full_id}")
         if "::" not in entry_full_id:
             log("ERROR: Invalid entry_full_id format in get_function_signature", "ERROR")
             return {"error": "invalid entry id"}
         
-        rel_path, fn_name = entry_full_id.split("::", 1)
-        log(f"Parsing entry_full_id: rel_path={rel_path}, fn_name={fn_name}")
+        # Split the entry_full_id - it can be:
+        # - path/to/file.py::function_name (top-level function)
+        # - path/to/file.py::ClassName::method_name (class method)
+        # - path/to/file.py::outer_function::inner_function (nested function)
+        parts = entry_full_id.split("::")
+        rel_path = parts[0]
+        fn_path = parts[1:]  # Can be [function_name] or [ClassName, method_name] or [outer, inner]
         
-        module = import_module_from_path(repo_root, rel_path)
-        log(f"Module imported: {module}")
+        log(f"Parsing entry_full_id: rel_path={rel_path}, fn_path={fn_path}")
         
-        func = getattr(module, fn_name, None)
-        log(f"Function lookup: fn_name={fn_name}, found={func is not None}, callable={callable(func) if func else False}")
+        # Get absolute path to the file
+        rel_path = rel_path.lstrip("/")
+        abs_path = os.path.join(repo_root, rel_path)
         
-        if func is None or not callable(func):
-            log(f"ERROR: Function {fn_name} not found or not callable", "ERROR")
-            return {"error": f"function {fn_name} not found"}
+        if not os.path.exists(abs_path):
+            log(f"ERROR: File not found: {abs_path}", "ERROR")
+            return {"error": f"file not found: {rel_path}"}
         
-        sig = inspect.signature(func)
-        params = list(sig.parameters.keys())
-        log(f"Function signature: params={params}, param_count={len(params)}")
+        # Parse the file with AST
+        try:
+            with open(abs_path, 'r', encoding='utf-8') as f:
+                source = f.read()
+            tree = ast.parse(source, filename=abs_path)
+        except SyntaxError as e:
+            log(f"ERROR: Syntax error parsing file: {e}", "ERROR")
+            return {"error": f"syntax error in file: {str(e)}"}
+        except Exception as e:
+            log(f"ERROR: Error reading file: {e}", "ERROR")
+            return {"error": f"error reading file: {str(e)}"}
+        
+        # Find the function in the AST
+        target_func = None
+        
+        if len(fn_path) == 1:
+            # Simple function: path/to/file.py::function_name
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef) and node.name == fn_path[0]:
+                    target_func = node
+                    break
+        elif len(fn_path) == 2:
+            # Could be class method or nested function
+            # First try class method: path/to/file.py::ClassName::method_name
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef) and node.name == fn_path[0]:
+                    for item in node.body:
+                        if isinstance(item, ast.FunctionDef) and item.name == fn_path[1]:
+                            target_func = item
+                            break
+                    if target_func:
+                        break
+                    break
+            
+            # If not found as class method, try nested function
+            if target_func is None:
+                for node in tree.body:
+                    if isinstance(node, ast.FunctionDef) and node.name == fn_path[0]:
+                        # Look for nested function
+                        for item in node.body:
+                            if isinstance(item, ast.FunctionDef) and item.name == fn_path[1]:
+                                target_func = item
+                                break
+                        if target_func:
+                            break
+                        break
+        else:
+            # More complex nesting - traverse step by step
+            current_nodes = tree.body
+            for i, part in enumerate(fn_path):
+                found = False
+                for node in current_nodes:
+                    if isinstance(node, ast.FunctionDef) and node.name == part:
+                        if i == len(fn_path) - 1:
+                            # This is the target function
+                            target_func = node
+                            found = True
+                            break
+                        else:
+                            # Continue searching inside this function
+                            current_nodes = [n for n in node.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))]
+                            found = True
+                            break
+                    elif isinstance(node, ast.ClassDef) and node.name == part:
+                        if i == len(fn_path) - 1:
+                            # Shouldn't happen, but handle it
+                            break
+                        else:
+                            # Continue searching inside this class
+                            current_nodes = node.body
+                            found = True
+                            break
+                if not found:
+                    break
+        
+        if target_func is None:
+            # Fallback: try importing and using inspect (for cases AST can't handle)
+            log(f"Function not found in AST, trying import fallback")
+            try:
+                module = import_module_from_path(repo_root, rel_path)
+                # Try to get the function by traversing the path
+                obj = module
+                for part in fn_path:
+                    obj = getattr(obj, part, None)
+                    if obj is None:
+                        break
+                
+                if obj is not None and callable(obj):
+                    sig = inspect.signature(obj)
+                    params = list(sig.parameters.keys())
+                    log(f"Function signature (via import): params={params}, param_count={len(params)}")
+                    return {
+                        "params": params,
+                        "param_count": len(params)
+                    }
+            except Exception as import_error:
+                log(f"Import fallback also failed: {import_error}")
+        
+        if target_func is None:
+            log(f"ERROR: Function {'::'.join(fn_path)} not found in {rel_path}", "ERROR")
+            return {"error": f"function {'::'.join(fn_path)} not found"}
+        
+        # Extract parameters from the AST function node
+        params = []
+        is_method = len(fn_path) == 2  # Class method if path has 2 parts (ClassName::method_name)
+        for arg in target_func.args.args:
+            # Skip 'self' and 'cls' parameters only for class methods
+            if is_method and arg.arg in ('self', 'cls'):
+                continue
+            params.append(arg.arg)
+        
+        log(f"Function signature (via AST): params={params}, param_count={len(params)}")
         
         return {
             "params": params,
@@ -112,6 +227,149 @@ def get_function_signature(repo_root: str, entry_full_id: str):
         }
     except Exception as e:
         log_exception(e, "get_function_signature")
+        return {"error": str(e)}
+
+def extract_call_arguments(repo_root: str, entry_full_id: str, call_line: int, locals_dict: dict, globals_dict: dict, parent_file: str = None):
+    """Extract function call arguments from a specific line using parent's locals/globals."""
+    try:
+        log(f"extract_call_arguments called: entry_full_id={entry_full_id}, call_line={call_line}, parent_file={parent_file}")
+        if "::" not in entry_full_id:
+            return {"error": "invalid entry id"}
+        
+        rel_path, fn_name = entry_full_id.split("::", 1)
+        
+        # Use parent_file if provided, otherwise use the nested function's file
+        if parent_file:
+            # parent_file is relative to repo_root
+            if os.path.isabs(parent_file):
+                abs_path = parent_file
+            else:
+                abs_path = os.path.join(repo_root, parent_file.lstrip("/"))
+        else:
+            abs_path = os.path.join(repo_root, rel_path.lstrip("/"))
+        
+        if not os.path.isfile(abs_path):
+            return {"error": f"file not found: {abs_path}"}
+        
+        # Read the file and get the line
+        with open(abs_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        if call_line < 1 or call_line > len(lines):
+            return {"error": f"line {call_line} out of range"}
+        
+        call_line_text = lines[call_line - 1].strip()
+        log(f"Extracting call from line {call_line}: {call_line_text}")
+        
+        # Parse the line to find function calls
+        try:
+            tree = ast.parse(call_line_text, mode='eval')
+        except SyntaxError:
+            # Try parsing as a statement instead
+            try:
+                tree = ast.parse(call_line_text, mode='exec')
+            except SyntaxError as e:
+                return {"error": f"cannot parse line: {str(e)}"}
+        
+        # Find the function call
+        call_node = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                # Check if this call matches the function name
+                if isinstance(node.func, ast.Name) and node.func.id == fn_name:
+                    call_node = node
+                    break
+                elif isinstance(node.func, ast.Attribute):
+                    # Handle method calls like obj.method()
+                    if node.func.attr == fn_name:
+                        call_node = node
+                        break
+        
+        if not call_node:
+            return {"error": f"function call to {fn_name} not found on line {call_line}"}
+        
+        # Evaluate arguments using parent's locals/globals
+        args_list = []
+        kwargs_dict = {}
+        
+        # Create evaluation context from parent's locals and globals
+        eval_globals = dict(globals_dict)
+        eval_locals = dict(locals_dict)
+        
+        # Evaluate positional arguments
+        for arg in call_node.args:
+            try:
+                # Convert AST node to code and evaluate
+                code = compile(ast.Expression(arg), '<string>', 'eval')
+                value = eval(code, eval_globals, eval_locals)
+                args_list.append(safe_json(value))
+            except Exception as e:
+                log(f"Error evaluating positional argument: {e}", "WARNING")
+                args_list.append(None)
+        
+        # Evaluate keyword arguments
+        for kw in call_node.keywords:
+            key = kw.arg if kw.arg else None
+            if key:
+                try:
+                    code = compile(ast.Expression(kw.value), '<string>', 'eval')
+                    value = eval(code, eval_globals, eval_locals)
+                    kwargs_dict[key] = safe_json(value)
+                except Exception as e:
+                    log(f"Error evaluating keyword argument {key}: {e}", "WARNING")
+                    kwargs_dict[key] = None
+        
+        # Get the function signature to filter arguments to only those the function accepts
+        # We MUST get the signature to filter arguments correctly - otherwise we might pass
+        # arguments that the function doesn't accept
+        sig_result = get_function_signature(repo_root, entry_full_id)
+        if "error" not in sig_result:
+            accepted_params = set(sig_result.get("params", []))
+            log(f"Function accepts parameters: {accepted_params}")
+            
+            # Filter keyword arguments to only include those the function accepts
+            # This is the main fix: don't pass kwargs that the function doesn't accept
+            original_kwargs_keys = set(kwargs_dict.keys())
+            filtered_kwargs = {k: v for k, v in kwargs_dict.items() if k in accepted_params}
+            filtered_out_kwargs = original_kwargs_keys - set(filtered_kwargs.keys())
+            if filtered_out_kwargs:
+                log(f"Filtered out keyword arguments not accepted by function: {filtered_out_kwargs}")
+            
+            # Also check if any positional arguments should be converted to keyword arguments
+            # if they match parameter names (though this is less common)
+            
+            # For positional arguments, limit to the number of parameters the function has
+            # We want to be careful here: if there are more positional args than parameters,
+            # and some parameters are already provided as keywords, we need to account for that
+            num_total_params = len(accepted_params)
+            # Count how many positional params are NOT already in kwargs
+            positional_params_not_in_kwargs = [p for p in sig_result.get("params", []) if p not in filtered_kwargs]
+            max_positional = len(positional_params_not_in_kwargs)
+            
+            # Limit positional arguments to what the function can accept
+            if len(args_list) > max_positional:
+                log(f"Limiting positional arguments from {len(args_list)} to {max_positional} (function has {num_total_params} params, {len(filtered_kwargs)} provided as kwargs)")
+                filtered_args = args_list[:max_positional]
+            else:
+                filtered_args = args_list
+            
+            args_list = filtered_args
+            kwargs_dict = filtered_kwargs
+            log(f"Filtered arguments to match function signature: args={args_list}, kwargs={kwargs_dict}")
+        else:
+            # If we can't get the signature, we can't safely filter arguments
+            # Return an error rather than using unfiltered arguments
+            error_msg = sig_result.get('error', 'unknown error')
+            log(f"ERROR: Could not get function signature to filter arguments: {error_msg}", "ERROR")
+            return {"error": f"Could not get function signature to filter arguments: {error_msg}"}
+        
+        result = {
+            "args": {"args": args_list, "kwargs": kwargs_dict}
+        }
+        log(f"Extracted arguments: args={args_list}, kwargs={kwargs_dict}")
+        return result
+    except Exception as e:
+        log_exception(e, "extract_call_arguments")
         return {"error": str(e)}
 
 # --------------------------
@@ -130,71 +388,91 @@ class PersistentDebugger(bdb.Bdb):
         self.thread_exception = None  # Store exceptions from the debugger thread
 
     def user_line(self, frame):
-        lineno = frame.f_lineno
-        fname = os.path.abspath(frame.f_code.co_filename)
-        log(f"user_line called: line {lineno} in {fname}")
-        # Only stop for the main target file
-        if fname != self.target_file:
-            log(f"Skipping line {lineno} (not in target file {self.target_file})")
+        try:
+            lineno = frame.f_lineno
+            fname = os.path.abspath(frame.f_code.co_filename)
+            log(f"user_line called: line {lineno} in {fname}")
+            funcname = frame.f_code.co_name
+            
+            # Check if we're in the target function
+            in_target_function = self.target_function is None or funcname == self.target_function
+            
+            # Handle case where target_file might be None (shouldn't happen, but be safe)
+            if self.target_file is None:
+                log(f"WARNING: target_file is None, accepting line {lineno} in {fname}")
+                # Accept the line and set target_file (this should only happen in edge cases)
+                self.target_file = fname
+            # Only accept lines from the target file, OR if we're in the target function
+            # (this allows stepping through nested functions in different files)
+            elif fname != self.target_file:
+                # If we're in the target function but in a different file, update target_file
+                # to allow stepping through this nested function
+                if in_target_function and self.target_function is not None:
+                    log(f"Switching target_file from {self.target_file} to {fname} (target function {self.target_function} in different file)")
+                    self.target_file = fname
+                else:
+                    log(f"Skipping line {lineno} (not in target file {self.target_file}, not in target function {self.target_function})")
+                    return
+            locals_snapshot = {k: safe_json(v) for k, v in frame.f_locals.items()}
+            
+            # Capture only user-declared globals from the current file
+            globals_snapshot = {}
+            builtin_names = {'__builtins__', '__file__', '__name__', '__doc__', '__package__', 
+                            '__loader__', '__spec__', '__cached__', '__annotations__'}
+            
+            for k, v in frame.f_globals.items():
+                # Skip built-in names and system variables
+                if k in builtin_names or (k.startswith('__') and k.endswith('__')):
+                    continue
+                
+                # Skip imported modules
+                if isinstance(v, types.ModuleType):
+                    continue
+                
+                # Skip functions (only want variables)
+                if isinstance(v, types.FunctionType):
+                    continue
+                
+                # Skip classes (only want variables)
+                if isinstance(v, type):
+                    continue
+                
+                # Skip typing constructs (Dict, List, Optional, etc. from typing module)
+                if hasattr(v, '__module__') and v.__module__ == 'typing':
+                    continue
+                
+                # Skip typing._GenericAlias and similar typing constructs
+                if type(v).__module__ == 'typing':
+                    continue
+                
+                # Only include simple variable types: int, str, float, bool, None, list, dict, tuple, set
+                # These are the actual variable values the user declared
+                globals_snapshot[k] = safe_json(v)
+            self.last_event = {
+                "event": "line",
+                "filename": fname,
+                "function": funcname,
+                "line": lineno,
+                "locals": locals_snapshot,
+                "globals": globals_snapshot
+            }
+            log(f"Created line event: {funcname}:{lineno}, target_line={self.target_line}, target_function={self.target_function}")
+            # Stop if we've reached the target line AND we're in the target function
+            # This ensures we stop in the correct function, not in nested function calls
+            if self.target_line is not None and lineno >= self.target_line and in_target_function:
+                log(f"Reached target line {self.target_line} in target function {self.target_function} (current: {funcname}:{lineno}), stopping and waiting")
+                self.set_step()
+                # Notify main thread that we have a fresh event ready
+                self.ready_event.set()
+                log("Set ready_event, waiting for step_event")
+                # Wait until the main thread asks us to continue
+                self.step_event.clear()
+                self.step_event.wait()
+                log("Received step_event, continuing")
+        except Exception as e:
+            log_exception(e, "user_line")
+            # Don't crash, just skip this line
             return
-        funcname = frame.f_code.co_name
-        locals_snapshot = {k: safe_json(v) for k, v in frame.f_locals.items()}
-        
-        # Capture only user-declared globals from the current file
-        globals_snapshot = {}
-        builtin_names = {'__builtins__', '__file__', '__name__', '__doc__', '__package__', 
-                        '__loader__', '__spec__', '__cached__', '__annotations__'}
-        
-        for k, v in frame.f_globals.items():
-            # Skip built-in names and system variables
-            if k in builtin_names or (k.startswith('__') and k.endswith('__')):
-                continue
-            
-            # Skip imported modules
-            if isinstance(v, types.ModuleType):
-                continue
-            
-            # Skip functions (only want variables)
-            if isinstance(v, types.FunctionType):
-                continue
-            
-            # Skip classes (only want variables)
-            if isinstance(v, type):
-                continue
-            
-            # Skip typing constructs (Dict, List, Optional, etc. from typing module)
-            if hasattr(v, '__module__') and v.__module__ == 'typing':
-                continue
-            
-            # Skip typing._GenericAlias and similar typing constructs
-            if type(v).__module__ == 'typing':
-                continue
-            
-            # Only include simple variable types: int, str, float, bool, None, list, dict, tuple, set
-            # These are the actual variable values the user declared
-            globals_snapshot[k] = safe_json(v)
-        self.last_event = {
-            "event": "line",
-            "filename": fname,
-            "function": funcname,
-            "line": lineno,
-            "locals": locals_snapshot,
-            "globals": globals_snapshot
-        }
-        log(f"Created line event: {funcname}:{lineno}, target_line={self.target_line}, target_function={self.target_function}")
-        # Stop if we've reached the target line AND we're in the target function
-        # This ensures we stop in the correct function, not in nested function calls
-        in_target_function = self.target_function is None or funcname == self.target_function
-        if self.target_line is not None and lineno >= self.target_line and in_target_function:
-            log(f"Reached target line {self.target_line} in target function {self.target_function} (current: {funcname}:{lineno}), stopping and waiting")
-            self.set_step()
-            # Notify main thread that we have a fresh event ready
-            self.ready_event.set()
-            log("Set ready_event, waiting for step_event")
-            # Wait until the main thread asks us to continue
-            self.step_event.clear()
-            self.step_event.wait()
-            log("Received step_event, continuing")
 
     def continue_until(self, line, function_name=None):
         log(f"continue_until called with line={line}, function_name={function_name}")
@@ -283,7 +561,8 @@ def main():
     parser.add_argument(
         "--args_json",
         required=False,
-        default='{"kwargs": {"metric_name": "test", "period": "last_7_days"}}'
+        # No default business-specific kwargs; start with empty args/kwargs
+        default='{"args": [], "kwargs": {}}'
     )
     parser.add_argument(
         "--stop_line",
@@ -295,6 +574,28 @@ def main():
         action="store_true",
         help="Get function signature instead of tracing"
     )
+    parser.add_argument(
+        "--extract-call-args",
+        action="store_true",
+        help="Extract call arguments from a line"
+    )
+    parser.add_argument(
+        "--call-line",
+        type=int,
+        help="Line number where function is called (for --extract-call-args)"
+    )
+    parser.add_argument(
+        "--locals",
+        help="JSON string of parent function's locals (for --extract-call-args)"
+    )
+    parser.add_argument(
+        "--globals",
+        help="JSON string of parent function's globals (for --extract-call-args)"
+    )
+    parser.add_argument(
+        "--parent-file",
+        help="File path where the call happens (for --extract-call-args)"
+    )
     args = parser.parse_args()
     
     log(f"Command line arguments: repo_root={args.repo_root}, entry_full_id={args.entry_full_id}, stop_line={args.stop_line}, get_signature={args.get_signature}")
@@ -304,6 +605,28 @@ def main():
         log("Getting function signature")
         result = get_function_signature(args.repo_root, args.entry_full_id)
         log(f"Signature result: {result}")
+        print(json.dumps(result), flush=True)
+        sys.exit(0)
+    
+    # If --extract-call-args is set, extract arguments and exit
+    if args.extract_call_args:
+        if args.call_line is None:
+            parser.error("--call-line is required when using --extract-call-args")
+        locals_dict = {}
+        globals_dict = {}
+        if args.locals:
+            try:
+                locals_dict = json.loads(args.locals)
+            except Exception as e:
+                log(f"Error parsing --locals: {e}", "WARNING")
+        if args.globals:
+            try:
+                globals_dict = json.loads(args.globals)
+            except Exception as e:
+                log(f"Error parsing --globals: {e}", "WARNING")
+        log("Extracting call arguments")
+        result = extract_call_arguments(args.repo_root, args.entry_full_id, args.call_line, locals_dict, globals_dict, args.parent_file)
+        log(f"Extraction result: {result}")
         print(json.dumps(result), flush=True)
         sys.exit(0)
     
@@ -363,6 +686,40 @@ def main():
         sys.exit(1)
     fn = getattr(mod, fn_name)
     log(f"Found function: {fn_name}, callable={callable(fn)}")
+    
+    # Filter arguments to match function signature - this ensures we don't pass
+    # arguments that the function doesn't accept (fixes issues like passing 'metric_name'
+    # to functions that don't accept it)
+    sig_result = get_function_signature(repo_root, entry_full_id)
+    if "error" not in sig_result:
+        accepted_params = set(sig_result.get("params", []))
+        log(f"Function accepts parameters: {accepted_params}")
+        
+        # Filter keyword arguments to only include those the function accepts
+        original_kwargs_keys = set(kwargs_dict.keys())
+        filtered_kwargs = {k: v for k, v in kwargs_dict.items() if k in accepted_params}
+        filtered_out_kwargs = original_kwargs_keys - set(filtered_kwargs.keys())
+        if filtered_out_kwargs:
+            log(f"Filtered out keyword arguments not accepted by function: {filtered_out_kwargs}")
+        
+        # For positional arguments, limit to what the function can accept
+        num_total_params = len(accepted_params)
+        positional_params_not_in_kwargs = [p for p in sig_result.get("params", []) if p not in filtered_kwargs]
+        max_positional = len(positional_params_not_in_kwargs)
+        
+        if len(args_list) > max_positional:
+            log(f"Limiting positional arguments from {len(args_list)} to {max_positional} (function has {num_total_params} params, {len(filtered_kwargs)} provided as kwargs)")
+            args_list = args_list[:max_positional]
+        
+        kwargs_dict = filtered_kwargs
+        log(f"Filtered arguments to match function signature: args={args_list}, kwargs={kwargs_dict}")
+    else:
+        # If we can't get the signature, we can't safely filter arguments
+        error_msg = sig_result.get('error', 'unknown error')
+        log(f"WARNING: Could not get function signature to filter arguments: {error_msg}, using unfiltered arguments", "WARNING")
+        # Note: We continue with unfiltered arguments here because this is the main entry point
+        # The user-provided args_json should already be correct, but nested calls will be filtered
+    
     dbg = PersistentDebugger()
     dbg.target_file = abs_path  # Only this file counts for stop_line
     dbg.target_function = fn_name  # Only stop in the target function

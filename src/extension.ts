@@ -21,6 +21,21 @@ let currentFunctionBodies: Record<string, FunctionBody> = {};
 let currentRepoRoot: string | undefined;
 let activeTracer: TracerManager | undefined;
 let tracerOutputChannel: vscode.OutputChannel | undefined;
+const storedCallArgs: Map<string, NormalisedCallArgs> = new Map();
+
+// Cache for parent execution contexts to avoid redundant tracing
+interface ExecutionContext {
+	locals: Record<string, unknown>;
+	globals: Record<string, unknown>;
+	file: string;
+}
+const parentExecutionContextCache = new Map<string, ExecutionContext>();
+
+function getCacheKey(parentId: string, callLine: number, args: NormalisedCallArgs): string {
+	// Create a cache key from function ID, call line, and args
+	const argsKey = JSON.stringify(args);
+	return `${parentId}:${callLine}:${argsKey}`;
+}
 
 interface TracerEvent {
 	event: string;
@@ -43,9 +58,10 @@ interface NormalisedCallArgs {
 	kwargs: Record<string, unknown>;
 }
 
+// Baseline empty arguments for parent functions – actual values come from user input
 const DEFAULT_PARENT_CALL_ARGS: NormalisedCallArgs = {
 	args: [],
-	kwargs: { metric_name: 'test', period: 'last_7_days' },
+	kwargs: {},
 };
 
 function isTraceCallArgs(value: unknown): value is TraceCallArgs {
@@ -78,6 +94,14 @@ function cloneCallArgs(args: NormalisedCallArgs): NormalisedCallArgs {
 	};
 }
 
+function getStoredCallArgs(functionId: string): NormalisedCallArgs | undefined {
+	return storedCallArgs.get(functionId);
+}
+
+function setStoredCallArgs(functionId: string, args: NormalisedCallArgs): void {
+	storedCallArgs.set(functionId, cloneCallArgs(args));
+}
+
 class TracerManager {
 	private process: ChildProcess | undefined;
 	private outputChannel: vscode.OutputChannel;
@@ -91,6 +115,7 @@ class TracerManager {
 	private pendingDisplayFile: string | undefined;
 	private currentDisplayLine: number | undefined;
 	private currentDisplayFile: string | undefined;
+	private suppressWebviewEvents: boolean = false; // Suppress webview events for parent tracing
 
 	constructor(outputChannel: vscode.OutputChannel, webview?: vscode.Webview) {
 		this.outputChannel = outputChannel;
@@ -101,8 +126,13 @@ class TracerManager {
 		this.webview = webview;
 	}
 
+	setSuppressWebviewEvents(suppress: boolean): void {
+		this.suppressWebviewEvents = suppress;
+	}
+
 	private decorateEvent(event: TracerEvent): TracerEvent {
 		const decorated = { ...event };
+		// Always prefer pendingDisplayLine, then currentDisplayLine
 		const targetLine =
 			typeof this.pendingDisplayLine === 'number'
 				? this.pendingDisplayLine
@@ -110,6 +140,8 @@ class TracerManager {
 		const targetFile = this.pendingDisplayFile ?? this.currentDisplayFile;
 
 		if (decorated.event === 'line') {
+			// ALWAYS override line number with targetLine if available
+			// This ensures the clicked line is always used, not the tracer's reported line
 			if (typeof targetLine === 'number') {
 				decorated.line = targetLine;
 			}
@@ -118,7 +150,8 @@ class TracerManager {
 			}
 		}
 		if (decorated.event === 'error') {
-			if (typeof targetLine === 'number' && typeof decorated.line !== 'number') {
+			// For errors, use targetLine if event doesn't have a line, or always override
+			if (typeof targetLine === 'number') {
 				decorated.line = targetLine;
 			}
 			if (targetFile && !decorated.filename) {
@@ -135,6 +168,11 @@ class TracerManager {
 
 	private processIncomingEvent(rawEvent: TracerEvent): void {
 		const decorated = this.decorateEvent(rawEvent);
+		
+		// Log for debugging first click issues
+		if (decorated.event === 'line') {
+			this.outputChannel.appendLine(`[processIncomingEvent] Decorated event: line=${decorated.line}, pendingDisplayLine=${this.pendingDisplayLine}, currentDisplayLine=${this.currentDisplayLine}, originalLine=${rawEvent.line}`);
+		}
 
 		if (this.pendingReadResolve) {
 			const resolver = this.pendingReadResolve;
@@ -142,11 +180,12 @@ class TracerManager {
 			this.pendingReadReject = undefined;
 			resolver(decorated);
 			this.clearPendingDisplay();
+			// Don't emit to webview here - handleTraceLine will send it with the correct line number
 		} else {
 			this.eventQueue.push(decorated);
+			// Only emit to webview if there's no pending resolver (queued events)
+			this.emitTracerEvent(decorated);
 		}
-
-		this.emitTracerEvent(decorated);
 	}
 
 	private spawnTracer(
@@ -160,7 +199,7 @@ class TracerManager {
 		const tracerPath = path.join(extensionPath, 'python', 'tracer.py');
 
 		this.outputChannel.appendLine(`[Rust-like] Spawning tracer for ${entryFullId} at line ${stopLine}`);
-		this.outputChannel.show(true);
+		// Don't show output channel automatically - user can open it manually if needed
 
 		const args = [
 			'-u',
@@ -226,10 +265,44 @@ class TracerManager {
 
 		this.process.on('exit', (code) => {
 			this.outputChannel.appendLine(`[Tracer] Process exited with code ${code}`);
-			if (this.pendingReadReject) {
-				this.pendingReadReject(new Error(`Python process exited with code ${code}`));
-				this.pendingReadResolve = undefined;
-				this.pendingReadReject = undefined;
+			if (code !== 0 && code !== null) {
+				// Process exited with an error - check for error events or stderr output
+				let errorMessage = `Python process exited with code ${code}`;
+				
+				// Check if there's an error event in the queue
+				const errorEvent = this.eventQueue.find(e => e.event === 'error');
+				if (errorEvent) {
+					errorMessage = errorEvent.error || errorMessage;
+					if (errorEvent.filename) {
+						errorMessage += ` in ${errorEvent.filename}`;
+					}
+					if (errorEvent.line) {
+						errorMessage += ` at line ${errorEvent.line}`;
+					}
+				} else if (this.stderrBuffer.trim()) {
+					// Check if there's any remaining stderr output
+					const stderrLines = this.stderrBuffer.trim().split('\n').filter(l => l.trim());
+					if (stderrLines.length > 0) {
+						// Try to find error messages in stderr
+						const errorLines = stderrLines.filter(l => 
+							l.toLowerCase().includes('error') || 
+							l.toLowerCase().includes('exception') ||
+							l.toLowerCase().includes('traceback')
+						);
+						if (errorLines.length > 0) {
+							errorMessage += `: ${errorLines[0]}`;
+						} else {
+							// Use the last line of stderr as it might contain the error
+							errorMessage += `: ${stderrLines[stderrLines.length - 1]}`;
+						}
+					}
+				}
+				
+				if (this.pendingReadReject) {
+					this.pendingReadReject(new Error(errorMessage));
+					this.pendingReadResolve = undefined;
+					this.pendingReadReject = undefined;
+				}
 			}
 			this.process = undefined;
 			this.currentFlow = undefined;
@@ -247,9 +320,13 @@ class TracerManager {
 		argsJson: string,
 		extensionPath: string,
 		pythonPath: string,
+		suppressWebview: boolean = false,
 	): Promise<TracerEvent> {
 		const firstTime = this.process === undefined;
 		const needsNewTracer = this.currentFlow !== entryFullId;
+
+		// Set suppress flag for parent tracing (don't show values at call site)
+		this.suppressWebviewEvents = suppressWebview;
 
 		this.pendingDisplayLine = displayLine;
 		this.pendingDisplayFile = displayFile;
@@ -381,7 +458,7 @@ class TracerManager {
 				}
 			}
 
-			if (this.webview) {
+			if (this.webview && !this.suppressWebviewEvents) {
 				this.webview.postMessage({
 					type: 'tracer-event',
 					event: event,
@@ -392,7 +469,7 @@ class TracerManager {
 			if (event.traceback) {
 				this.outputChannel.appendLine(event.traceback);
 			}
-			if (this.webview) {
+			if (this.webview && !this.suppressWebviewEvents) {
 				this.webview.postMessage({
 					type: 'tracer-error',
 					error: event.error || 'Unknown error',
@@ -628,18 +705,341 @@ async function showFlowPanel(
 				const targetPosition = new vscode.Position(Math.max(details.line - 1, 0), 0);
 				editor.selection = new vscode.Selection(targetPosition, targetPosition);
 				editor.revealRange(new vscode.Range(targetPosition, targetPosition), vscode.TextEditorRevealType.InCenter);
+			} else if (message.type === 'reveal-function-file' && typeof message.functionId === 'string') {
+				// Reveal the file containing the function in the explorer
+				try {
+					let functionId = message.functionId;
+					console.log('[extension] Revealing function file for:', functionId);
+					
+					// Try to resolve the function body - resolveFunctionBody handles normalization
+					let details = resolveFunctionBody(functionId);
+					
+					// If not found, try adding leading slash (function IDs are stored with leading slash)
+					if (!details && !functionId.startsWith('/')) {
+						functionId = '/' + functionId;
+						console.log('[extension] Retrying with leading slash:', functionId);
+						details = resolveFunctionBody(functionId);
+					}
+					
+					if (!details || !currentRepoRoot) {
+						console.log('[extension] Could not resolve function body or repo root:', { 
+							originalFunctionId: message.functionId,
+							triedFunctionId: functionId,
+							details, 
+							currentRepoRoot,
+							availableKeys: Object.keys(currentFunctionBodies).slice(0, 10)
+						});
+						return;
+					}
+					
+					console.log('[extension] Resolved function body:', { file: details.file, line: details.line, id: details.id });
+					// details.file is already a relative path like "backend/services/analytics.py"
+					const filePath = details.file.startsWith('/') ? details.file.slice(1) : details.file;
+					const fullPath = path.join(currentRepoRoot, filePath);
+					const targetUri = vscode.Uri.file(fullPath);
+					console.log('[extension] Target URI:', targetUri.fsPath);
+					
+					// Verify file exists before revealing
+					try {
+						await fs.access(fullPath);
+						// Try revealing in explorer - this command should work even if file isn't open
+						await vscode.commands.executeCommand('revealInExplorer', targetUri);
+						console.log('[extension] Successfully revealed file in explorer');
+					} catch (error) {
+						console.error('[extension] File does not exist or cannot be accessed:', fullPath, error);
+						// Fallback: try to open the file first, then reveal
+						try {
+							const document = await vscode.workspace.openTextDocument(targetUri);
+							await vscode.window.showTextDocument(document, { preview: true });
+							await vscode.commands.executeCommand('revealInExplorer', targetUri);
+						} catch (fallbackError) {
+							console.error('[extension] Fallback also failed:', fallbackError);
+						}
+					}
+				} catch (error) {
+					console.error('[extension] Error in reveal-function-file handler:', error);
+				}
 			} else if (message.type === 'trace-line' && typeof message.functionId === 'string' && typeof message.line === 'number') {
 				console.log('[extension] Handling trace-line:', message.functionId, message.line);
 				try {
 					const callArgs = isTraceCallArgs(message.callArgs) ? message.callArgs : undefined;
 					const stopLineCandidate = typeof message.stopLine === 'number' ? message.stopLine : message.line + 1;
 					const stopLine = Number.isFinite(stopLineCandidate) ? stopLineCandidate : message.line + 1;
-					await handleTraceLine(message.functionId, message.line, stopLine, context, callArgs);
+					const parentContext = (message.isNested && typeof message.parentFunctionId === 'string' && typeof message.parentLine === 'number' && typeof message.callLine === 'number')
+						? {
+							parentFunctionId: message.parentFunctionId,
+							parentLine: message.parentLine,
+							callLine: message.callLine,
+							parentCallArgs: isTraceCallArgs(message.parentCallArgs) ? message.parentCallArgs : undefined,
+						}
+						: undefined;
+					await handleTraceLine(message.functionId, message.line, stopLine, context, callArgs, parentContext);
 				} catch (error) {
 					console.error('[extension] Error in handleTraceLine:', error);
 					vscode.window.showErrorMessage(`Error tracing line: ${error instanceof Error ? error.message : String(error)}`);
 				}
+			} else if (message.type === 'find-call-sites' && typeof message.functionId === 'string') {
+				console.log('[extension] Finding call sites for:', message.functionId);
+				try {
+					const pythonPath = await getPythonPath();
+					const callSites = await findCallSites(pythonPath, currentRepoRoot!, message.functionId, context.extensionPath);
+					if (flowPanel) {
+						flowPanel.webview.postMessage({
+							type: 'call-sites-found',
+							functionId: message.functionId,
+							callSites: callSites,
+						});
+					}
+				} catch (error) {
+					console.error('[extension] Error finding call sites:', error);
+					if (flowPanel) {
+						flowPanel.webview.postMessage({
+							type: 'call-sites-error',
+							functionId: message.functionId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				}
+			} else if (message.type === 'request-function-signature' && typeof message.functionId === 'string') {
+				// Webview is requesting function signature (for displaying parameter names)
+				console.log('[extension] Requesting function signature for:', message.functionId);
+				try {
+					const pythonPath = await getPythonPath();
+					const targetFunctionId = message.functionId;
+					const entryFullId = targetFunctionId.startsWith('/') ? targetFunctionId.slice(1) : targetFunctionId;
+					
+					const signature = await getFunctionSignature(pythonPath, currentRepoRoot!, entryFullId, context.extensionPath);
+					
+					// Send signature to webview
+					if (flowPanel) {
+						flowPanel.webview.postMessage({
+							type: 'function-signature',
+							functionId: targetFunctionId,
+							params: signature?.params || [],
+						});
+					}
+				} catch (error) {
+					console.error('[extension] Error getting function signature:', error);
+					// Don't show error message, just send empty params
+					if (flowPanel) {
+						flowPanel.webview.postMessage({
+							type: 'function-signature',
+							functionId: message.functionId,
+							params: [],
+						});
+					}
+				}
+			} else if (message.type === 'request-args-form' && typeof message.functionId === 'string') {
+				// Webview is requesting to show the args form - send function signature
+				console.log('[extension] Requesting args form for:', message.functionId);
+				try {
+					const pythonPath = await getPythonPath();
+					const targetFunctionId = message.functionId;
+					const entryFullId = targetFunctionId.startsWith('/') ? targetFunctionId.slice(1) : targetFunctionId;
+					
+					const signature = await getFunctionSignature(pythonPath, currentRepoRoot!, entryFullId, context.extensionPath);
+					
+					// Extract function name for display
+					const functionName = entryFullId.split('::').pop() || entryFullId;
+					
+					// Send signature to webview to show the form
+					if (flowPanel) {
+						flowPanel.webview.postMessage({
+							type: 'show-args-form',
+							functionId: targetFunctionId,
+							params: signature?.params || [],
+							functionName: functionName,
+						});
+					}
+				} catch (error) {
+					console.error('[extension] Error getting function signature:', error);
+					vscode.window.showErrorMessage(`Error getting function signature: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			} else if (message.type === 'store-call-args' && typeof message.functionId === 'string') {
+				// Store arguments in extension so recursive tracing can find them
+				console.log('[extension] Storing call args for function:', message.functionId);
+				try {
+					if (message.args && typeof message.args === 'object') {
+						const callArgs = normaliseCallArgs(message.args as TraceCallArgs);
+						setStoredCallArgs(message.functionId, callArgs);
+						console.log('[extension] Stored args for', message.functionId, ':', callArgs);
+					}
+				} catch (error) {
+					console.error('[extension] Error storing call args:', error);
+				}
+			} else if (message.type === 'execute-with-args' && typeof message.functionId === 'string') {
+				console.log('[extension] Executing function with user-provided arguments:', message.functionId);
+				try {
+					const targetFunctionId = message.functionId;
+					const targetLine = typeof message.line === 'number' ? message.line : 1;
+					
+					// Get arguments from message (provided by webview form)
+					let callArgs: NormalisedCallArgs;
+					if (message.args && typeof message.args === 'object') {
+						callArgs = normaliseCallArgs(message.args as TraceCallArgs);
+						// Also store in extension for recursive tracing
+						setStoredCallArgs(targetFunctionId, callArgs);
+					} else {
+						callArgs = { args: [], kwargs: {} };
+					}
+					
+					// Execute the function with provided arguments at the specified line
+					await handleTraceLine(
+						targetFunctionId,
+						targetLine,
+						targetLine,
+						context,
+						callArgs,
+						undefined, // No parent context
+					);
+				} catch (error) {
+					console.error('[extension] Error executing with arguments:', error);
+					vscode.window.showErrorMessage(`Error executing function: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			} else if (message.type === 'execute-from-call-site' && typeof message.functionId === 'string' && typeof message.callSite === 'object') {
+				console.log('[extension] Executing from call site:', message.callSite);
+				try {
+					// The call site contains: file, line, calling_function_id
+					// We need to execute up to that line in the calling function, then extract arguments
+					const callSite = message.callSite as CallSite;
+					if (typeof callSite.line === 'number') {
+						const pythonPath = await getPythonPath();
+						const targetFunctionId = message.functionId; // The parent function to execute
+						
+						// Check if we have a calling function ID
+						if (callSite.calling_function_id) {
+							// We have a calling function - execute it first to get runtime context
+							// We need to ensure activeTracer exists or create one
+							if (!activeTracer) {
+								if (!tracerOutputChannel) {
+									tracerOutputChannel = vscode.window.createOutputChannel('Linearizer Tracer');
+									context.subscriptions.push(tracerOutputChannel);
+								}
+								activeTracer = new TracerManager(tracerOutputChannel);
+							}
+							
+							const callingFunctionId = callSite.calling_function_id.startsWith('/') 
+								? callSite.calling_function_id.slice(1) 
+								: callSite.calling_function_id;
+							
+							console.log('[extension] Executing calling function:', {
+								callingFunctionId,
+								file: callSite.file,
+								line: callSite.line,
+								targetFunctionId
+							});
+							
+							// Validate the calling function ID format
+							if (!callingFunctionId.includes('::')) {
+								throw new Error(`Invalid calling function ID format: ${callSite.calling_function_id}. Expected format: path/to/file.py::function_name`);
+							}
+							
+							const callSiteEvent = await activeTracer.getTracerData(
+								currentRepoRoot!,
+								callingFunctionId,
+								callSite.line - 1, // displayLine is 0-indexed, callSite.line is 1-indexed
+								callSite.file,
+								JSON.stringify({ args: [], kwargs: {} }), // Dummy args - we'll extract real ones
+								context.extensionPath,
+								pythonPath,
+								false, // suppressWebview
+							);
+							
+							// Now extract the call arguments at that line
+							const extractedArgs = await extractCallArguments(
+								pythonPath,
+								currentRepoRoot!,
+								targetFunctionId.startsWith('/') ? targetFunctionId.slice(1) : targetFunctionId,
+								callSite.file,
+								callSite.line,
+								callSiteEvent.locals || {},
+								callSiteEvent.globals || {},
+								context.extensionPath,
+							);
+							
+							// Send extracted arguments to webview to display and allow editing
+							if (extractedArgs && !('error' in extractedArgs)) {
+								const normalisedArgs = normaliseCallArgs(extractedArgs);
+								if (flowPanel?.webview) {
+									flowPanel.webview.postMessage({
+										type: 'call-site-args-extracted',
+										functionId: targetFunctionId,
+										callSite: callSite,
+										args: normalisedArgs,
+									});
+								}
+							} else {
+								const errorMsg = extractedArgs && 'error' in extractedArgs ? extractedArgs.error : 'Failed to extract call arguments';
+								if (flowPanel?.webview) {
+									flowPanel.webview.postMessage({
+										type: 'call-site-args-error',
+										functionId: targetFunctionId,
+										error: errorMsg,
+									});
+								}
+							}
+						} else {
+							// No calling function ID (from fallback text search) - try to extract from call line directly
+							// This is a fallback when we can't determine the calling function
+							if (callSite.call_line) {
+								// Try to extract arguments from the call line text directly
+								const extractedArgs = await extractCallArguments(
+									pythonPath,
+									currentRepoRoot!,
+									targetFunctionId.startsWith('/') ? targetFunctionId.slice(1) : targetFunctionId,
+									callSite.file,
+									callSite.line,
+									{}, // Empty locals - we don't have runtime context
+									{}, // Empty globals - we don't have runtime context
+									context.extensionPath,
+								);
+								
+								if (extractedArgs && !('error' in extractedArgs)) {
+									const normalisedArgs = normaliseCallArgs(extractedArgs);
+									if (flowPanel?.webview) {
+										flowPanel.webview.postMessage({
+											type: 'call-site-args-extracted',
+											functionId: targetFunctionId,
+											callSite: callSite,
+											args: normalisedArgs,
+										});
+									}
+								} else {
+									const errorMsg = extractedArgs && 'error' in extractedArgs ? extractedArgs.error : 'Failed to extract call arguments from call line';
+									if (flowPanel?.webview) {
+										flowPanel.webview.postMessage({
+											type: 'call-site-args-error',
+											functionId: targetFunctionId,
+											error: errorMsg,
+										});
+									}
+								}
+							} else {
+								if (flowPanel?.webview) {
+									flowPanel.webview.postMessage({
+										type: 'call-site-args-error',
+										functionId: targetFunctionId,
+										error: 'The calling function could not be determined and the call line is not available.',
+									});
+								}
+							}
+						}
+					} else {
+						vscode.window.showErrorMessage('Invalid call site: line number is missing.');
+					}
+				} catch (error) {
+					console.error('[extension] Error executing from call site:', error);
+					vscode.window.showErrorMessage(`Error executing from call site: ${error instanceof Error ? error.message : String(error)}`);
+				}
 			} else if (message.type === 'stop-trace') {
+				if (activeTracer) {
+					activeTracer.stop();
+					activeTracer = undefined;
+				}
+			} else if (message.type === 'reset-tracer' && typeof message.functionId === 'string') {
+				// Reset tracer when arguments are updated - this ensures a new tracer is created
+				// with the new arguments on the next execution
+				console.log('[extension] Resetting tracer for function:', message.functionId);
 				if (activeTracer) {
 					activeTracer.stop();
 					activeTracer = undefined;
@@ -648,6 +1048,29 @@ async function showFlowPanel(
 		});
 		context.subscriptions.push(flowPanelMessageDisposable);
 	}
+}
+
+async function getSyntaxHighlightingStyles(): Promise<string> {
+	// Get semantic token colors from VS Code theme for Python syntax highlighting
+	// This makes the code display use the same colors as VS Code's editor
+	const colorMap = await vscode.commands.executeCommand<[string, string][]>('vscode.getColorMap');
+	
+	if (!colorMap || colorMap.length === 0) {
+		// Fallback: return empty string, CSS will use CSS variables
+		return '';
+	}
+
+	// Map TextMate scopes to token types we use
+	// VS Code uses TextMate scopes for syntax highlighting
+	// We'll inject styles that use the actual theme colors
+	const styles: string[] = [];
+	
+	// Note: VS Code doesn't expose TextMate token colors directly via API
+	// Instead, we rely on CSS variables that VS Code provides
+	// The CSS already uses the right variables, so this function is a placeholder
+	// for future enhancement if we want to inject specific colors
+	
+	return styles.join('\n');
 }
 
 function buildFlowWebviewHtml(
@@ -679,7 +1102,7 @@ function buildFlowWebviewHtml(
 	<html lang="en">
 	<head>
 		<meta charset="UTF-8" />
-		<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} https: data:; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';" />
+		<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} https: data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';" />
 		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 		<title>Linearizer Call Flows</title>
 		<link rel="stylesheet" href="${stylesUri}" />
@@ -865,6 +1288,105 @@ async function getPythonPath(): Promise<string> {
 	throw new Error('Python executable not found. Please configure linearizer.pythonPath');
 }
 
+async function extractCallArguments(
+	pythonPath: string,
+	repoRoot: string,
+	nestedFunctionId: string,
+	parentFile: string,
+	callLine: number,
+	locals: Record<string, unknown>,
+	globals: Record<string, unknown>,
+	extensionPath: string,
+): Promise<TraceCallArgs | null> {
+	try {
+		const tracerScript = path.join(extensionPath, 'python', 'tracer.py');
+		const nestedEntryFullId = nestedFunctionId.startsWith('/') ? nestedFunctionId.slice(1) : nestedFunctionId;
+		
+		const result = await execFileAsync(pythonPath, [
+			tracerScript,
+			'--extract-call-args',
+			'--repo_root', repoRoot,
+			'--entry_full_id', nestedEntryFullId,
+			'--parent-file', parentFile,
+			'--call-line', String(callLine),
+			'--locals', JSON.stringify(locals),
+			'--globals', JSON.stringify(globals),
+		], {
+			timeout: 30000,
+			cwd: repoRoot,
+		});
+
+		const parsed = JSON.parse(result.stdout);
+		if (parsed.error) {
+			console.error('[extension] Error extracting call arguments:', parsed.error);
+			return null;
+		}
+		return parsed.args ? parsed.args : null;
+	} catch (error) {
+		console.error('[extension] Failed to extract call arguments:', error);
+		return null;
+	}
+}
+
+interface CallSite {
+	file: string;
+	line: number;
+	column: number;
+	call_line: string;
+	context: string[];
+	calling_function: string | null;
+	calling_function_id: string | null;
+}
+
+async function findCallSites(
+	pythonPath: string,
+	repoRoot: string,
+	functionId: string,
+	extensionPath: string,
+): Promise<CallSite[]> {
+	const scriptPath = path.join(extensionPath, 'python', 'find_call_sites.py');
+	
+	try {
+		const entryFullId = functionId.startsWith('/') ? functionId.slice(1) : functionId;
+		console.log('[extension] Calling find_call_sites.py with:', { pythonPath, scriptPath, repoRoot, entryFullId });
+		
+		const { stdout, stderr } = await execFileAsync(
+			pythonPath,
+			[
+				'-u', // Unbuffered output
+				scriptPath,
+				'--repo', repoRoot,
+				'--function-id', entryFullId,
+			],
+			{ cwd: repoRoot, maxBuffer: 10 * 1024 * 1024 },
+		);
+		
+		if (stderr && stderr.trim()) {
+			console.warn('[extension] find_call_sites.py stderr:', stderr);
+		}
+		
+		console.log('[extension] find_call_sites.py stdout:', stdout);
+		const trimmed = stdout.trim();
+		if (!trimmed) {
+			console.warn('[extension] find_call_sites.py returned empty output');
+			return [];
+		}
+		
+		const result = JSON.parse(trimmed);
+		const callSites = result.call_sites || [];
+		console.log('[extension] Found call sites:', callSites.length);
+		return callSites;
+	} catch (error: any) {
+		const errorMessage = error instanceof Error ? error.message : String(error);
+		const errorStdout = (error as any)?.stdout ? String((error as any).stdout) : '';
+		const errorStderr = (error as any)?.stderr ? String((error as any).stderr) : '';
+		console.error('[extension] Error finding call sites:', errorMessage);
+		if (errorStdout) console.error('[extension] stdout:', errorStdout);
+		if (errorStderr) console.error('[extension] stderr:', errorStderr);
+		throw error; // Re-throw so the caller can handle it
+	}
+}
+
 async function getFunctionSignature(
 	pythonPath: string,
 	repoRoot: string,
@@ -897,12 +1419,20 @@ async function getFunctionSignature(
 	}
 }
 
+interface ParentContext {
+	parentFunctionId: string;
+	parentLine: number;
+	callLine: number;
+	parentCallArgs?: TraceCallArgs;
+}
+
 async function handleTraceLine(
 	functionId: string,
 	displayLine: number,
 	stopLine: number,
 	context: vscode.ExtensionContext,
 	callArgs?: TraceCallArgs,
+	parentContext?: ParentContext,
 ): Promise<void> {
 	if (!currentRepoRoot) {
 		vscode.window.showErrorMessage('No repository root available');
@@ -915,44 +1445,241 @@ async function handleTraceLine(
 		return;
 	}
 
-	const executionLine = Number.isFinite(stopLine) ? stopLine : displayLine + 1;
+		const executionLine = Number.isFinite(stopLine) ? stopLine : displayLine + 1;
 
 	try {
 		const pythonPath = await getPythonPath();
 		const entryFullId = functionId.startsWith('/') ? functionId.slice(1) : functionId;
 		let resolvedArgs = callArgs ? normaliseCallArgs(callArgs) : cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
 		let argsJson: string;
+		let hasExtractedArgs = false; // Track if we extracted args from parent
 
-		if (callArgs) {
+		// If this is a nested function, trace the parent chain recursively to get arguments
+		if (parentContext && !callArgs) {
+			// Helper function to trace a parent function and return its execution context
+			async function traceParentFunction(
+				parentId: string,
+				callLine: number,
+				parentStoredArgs: NormalisedCallArgs | undefined,
+				visited: Set<string> = new Set() // To detect circular dependencies
+			): Promise<{ locals: Record<string, unknown>, globals: Record<string, unknown>, file: string }> {
+				if (visited.has(parentId)) {
+					throw new Error(`Circular dependency detected: ${parentId}`);
+				}
+				visited.add(parentId);
+
+				const parentBody = resolveFunctionBody(parentId);
+				if (!parentBody) {
+					throw new Error(`Parent function ${parentId} not found`);
+				}
+
+				const parentEntryFullId = parentId.startsWith('/') ? parentId.slice(1) : parentId;
+
+				// Check if parent function requires arguments
+				const parentSignature = await getFunctionSignature(pythonPath, currentRepoRoot!, parentEntryFullId, context.extensionPath);
+				const hasRequiredParams = parentSignature && parentSignature.params && parentSignature.params.length > 0;
+				
+				// If required params but no stored args, recursively trace up the chain to find a parent with stored args
+				if (hasRequiredParams && (!parentStoredArgs || (Object.keys(parentStoredArgs.kwargs || {}).length === 0 && (parentStoredArgs.args || []).length === 0))) {
+					console.log('[extension] Parent function requires args but has none, searching call sites:', parentId);
+					// Try to find call sites and trace from grandparent (recursive case)
+					const callSites = await findCallSites(pythonPath, currentRepoRoot!, parentId, context.extensionPath);
+					
+					if (callSites && callSites.length > 0) {
+						console.log('[extension] Found', callSites.length, 'call sites for parent function');
+						for (const callSite of callSites) {
+							if (callSite.calling_function_id) {
+								const grandParentId = callSite.calling_function_id.startsWith('/') 
+									? callSite.calling_function_id 
+									: '/' + callSite.calling_function_id;
+								const grandParentStoredArgs = getStoredCallArgs(grandParentId);
+								
+								console.log('[extension] Checking call site from:', grandParentId, 'has stored args:', !!grandParentStoredArgs);
+								
+								if (grandParentStoredArgs) {
+									console.log('[extension] Found grandparent with stored args, tracing recursively:', grandParentId);
+									// Recursively trace grandparent to get parent's args
+									const grandParentEvent = await traceParentFunction(
+										grandParentId,
+										callSite.line,
+										grandParentStoredArgs,
+										visited
+									);
+									
+									console.log('[extension] Extracting parent args from grandparent execution at line', callSite.line);
+									// Extract parent's args from grandparent's execution
+									const extractedParentArgs = await extractCallArguments(
+										pythonPath,
+										currentRepoRoot!,
+										parentId,
+										callSite.file,
+										callSite.line,
+										grandParentEvent.locals,
+										grandParentEvent.globals,
+										context.extensionPath,
+									);
+									
+									if (extractedParentArgs && !('error' in extractedParentArgs)) {
+										parentStoredArgs = normaliseCallArgs(extractedParentArgs);
+										console.log('[extension] Successfully extracted parent args from grandparent:', parentStoredArgs);
+										break;
+									} else {
+										const error = extractedParentArgs && 'error' in extractedParentArgs ? extractedParentArgs.error : 'Unknown error';
+										console.warn('[extension] Failed to extract parent args from call site:', error);
+									}
+								}
+							}
+						}
+					} else {
+						console.log('[extension] No call sites found for parent function:', parentId);
+					}
+					
+					// If still no args and function requires them, error
+					if (!parentStoredArgs || (Object.keys(parentStoredArgs.kwargs || {}).length === 0 && (parentStoredArgs.args || []).length === 0)) {
+						throw new Error(`Parent function ${parentId} requires arguments (${parentSignature.params.join(', ')}) but none were provided. Please provide arguments for the parent function first.`);
+					}
+				}
+				
+				// Use stored args if available, otherwise empty args (valid for no-param functions)
+				const finalParentArgs = parentStoredArgs || cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+				
+				// Check cache first to avoid redundant tracing
+				const cacheKey = getCacheKey(parentId, callLine, finalParentArgs);
+				const cached = parentExecutionContextCache.get(cacheKey);
+				if (cached) {
+					console.log('[extension] Using cached execution context for parent:', parentId);
+					return cached;
+				}
+
+				const parentArgsJson = JSON.stringify(finalParentArgs);
+
+				// Create or get tracer
+				if (!tracerOutputChannel) {
+					tracerOutputChannel = vscode.window.createOutputChannel('Linearizer Tracer');
+				}
+				if (!activeTracer) {
+					activeTracer = new TracerManager(tracerOutputChannel, flowPanel?.webview);
+				}
+				activeTracer.setWebview(flowPanel?.webview);
+
+				console.log('[extension] Tracing parent function:', parentEntryFullId, 'with args:', parentArgsJson);
+				
+				// Trace parent to the call line
+				const parentEvent = await activeTracer.getTracerData(
+					currentRepoRoot!,
+					parentEntryFullId,
+					callLine,
+					parentBody.file,
+					parentArgsJson,
+					context.extensionPath,
+					pythonPath,
+					true, // suppressWebview = true: don't display parent events
+				);
+
+				if (parentEvent.event === 'error') {
+					throw new Error(`Error tracing parent function ${parentId}: ${parentEvent.error || 'Unknown error'}`);
+				}
+
+				const result = {
+					locals: parentEvent.locals || {},
+					globals: parentEvent.globals || {},
+					file: parentBody.file,
+				};
+
+				// Cache the result
+				parentExecutionContextCache.set(cacheKey, result);
+				console.log('[extension] Cached execution context for parent:', parentId);
+
+				return result;
+			}
+
+			try {
+				// Get parent's stored args (from message or stored state)
+				let parentStoredArgs: NormalisedCallArgs | undefined = parentContext.parentCallArgs
+					? normaliseCallArgs(parentContext.parentCallArgs)
+					: getStoredCallArgs(parentContext.parentFunctionId);
+
+				// Trace the parent function to get its execution context
+				const parentEvent = await traceParentFunction(
+					parentContext.parentFunctionId,
+					parentContext.callLine,
+					parentStoredArgs
+				);
+
+				// Extract call arguments for the nested function (functionId) from parent's execution
+				// This automatically filters args to match the nested function's signature
+				const extractedArgs = await extractCallArguments(
+					pythonPath,
+					currentRepoRoot!,
+					functionId, // The nested function being called
+					parentEvent.file, // The parent function's file where the call happens
+					parentContext.callLine,
+					parentEvent.locals,
+					parentEvent.globals,
+					context.extensionPath,
+				);
+
+				if (extractedArgs && !('error' in extractedArgs)) {
+					// extractCallArguments already filters args to match the function's signature
+					resolvedArgs = normaliseCallArgs(extractedArgs);
+					hasExtractedArgs = true; // Mark that we have extracted args
+					console.log('[extension] Extracted and filtered args for nested function:', resolvedArgs);
+				} else {
+					const errorMsg = extractedArgs && 'error' in extractedArgs ? extractedArgs.error : 'Failed to extract call arguments';
+					vscode.window.showErrorMessage(`Error extracting arguments from parent function: ${errorMsg}`);
+					return;
+				}
+				
+				// Reset suppress flag so nested function events will be displayed
+				if (activeTracer) {
+					activeTracer.setSuppressWebviewEvents(false);
+				}
+			} catch (error) {
+				vscode.window.showErrorMessage(`Error tracing parent function: ${error instanceof Error ? error.message : String(error)}`);
+				return;
+			}
+		}
+
+		// If we have callArgs or extracted args from parent, use them directly
+		// For nested functions, we should always extract args from parent - never prompt for input
+		if (callArgs || hasExtractedArgs) {
 			argsJson = JSON.stringify(resolvedArgs);
 		} else {
-			const signature = await getFunctionSignature(pythonPath, currentRepoRoot, entryFullId, context.extensionPath);
-			const defaultJson = JSON.stringify(resolvedArgs);
-			if (signature && signature.params.length > 0) {
-				const paramInput = await vscode.window.showInputBox({
-					prompt: `Enter function arguments as JSON (params: ${signature.params.join(', ')}). Example: {"args": [1, 2], "kwargs": {"key": "value"}}`,
-					placeHolder: defaultJson,
-					value: defaultJson,
-				});
+			// Only prompt for input if this is a top-level parent function (not nested)
+			// If nested, we should have extracted args from parent above
+			if (!parentContext) {
+				const signature = await getFunctionSignature(pythonPath, currentRepoRoot, entryFullId, context.extensionPath);
+				const defaultJson = JSON.stringify(resolvedArgs);
+				if (signature && signature.params.length > 0) {
+					const paramInput = await vscode.window.showInputBox({
+						prompt: `Enter function arguments as JSON (params: ${signature.params.join(', ')}). Example: {"args": [1, 2], "kwargs": {"key": "value"}}`,
+						placeHolder: defaultJson,
+						value: defaultJson,
+					});
 
-				if (paramInput === undefined) {
-					return; // User cancelled
-				}
-
-				if (paramInput.trim()) {
-					try {
-						const parsed = JSON.parse(paramInput);
-						if (!isTraceCallArgs(parsed)) {
-							throw new Error('Invalid argument structure');
-						}
-						resolvedArgs = normaliseCallArgs(parsed);
-					} catch {
-						vscode.window.showErrorMessage('Invalid JSON format for arguments');
-						return;
+					if (paramInput === undefined) {
+						return; // User cancelled
 					}
-				} else {
-					resolvedArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+
+					if (paramInput.trim()) {
+						try {
+							const parsed = JSON.parse(paramInput);
+							if (!isTraceCallArgs(parsed)) {
+								throw new Error('Invalid argument structure');
+							}
+							resolvedArgs = normaliseCallArgs(parsed);
+						} catch {
+							vscode.window.showErrorMessage('Invalid JSON format for arguments');
+							return;
+						}
+					} else {
+						resolvedArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+					}
 				}
+			} else {
+				// This is a nested function but we somehow didn't extract args
+				// This shouldn't happen, but just use empty args as fallback
+				resolvedArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
 			}
 			argsJson = JSON.stringify(resolvedArgs);
 		}
