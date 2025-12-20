@@ -83,29 +83,143 @@ def safe_json(value):
         return f"<unserializable {type(value).__name__}>"
 
 def get_function_signature(repo_root: str, entry_full_id: str):
-    """Get the function signature (parameter names) for a given function."""
+    """Get the function signature (parameter names) for a given function using AST parsing."""
     try:
         log(f"get_function_signature called: repo_root={repo_root}, entry_full_id={entry_full_id}")
         if "::" not in entry_full_id:
             log("ERROR: Invalid entry_full_id format in get_function_signature", "ERROR")
             return {"error": "invalid entry id"}
         
-        rel_path, fn_name = entry_full_id.split("::", 1)
-        log(f"Parsing entry_full_id: rel_path={rel_path}, fn_name={fn_name}")
+        # Split the entry_full_id - it can be:
+        # - path/to/file.py::function_name (top-level function)
+        # - path/to/file.py::ClassName::method_name (class method)
+        # - path/to/file.py::outer_function::inner_function (nested function)
+        parts = entry_full_id.split("::")
+        rel_path = parts[0]
+        fn_path = parts[1:]  # Can be [function_name] or [ClassName, method_name] or [outer, inner]
         
-        module = import_module_from_path(repo_root, rel_path)
-        log(f"Module imported: {module}")
+        log(f"Parsing entry_full_id: rel_path={rel_path}, fn_path={fn_path}")
         
-        func = getattr(module, fn_name, None)
-        log(f"Function lookup: fn_name={fn_name}, found={func is not None}, callable={callable(func) if func else False}")
+        # Get absolute path to the file
+        rel_path = rel_path.lstrip("/")
+        abs_path = os.path.join(repo_root, rel_path)
         
-        if func is None or not callable(func):
-            log(f"ERROR: Function {fn_name} not found or not callable", "ERROR")
-            return {"error": f"function {fn_name} not found"}
+        if not os.path.exists(abs_path):
+            log(f"ERROR: File not found: {abs_path}", "ERROR")
+            return {"error": f"file not found: {rel_path}"}
         
-        sig = inspect.signature(func)
-        params = list(sig.parameters.keys())
-        log(f"Function signature: params={params}, param_count={len(params)}")
+        # Parse the file with AST
+        try:
+            with open(abs_path, 'r', encoding='utf-8') as f:
+                source = f.read()
+            tree = ast.parse(source, filename=abs_path)
+        except SyntaxError as e:
+            log(f"ERROR: Syntax error parsing file: {e}", "ERROR")
+            return {"error": f"syntax error in file: {str(e)}"}
+        except Exception as e:
+            log(f"ERROR: Error reading file: {e}", "ERROR")
+            return {"error": f"error reading file: {str(e)}"}
+        
+        # Find the function in the AST
+        target_func = None
+        
+        if len(fn_path) == 1:
+            # Simple function: path/to/file.py::function_name
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef) and node.name == fn_path[0]:
+                    target_func = node
+                    break
+        elif len(fn_path) == 2:
+            # Could be class method or nested function
+            # First try class method: path/to/file.py::ClassName::method_name
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef) and node.name == fn_path[0]:
+                    for item in node.body:
+                        if isinstance(item, ast.FunctionDef) and item.name == fn_path[1]:
+                            target_func = item
+                            break
+                    if target_func:
+                        break
+                    break
+            
+            # If not found as class method, try nested function
+            if target_func is None:
+                for node in tree.body:
+                    if isinstance(node, ast.FunctionDef) and node.name == fn_path[0]:
+                        # Look for nested function
+                        for item in node.body:
+                            if isinstance(item, ast.FunctionDef) and item.name == fn_path[1]:
+                                target_func = item
+                                break
+                        if target_func:
+                            break
+                        break
+        else:
+            # More complex nesting - traverse step by step
+            current_nodes = tree.body
+            for i, part in enumerate(fn_path):
+                found = False
+                for node in current_nodes:
+                    if isinstance(node, ast.FunctionDef) and node.name == part:
+                        if i == len(fn_path) - 1:
+                            # This is the target function
+                            target_func = node
+                            found = True
+                            break
+                        else:
+                            # Continue searching inside this function
+                            current_nodes = [n for n in node.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))]
+                            found = True
+                            break
+                    elif isinstance(node, ast.ClassDef) and node.name == part:
+                        if i == len(fn_path) - 1:
+                            # Shouldn't happen, but handle it
+                            break
+                        else:
+                            # Continue searching inside this class
+                            current_nodes = node.body
+                            found = True
+                            break
+                if not found:
+                    break
+        
+        if target_func is None:
+            # Fallback: try importing and using inspect (for cases AST can't handle)
+            log(f"Function not found in AST, trying import fallback")
+            try:
+                module = import_module_from_path(repo_root, rel_path)
+                # Try to get the function by traversing the path
+                obj = module
+                for part in fn_path:
+                    obj = getattr(obj, part, None)
+                    if obj is None:
+                        break
+                
+                if obj is not None and callable(obj):
+                    sig = inspect.signature(obj)
+                    params = list(sig.parameters.keys())
+                    log(f"Function signature (via import): params={params}, param_count={len(params)}")
+                    return {
+                        "params": params,
+                        "param_count": len(params)
+                    }
+            except Exception as import_error:
+                log(f"Import fallback also failed: {import_error}")
+        
+        if target_func is None:
+            log(f"ERROR: Function {'::'.join(fn_path)} not found in {rel_path}", "ERROR")
+            return {"error": f"function {'::'.join(fn_path)} not found"}
+        
+        # Extract parameters from the AST function node
+        params = []
+        is_method = len(fn_path) == 2  # Class method if path has 2 parts (ClassName::method_name)
+        for arg in target_func.args.args:
+            # Skip 'self' and 'cls' parameters only for class methods
+            if is_method and arg.arg in ('self', 'cls'):
+                continue
+            params.append(arg.arg)
+        
+        log(f"Function signature (via AST): params={params}, param_count={len(params)}")
         
         return {
             "params": params,

@@ -577,8 +577,9 @@
     } else {
       state.expandedParents.add(parentId);
       // Request call sites when expanding a parent function
-      if (!state.callSitesByFunction.has(parentId) && !state.loadingCallSites.has(parentId)) {
+      if (!state.loadingCallSites.has(parentId)) {
         state.loadingCallSites.add(parentId);
+        console.log('[flowPanel] Requesting call sites for parent:', parentId);
         vscode.postMessage({ type: 'find-call-sites', functionId: parentId });
       }
     }

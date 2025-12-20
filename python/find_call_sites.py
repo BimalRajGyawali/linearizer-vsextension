@@ -13,10 +13,16 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-def find_function_calls_in_file(file_path: str, target_function_name: str, repo_root: str) -> List[Dict[str, any]]:
+def find_function_calls_in_file(file_path: str, target_function_name: str, repo_root: str, target_file_path: str = None) -> List[Dict[str, any]]:
     """
     Find all calls to target_function_name in a given file.
     Returns a list of call sites with file, line, column, and call context.
+    
+    Args:
+        file_path: Path to the file to search
+        target_function_name: Name of the function to find calls to
+        repo_root: Root of the repository
+        target_file_path: Relative path to the file containing the target function (for import matching)
     """
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -24,6 +30,68 @@ def find_function_calls_in_file(file_path: str, target_function_name: str, repo_
         
         tree = ast.parse(source_code, filename=file_path)
         call_sites = []
+        
+        # Track imports to find if the target function is imported
+        imported_names = set()  # Names the function might be imported as (for direct calls)
+        imported_modules = set()  # Module aliases that might contain the function (for module.function() calls)
+        
+        class ImportVisitor(ast.NodeVisitor):
+            """First pass: collect imports to understand how the function might be called."""
+            def visit_Import(self, node):
+                # Track module imports: import analytics -> analytics is available
+                for alias in node.names:
+                    imported_modules.add(alias.asname if alias.asname else alias.name)
+            
+            def visit_ImportFrom(self, node):
+                if node.module:
+                    module_name = node.module
+                    # Check if this import is from the target function's module
+                    if target_file_path:
+                        # Convert target_file_path to module path (e.g., "backend/services/analytics.py" -> "backend.services.analytics")
+                        target_module_parts = target_file_path.replace('/', '.').replace('.py', '').split('.')
+                        target_module_full = '.'.join(target_module_parts)  # "backend.services.analytics"
+                        target_module_short = target_module_parts[-1]  # Just "analytics"
+                        target_package = '.'.join(target_module_parts[:-1]) if len(target_module_parts) > 1 else None  # "backend.services"
+                        
+                        # Check if the import matches the target module
+                        # Match cases like:
+                        # - from backend.services.analytics import ... (full path)
+                        # - from backend.services import ... (package level)
+                        # - from .analytics import ... (relative import)
+                        # - from analytics import ... (direct module)
+                        module_matches = (
+                            module_name == target_module_full or
+                            module_name.endswith('.' + target_module_short) or
+                            module_name == target_module_short or
+                            (target_package and module_name == target_package) or
+                            (target_package and module_name.endswith('.' + target_package.split('.')[-1]))
+                        )
+                        
+                        # Also check for relative imports (e.g., from .analytics import ...)
+                        if node.level > 0:  # Relative import
+                            # For relative imports, we need to check if the relative path matches
+                            # This is approximate - we check if the module name matches the target module short name
+                            if target_module_short in module_name or module_name.endswith('.' + target_module_short):
+                                module_matches = True
+                        
+                        if module_matches:
+                            # This import is from the target function's module
+                            for alias in node.names:
+                                if alias.name == target_function_name:
+                                    # Function is imported directly: from analytics import get_metric_period_analytics
+                                    imported_names.add(alias.asname if alias.asname else alias.name)
+                                elif alias.name == '*':
+                                    # Wildcard import - the function might be available
+                                    imported_names.add(target_function_name)
+                    else:
+                        # No target file path, but check if function name matches
+                        for alias in node.names:
+                            if alias.name == target_function_name:
+                                imported_names.add(alias.asname if alias.asname else alias.name)
+        
+        # First pass: collect imports
+        import_visitor = ImportVisitor()
+        import_visitor.visit(tree)
         
         class CallSiteVisitor(ast.NodeVisitor):
             def __init__(self):
@@ -44,16 +112,32 @@ def find_function_calls_in_file(file_path: str, target_function_name: str, repo_
             
             def visit_Call(self, node):
                 # Check if this is a call to our target function
-                func_name = None
+                # We match any call where the function name matches exactly
+                # This is permissive to catch all possible call sites
+                is_match = False
                 
                 if isinstance(node.func, ast.Name):
                     # Direct call: function_name()
                     func_name = node.func.id
+                    # Match if exact name matches or if it's imported with that name
+                    is_match = (func_name == target_function_name or func_name in imported_names)
+                    
                 elif isinstance(node.func, ast.Attribute):
-                    # Method call: obj.method_name()
-                    func_name = node.func.attr
+                    # Method call or module.function() call: obj.method() or module.function()
+                    attr_name = node.func.attr
+                    
+                    # Match if the attribute name is the target function name
+                    if attr_name == target_function_name:
+                        # This could be:
+                        # - module.get_metric_period_analytics() (module-qualified)
+                        # - obj.get_metric_period_analytics() (method call)
+                        # We include it - the user can determine if it's correct
+                        is_match = True
+                    elif attr_name in imported_names:
+                        # Imported with a different name but called as attribute
+                        is_match = True
                 
-                if func_name == target_function_name:
+                if is_match:
                     # Get the line number (1-indexed)
                     lineno = node.lineno
                     col_offset = node.col_offset
@@ -91,8 +175,30 @@ def find_function_calls_in_file(file_path: str, target_function_name: str, repo_
         return call_sites
     
     except SyntaxError as e:
-        # File has syntax errors, skip it
-        return []
+        # File has syntax errors, try fallback text-based search
+        # This is less accurate but can still find call sites in files with syntax errors
+        try:
+            lines = source_code.split('\n')
+            call_sites = []
+            for i, line in enumerate(lines, 1):
+                # Simple pattern: look for function_name( or function_name ( with optional whitespace
+                # This catches: get_metric_period_analytics(...) or get_metric_period_analytics (...)
+                if target_function_name + '(' in line or target_function_name + ' (' in line:
+                    # Check if it's not just a definition
+                    if not line.strip().startswith('def ') and not line.strip().startswith('async def '):
+                        rel_path = os.path.relpath(file_path, repo_root).replace('\\', '/')
+                        call_sites.append({
+                            "file": rel_path,
+                            "line": i,
+                            "column": 0,
+                            "call_line": line.strip(),
+                            "context": lines[max(0, i-3):min(len(lines), i+2)],
+                            "calling_function": None,  # Can't determine from text search
+                            "calling_function_id": None
+                        })
+            return call_sites
+        except Exception:
+            return []
     except Exception as e:
         # Error reading or parsing file
         return []
@@ -120,6 +226,9 @@ def find_call_sites(repo_root: str, target_function_id: str) -> List[Dict[str, a
     if not os.path.isfile(target_file_abs):
         return []
     
+    # Store the relative path for import matching
+    target_file_rel_path = path_part
+    
     all_call_sites = []
     
     # Walk through all Python files in the repo
@@ -132,7 +241,11 @@ def find_call_sites(repo_root: str, target_function_id: str) -> List[Dict[str, a
                 continue
             
             file_path = os.path.join(root, file)
-            call_sites = find_function_calls_in_file(file_path, func_name, repo_root)
+            # Skip the file containing the function itself (no point finding calls within itself)
+            if os.path.abspath(file_path) == target_file_abs:
+                continue
+                
+            call_sites = find_function_calls_in_file(file_path, func_name, repo_root, target_file_rel_path)
             all_call_sites.extend(call_sites)
     
     return all_call_sites
