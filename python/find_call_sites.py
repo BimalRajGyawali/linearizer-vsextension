@@ -175,30 +175,8 @@ def find_function_calls_in_file(file_path: str, target_function_name: str, repo_
         return call_sites
     
     except SyntaxError as e:
-        # File has syntax errors, try fallback text-based search
-        # This is less accurate but can still find call sites in files with syntax errors
-        try:
-            lines = source_code.split('\n')
-            call_sites = []
-            for i, line in enumerate(lines, 1):
-                # Simple pattern: look for function_name( or function_name ( with optional whitespace
-                # This catches: get_metric_period_analytics(...) or get_metric_period_analytics (...)
-                if target_function_name + '(' in line or target_function_name + ' (' in line:
-                    # Check if it's not just a definition
-                    if not line.strip().startswith('def ') and not line.strip().startswith('async def '):
-                        rel_path = os.path.relpath(file_path, repo_root).replace('\\', '/')
-                        call_sites.append({
-                            "file": rel_path,
-                            "line": i,
-                            "column": 0,
-                            "call_line": line.strip(),
-                            "context": lines[max(0, i-3):min(len(lines), i+2)],
-                            "calling_function": None,  # Can't determine from text search
-                            "calling_function_id": None
-                        })
-            return call_sites
-        except Exception:
-            return []
+        # File has syntax errors, skip it
+        return []
     except Exception as e:
         # Error reading or parsing file
         return []

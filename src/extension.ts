@@ -265,10 +265,44 @@ class TracerManager {
 
 		this.process.on('exit', (code) => {
 			this.outputChannel.appendLine(`[Tracer] Process exited with code ${code}`);
-			if (this.pendingReadReject) {
-				this.pendingReadReject(new Error(`Python process exited with code ${code}`));
-				this.pendingReadResolve = undefined;
-				this.pendingReadReject = undefined;
+			if (code !== 0 && code !== null) {
+				// Process exited with an error - check for error events or stderr output
+				let errorMessage = `Python process exited with code ${code}`;
+				
+				// Check if there's an error event in the queue
+				const errorEvent = this.eventQueue.find(e => e.event === 'error');
+				if (errorEvent) {
+					errorMessage = errorEvent.error || errorMessage;
+					if (errorEvent.filename) {
+						errorMessage += ` in ${errorEvent.filename}`;
+					}
+					if (errorEvent.line) {
+						errorMessage += ` at line ${errorEvent.line}`;
+					}
+				} else if (this.stderrBuffer.trim()) {
+					// Check if there's any remaining stderr output
+					const stderrLines = this.stderrBuffer.trim().split('\n').filter(l => l.trim());
+					if (stderrLines.length > 0) {
+						// Try to find error messages in stderr
+						const errorLines = stderrLines.filter(l => 
+							l.toLowerCase().includes('error') || 
+							l.toLowerCase().includes('exception') ||
+							l.toLowerCase().includes('traceback')
+						);
+						if (errorLines.length > 0) {
+							errorMessage += `: ${errorLines[0]}`;
+						} else {
+							// Use the last line of stderr as it might contain the error
+							errorMessage += `: ${stderrLines[stderrLines.length - 1]}`;
+						}
+					}
+				}
+				
+				if (this.pendingReadReject) {
+					this.pendingReadReject(new Error(errorMessage));
+					this.pendingReadResolve = undefined;
+					this.pendingReadReject = undefined;
+				}
 			}
 			this.process = undefined;
 			this.currentFlow = undefined;
@@ -839,61 +873,116 @@ async function showFlowPanel(
 					// The call site contains: file, line, calling_function_id
 					// We need to execute up to that line in the calling function, then extract arguments
 					const callSite = message.callSite as CallSite;
-					if (callSite.calling_function_id && typeof callSite.line === 'number') {
+					if (typeof callSite.line === 'number') {
 						const pythonPath = await getPythonPath();
 						const targetFunctionId = message.functionId; // The parent function to execute
 						
-						// First, execute up to the call site line to get the runtime context
-						// We need to ensure activeTracer exists or create one
-						if (!activeTracer) {
-							if (!tracerOutputChannel) {
-								tracerOutputChannel = vscode.window.createOutputChannel('Linearizer Tracer');
-								context.subscriptions.push(tracerOutputChannel);
+						// Check if we have a calling function ID
+						if (callSite.calling_function_id) {
+							// We have a calling function - execute it first to get runtime context
+							// We need to ensure activeTracer exists or create one
+							if (!activeTracer) {
+								if (!tracerOutputChannel) {
+									tracerOutputChannel = vscode.window.createOutputChannel('Linearizer Tracer');
+									context.subscriptions.push(tracerOutputChannel);
+								}
+								activeTracer = new TracerManager(tracerOutputChannel);
 							}
-							activeTracer = new TracerManager(tracerOutputChannel);
-						}
-						
-						const callSiteEvent = await activeTracer.getTracerData(
-							currentRepoRoot!,
-							callSite.calling_function_id.startsWith('/') ? callSite.calling_function_id.slice(1) : callSite.calling_function_id,
-							callSite.line - 1, // displayLine is 0-indexed, callSite.line is 1-indexed
-							callSite.file,
-							JSON.stringify({ args: [], kwargs: {} }), // Dummy args - we'll extract real ones
-							context.extensionPath,
-							pythonPath,
-							false, // suppressWebview
-						);
-						
-						// Now extract the call arguments at that line
-						const extractedArgs = await extractCallArguments(
-							pythonPath,
-							currentRepoRoot!,
-							targetFunctionId.startsWith('/') ? targetFunctionId.slice(1) : targetFunctionId,
-							callSite.file,
-							callSite.line,
-							callSiteEvent.locals || {},
-							callSiteEvent.globals || {},
-							context.extensionPath,
-						);
-						
-						// Now execute the target function with the extracted arguments
-						if (extractedArgs && !('error' in extractedArgs)) {
-							const normalisedArgs = normaliseCallArgs(extractedArgs);
-							const argsJson = JSON.stringify(normalisedArgs);
 							
-							// Execute the target function with extracted arguments
-							await handleTraceLine(
-								targetFunctionId,
-								1, // Start from first line
-								1,
-								context,
-								normalisedArgs,
-								undefined, // No parent context - this is a top-level execution
+							const callingFunctionId = callSite.calling_function_id.startsWith('/') 
+								? callSite.calling_function_id.slice(1) 
+								: callSite.calling_function_id;
+							
+							console.log('[extension] Executing calling function:', {
+								callingFunctionId,
+								file: callSite.file,
+								line: callSite.line,
+								targetFunctionId
+							});
+							
+							// Validate the calling function ID format
+							if (!callingFunctionId.includes('::')) {
+								throw new Error(`Invalid calling function ID format: ${callSite.calling_function_id}. Expected format: path/to/file.py::function_name`);
+							}
+							
+							const callSiteEvent = await activeTracer.getTracerData(
+								currentRepoRoot!,
+								callingFunctionId,
+								callSite.line - 1, // displayLine is 0-indexed, callSite.line is 1-indexed
+								callSite.file,
+								JSON.stringify({ args: [], kwargs: {} }), // Dummy args - we'll extract real ones
+								context.extensionPath,
+								pythonPath,
+								false, // suppressWebview
 							);
+							
+							// Now extract the call arguments at that line
+							const extractedArgs = await extractCallArguments(
+								pythonPath,
+								currentRepoRoot!,
+								targetFunctionId.startsWith('/') ? targetFunctionId.slice(1) : targetFunctionId,
+								callSite.file,
+								callSite.line,
+								callSiteEvent.locals || {},
+								callSiteEvent.globals || {},
+								context.extensionPath,
+							);
+							
+							// Now execute the target function with the extracted arguments
+							if (extractedArgs && !('error' in extractedArgs)) {
+								const normalisedArgs = normaliseCallArgs(extractedArgs);
+								
+								// Execute the target function with extracted arguments
+								await handleTraceLine(
+									targetFunctionId,
+									1, // Start from first line
+									1,
+									context,
+									normalisedArgs,
+									undefined, // No parent context - this is a top-level execution
+								);
+							} else {
+								const errorMsg = extractedArgs && 'error' in extractedArgs ? extractedArgs.error : 'Failed to extract call arguments';
+								vscode.window.showErrorMessage(`Error extracting arguments from call site: ${errorMsg}`);
+							}
 						} else {
-							const errorMsg = extractedArgs && 'error' in extractedArgs ? extractedArgs.error : 'Failed to extract call arguments';
-							vscode.window.showErrorMessage(`Error extracting arguments from call site: ${errorMsg}`);
+							// No calling function ID (from fallback text search) - try to extract from call line directly
+							// This is a fallback when we can't determine the calling function
+							if (callSite.call_line) {
+								// Try to extract arguments from the call line text directly
+								const extractedArgs = await extractCallArguments(
+									pythonPath,
+									currentRepoRoot!,
+									targetFunctionId.startsWith('/') ? targetFunctionId.slice(1) : targetFunctionId,
+									callSite.file,
+									callSite.line,
+									{}, // Empty locals - we don't have runtime context
+									{}, // Empty globals - we don't have runtime context
+									context.extensionPath,
+								);
+								
+								if (extractedArgs && !('error' in extractedArgs)) {
+									const normalisedArgs = normaliseCallArgs(extractedArgs);
+									
+									// Execute the target function with extracted arguments
+									await handleTraceLine(
+										targetFunctionId,
+										1, // Start from first line
+										1,
+										context,
+										normalisedArgs,
+										undefined, // No parent context - this is a top-level execution
+									);
+								} else {
+									const errorMsg = extractedArgs && 'error' in extractedArgs ? extractedArgs.error : 'Failed to extract call arguments from call line';
+									vscode.window.showErrorMessage(`Cannot execute from call site: ${errorMsg}. The calling function could not be determined. Please use "Provide Arguments" to manually enter function arguments.`);
+								}
+							} else {
+								vscode.window.showErrorMessage('Cannot execute from call site: The calling function could not be determined and the call line is not available. Please use "Provide Arguments" to manually enter function arguments.');
+							}
 						}
+					} else {
+						vscode.window.showErrorMessage('Invalid call site: line number is missing.');
 					}
 				} catch (error) {
 					console.error('[extension] Error executing from call site:', error);
