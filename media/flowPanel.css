@@ -752,3 +752,43 @@ h2 {
 .form-btn-secondary:hover:not(:disabled) {
   background: var(--vscode-list-hoverBackground);
 }
+
+/* Loading overlay for parent/child tracing */
+.loading-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+  backdrop-filter: blur(2px);
+  animation: fadeIn 0.2s ease-out;
+}
+
+.loading-spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid var(--vscode-input-border);
+  border-top-color: var(--vscode-textLink-foreground);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin-bottom: 16px;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.loading-message {
+  color: var(--vscode-foreground);
+  font-size: 0.95rem;
+  font-weight: 500;
+  text-align: center;
+}

@@ -23,6 +23,20 @@ let activeTracer: TracerManager | undefined;
 let tracerOutputChannel: vscode.OutputChannel | undefined;
 const storedCallArgs: Map<string, NormalisedCallArgs> = new Map();
 
+// Cache for parent execution contexts to avoid redundant tracing
+interface ExecutionContext {
+	locals: Record<string, unknown>;
+	globals: Record<string, unknown>;
+	file: string;
+}
+const parentExecutionContextCache = new Map<string, ExecutionContext>();
+
+function getCacheKey(parentId: string, callLine: number, args: NormalisedCallArgs): string {
+	// Create a cache key from function ID, call line, and args
+	const argsKey = JSON.stringify(args);
+	return `${parentId}:${callLine}:${argsKey}`;
+}
+
 interface TracerEvent {
 	event: string;
 	filename?: string;
@@ -1306,8 +1320,14 @@ async function handleTraceLine(
 			async function traceParentFunction(
 				parentId: string,
 				callLine: number,
-				parentStoredArgs: NormalisedCallArgs | undefined
+				parentStoredArgs: NormalisedCallArgs | undefined,
+				visited: Set<string> = new Set() // To detect circular dependencies
 			): Promise<{ locals: Record<string, unknown>, globals: Record<string, unknown>, file: string }> {
+				if (visited.has(parentId)) {
+					throw new Error(`Circular dependency detected: ${parentId}`);
+				}
+				visited.add(parentId);
+
 				const parentBody = resolveFunctionBody(parentId);
 				if (!parentBody) {
 					throw new Error(`Parent function ${parentId} not found`);
@@ -1342,7 +1362,8 @@ async function handleTraceLine(
 									const grandParentEvent = await traceParentFunction(
 										grandParentId,
 										callSite.line,
-										grandParentStoredArgs
+										grandParentStoredArgs,
+										visited
 									);
 									
 									console.log('[extension] Extracting parent args from grandparent execution at line', callSite.line);
@@ -1380,9 +1401,17 @@ async function handleTraceLine(
 				}
 				
 				// Use stored args if available, otherwise empty args (valid for no-param functions)
-				const parentArgsJson = parentStoredArgs 
-					? JSON.stringify(parentStoredArgs)
-					: JSON.stringify(cloneCallArgs(DEFAULT_PARENT_CALL_ARGS));
+				const finalParentArgs = parentStoredArgs || cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+				
+				// Check cache first to avoid redundant tracing
+				const cacheKey = getCacheKey(parentId, callLine, finalParentArgs);
+				const cached = parentExecutionContextCache.get(cacheKey);
+				if (cached) {
+					console.log('[extension] Using cached execution context for parent:', parentId);
+					return cached;
+				}
+
+				const parentArgsJson = JSON.stringify(finalParentArgs);
 
 				// Create or get tracer
 				if (!tracerOutputChannel) {
@@ -1411,11 +1440,17 @@ async function handleTraceLine(
 					throw new Error(`Error tracing parent function ${parentId}: ${parentEvent.error || 'Unknown error'}`);
 				}
 
-				return {
+				const result = {
 					locals: parentEvent.locals || {},
 					globals: parentEvent.globals || {},
 					file: parentBody.file,
 				};
+
+				// Cache the result
+				parentExecutionContextCache.set(cacheKey, result);
+				console.log('[extension] Cached execution context for parent:', parentId);
+
+				return result;
 			}
 
 			try {

@@ -22,6 +22,8 @@
     selectedCallSite: new Map(), // functionId -> selected call site
     argsFormVisible: false, // Whether the arguments form modal is visible
     argsFormData: null, // { functionId, params: [] }
+    tracingParent: new Set(), // Set of parent functionIds currently being traced
+    tracingChild: new Set(), // Set of child functionIds currently being traced
   };
   
   // Helper function to format values for display
@@ -321,6 +323,22 @@
           firstInput.focus();
         }
       }, 100);
+    } else if (message.type === 'tracing-parent' && typeof message.parentId === 'string') {
+      // Update loading state for parent tracing
+      if (message.show) {
+        state.tracingParent.add(message.parentId);
+      } else {
+        state.tracingParent.delete(message.parentId);
+      }
+      render();
+    } else if (message.type === 'tracing-child' && typeof message.childId === 'string') {
+      // Update loading state for child tracing
+      if (message.show) {
+        state.tracingChild.add(message.childId);
+      } else {
+        state.tracingChild.delete(message.childId);
+      }
+      render();
     }
   });
 
@@ -592,7 +610,31 @@
       content = parents.map((parentId) => renderParentBlock(parentId)).join('');
     }
     content += renderArgsFormModal();
+    content += renderLoadingOverlay();
     root.innerHTML = content;
+  }
+
+  function renderLoadingOverlay() {
+    const isTracingParent = state.tracingParent.size > 0;
+    const isTracingChild = state.tracingChild.size > 0;
+    
+    if (!isTracingParent && !isTracingChild) {
+      return '';
+    }
+
+    let message = '';
+    if (isTracingParent && isTracingChild) {
+      message = 'Preparing execution context...';
+    } else if (isTracingParent) {
+      message = 'Tracing parent function...';
+    } else if (isTracingChild) {
+      message = 'Preparing to execute...';
+    }
+
+    return '<div class="loading-overlay">' +
+      '<div class="loading-spinner"></div>' +
+      '<div class="loading-message">' + escapeHtml(message) + '</div>' +
+      '</div>';
   }
 
   function renderArgsFormModal() {
