@@ -153,6 +153,11 @@ class TracerManager {
 	private currentDisplayLine: number | undefined;
 	private currentDisplayFile: string | undefined;
 	private suppressWebviewEvents: boolean = false; // Suppress webview events for parent tracing
+	private lastEvent: TracerEvent | undefined;
+	private maxStopLineReached: number | undefined;
+	private lastContextKey: string | undefined;
+	private pendingStopLine: number | undefined;
+	private pendingContextKey: string | undefined;
 
 	constructor(outputChannel: vscode.OutputChannel, webview?: vscode.Webview) {
 		this.outputChannel = outputChannel;
@@ -203,8 +208,25 @@ class TracerManager {
 		this.pendingDisplayFile = undefined;
 	}
 
+	private buildContextKey(repoRoot: string, entryFullId: string, argsJson: string): string {
+		return `${repoRoot}::${entryFullId}::${argsJson}`;
+	}
+
 	private processIncomingEvent(rawEvent: TracerEvent): void {
 		const decorated = this.decorateEvent(rawEvent);
+
+		if (this.pendingContextKey) {
+			this.lastContextKey = this.pendingContextKey;
+		}
+
+		if (typeof this.pendingStopLine === 'number') {
+			const pendingStopLine = this.pendingStopLine;
+			this.maxStopLineReached = typeof this.maxStopLineReached === 'number'
+				? Math.max(this.maxStopLineReached, pendingStopLine)
+				: pendingStopLine;
+		}
+
+		this.lastEvent = decorated;
 		
 		// Log for debugging first click issues
 		if (decorated.event === 'line') {
@@ -223,6 +245,9 @@ class TracerManager {
 			// Only emit to webview if there's no pending resolver (queued events)
 			this.emitTracerEvent(decorated);
 		}
+
+		this.pendingStopLine = undefined;
+		this.pendingContextKey = undefined;
 	}
 
 	private spawnTracer(
@@ -258,6 +283,11 @@ class TracerManager {
 
 		this.stderrBuffer = '';
 		this.eventQueue = [];
+		this.lastEvent = undefined;
+		this.maxStopLineReached = undefined;
+		this.lastContextKey = undefined;
+		this.pendingStopLine = undefined;
+		this.pendingContextKey = undefined;
 
 		// Handle stderr data - accumulate and parse JSON lines
 		this.process.stderr?.on('data', (data: Buffer) => {
@@ -375,6 +405,30 @@ class TracerManager {
 		this.currentDisplayLine = displayLine;
 		this.currentDisplayFile = displayFile;
 
+		const contextKey = this.buildContextKey(repoRoot, entryFullId, argsJson);
+		if (
+			this.lastEvent &&
+			this.lastContextKey === contextKey &&
+			typeof this.maxStopLineReached === 'number' &&
+			targetStopLine <= this.maxStopLineReached
+		) {
+			this.outputChannel.appendLine(
+				`[Rust-like] Reusing cached tracer result (requested stop_line=${targetStopLine}, max=${this.maxStopLineReached})`
+			);
+			const cachedEvent: TracerEvent = {
+				...this.lastEvent,
+				line: displayLine,
+			};
+			if (displayFile) {
+				cachedEvent.filename = displayFile;
+			} else if (this.lastEvent.filename) {
+				cachedEvent.filename = this.lastEvent.filename;
+			}
+			this.lastEvent = cachedEvent;
+			this.clearPendingDisplay();
+			return cachedEvent;
+		}
+
 		// Spawn tracer if not alive
 		if (firstTime) {
 			this.outputChannel.appendLine(`[Rust-like] First time - spawning tracer`);
@@ -411,6 +465,8 @@ class TracerManager {
 
 		// Determine if this is the first call for this tracer
 		const isFirstCall = firstTime || needsNewTracer;
+		this.pendingStopLine = targetStopLine;
+		this.pendingContextKey = contextKey;
 
 		// Send continue command if not first call
 		if (!isFirstCall && this.process && this.process.stdin && !this.process.stdin.destroyed) {
