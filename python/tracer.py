@@ -212,18 +212,104 @@ def get_function_signature(repo_root: str, entry_full_id: str):
         
         # Extract parameters from the AST function node
         params = []
+        param_types = []
+        param_defaults = []
         is_method = len(fn_path) == 2  # Class method if path has 2 parts (ClassName::method_name)
-        for arg in target_func.args.args:
+        
+        def unparse_annotation(annotation):
+            """Convert AST annotation node to string representation."""
+            if annotation is None:
+                return None
+            try:
+                # Try using ast.unparse if available (Python 3.9+)
+                if hasattr(ast, 'unparse'):
+                    return ast.unparse(annotation)
+                else:
+                    # Fallback: manual unparsing for common cases
+                    if isinstance(annotation, ast.Name):
+                        return annotation.id
+                    elif isinstance(annotation, ast.Attribute):
+                        # Handle qualified names like typing.Dict, db.Connection
+                        parts = []
+                        node = annotation
+                        while isinstance(node, ast.Attribute):
+                            parts.insert(0, node.attr)
+                            node = node.value
+                        if isinstance(node, ast.Name):
+                            parts.insert(0, node.id)
+                        return '.'.join(parts)
+                    elif isinstance(annotation, ast.Constant):
+                        return str(annotation.value)
+                    elif isinstance(annotation, ast.Subscript):
+                        # Handle generic types like List[str], Dict[str, int]
+                        if isinstance(annotation.value, ast.Name):
+                            base = annotation.value.id
+                        elif isinstance(annotation.value, ast.Attribute):
+                            base = unparse_annotation(annotation.value)
+                        else:
+                            base = 'Unknown'
+                        return base
+                    else:
+                        # Fallback to string representation
+                        return str(annotation)
+            except Exception as e:
+                log(f"Error unparsing annotation: {e}", "WARNING")
+                return None
+        
+        def unparse_default(default):
+            """Convert AST default value node to Python literal."""
+            if default is None:
+                return None
+            try:
+                if hasattr(ast, 'unparse'):
+                    return ast.unparse(default)
+                elif isinstance(default, ast.Constant):
+                    return default.value
+                elif isinstance(default, (ast.Str, ast.Num)):
+                    # Python < 3.8 compatibility
+                    if isinstance(default, ast.Str):
+                        return default.s
+                    elif isinstance(default, ast.Num):
+                        return default.n
+                elif isinstance(default, ast.NameConstant):
+                    # Python < 3.8: True, False, None
+                    return default.value
+                elif isinstance(default, (ast.List, ast.Dict, ast.Tuple)):
+                    # Complex literals - try to evaluate safely
+                    return None  # Don't try to unparse complex defaults
+                else:
+                    return None
+            except Exception as e:
+                log(f"Error unparsing default: {e}", "WARNING")
+                return None
+        
+        for i, arg in enumerate(target_func.args.args):
             # Skip 'self' and 'cls' parameters only for class methods
             if is_method and arg.arg in ('self', 'cls'):
                 continue
+            
             params.append(arg.arg)
+            
+            # Extract type annotation
+            type_str = unparse_annotation(arg.annotation)
+            param_types.append(type_str)
+            
+            # Extract default value
+            default_index = i - (len(target_func.args.args) - len(target_func.args.defaults))
+            if default_index >= 0 and default_index < len(target_func.args.defaults):
+                default_node = target_func.args.defaults[default_index]
+                default_value = unparse_default(default_node)
+                param_defaults.append(default_value)
+            else:
+                param_defaults.append(None)
         
-        log(f"Function signature (via AST): params={params}, param_count={len(params)}")
+        log(f"Function signature (via AST): params={params}, param_types={param_types}, param_count={len(params)}")
         
         return {
             "params": params,
-            "param_count": len(params)
+            "param_count": len(params),
+            "param_types": param_types,
+            "param_defaults": param_defaults
         }
     except Exception as e:
         log_exception(e, "get_function_signature")
@@ -296,16 +382,46 @@ def extract_call_arguments(repo_root: str, entry_full_id: str, call_line: int, l
         eval_globals = dict(globals_dict)
         eval_locals = dict(locals_dict)
         
+        # Get the function signature first to know which parameters are required
+        sig_result = get_function_signature(repo_root, entry_full_id)
+        accepted_params = []
+        param_defaults = []
+        if "error" not in sig_result:
+            accepted_params = sig_result.get("params", [])
+            param_defaults = sig_result.get("param_defaults", [])
+            log(f"Function accepts parameters: {accepted_params}")
+        
+        # Track which parameters have defaults (are optional)
+        params_with_defaults = set()
+        if accepted_params and param_defaults:
+            for i, default_val in enumerate(param_defaults):
+                if i < len(accepted_params) and default_val is not None:
+                    params_with_defaults.add(accepted_params[i])
+        
+        # Track missing required arguments
+        missing_required = []
+        
         # Evaluate positional arguments
+        positional_arg_index = 0
         for arg in call_node.args:
             try:
                 # Convert AST node to code and evaluate
                 code = compile(ast.Expression(arg), '<string>', 'eval')
                 value = eval(code, eval_globals, eval_locals)
+                # Always add the value, even if None - let the function validate it
+                # (We used to skip None values, but that causes required params to be missing)
                 args_list.append(safe_json(value))
+                positional_arg_index += 1
             except Exception as e:
-                log(f"Error evaluating positional argument: {e}", "WARNING")
-                args_list.append(None)
+                log(f"Error evaluating positional argument at index {positional_arg_index}: {e}", "WARNING")
+                # Check if this is a required parameter
+                if accepted_params and positional_arg_index < len(accepted_params):
+                    param_name = accepted_params[positional_arg_index]
+                    if param_name not in params_with_defaults:
+                        missing_required.append(param_name)
+                        log(f"Required parameter {param_name} failed to evaluate: {e}", "ERROR")
+                # Don't add anything to args_list for this argument - it will be missing
+                positional_arg_index += 1
         
         # Evaluate keyword arguments
         for kw in call_node.keywords:
@@ -314,47 +430,63 @@ def extract_call_arguments(repo_root: str, entry_full_id: str, call_line: int, l
                 try:
                     code = compile(ast.Expression(kw.value), '<string>', 'eval')
                     value = eval(code, eval_globals, eval_locals)
+                    # Always add the value, even if None - let the function validate it
                     kwargs_dict[key] = safe_json(value)
                 except Exception as e:
                     log(f"Error evaluating keyword argument {key}: {e}", "WARNING")
-                    kwargs_dict[key] = None
+                    # Check if this is a required parameter
+                    if key in accepted_params and key not in params_with_defaults:
+                        missing_required.append(key)
+                        log(f"Required parameter {key} failed to evaluate: {e}", "ERROR")
+                    # Don't add anything to kwargs_dict for this argument - it will be missing
         
-        # Get the function signature to filter arguments to only those the function accepts
-        # We MUST get the signature to filter arguments correctly - otherwise we might pass
-        # arguments that the function doesn't accept
-        sig_result = get_function_signature(repo_root, entry_full_id)
-        if "error" not in sig_result:
-            accepted_params = set(sig_result.get("params", []))
-            log(f"Function accepts parameters: {accepted_params}")
+        # Check if we're missing any required parameters
+        if missing_required:
+            log(f"WARNING: Missing required parameters after evaluation: {missing_required}", "WARNING")
+            # Note: We continue anyway - the function call will fail with a better error message
+        
+        # Filter arguments to only those the function accepts
+        if accepted_params:
+            accepted_params_set = set(accepted_params)
             
             # Filter keyword arguments to only include those the function accepts
-            # This is the main fix: don't pass kwargs that the function doesn't accept
             original_kwargs_keys = set(kwargs_dict.keys())
-            filtered_kwargs = {k: v for k, v in kwargs_dict.items() if k in accepted_params}
+            filtered_kwargs = {k: v for k, v in kwargs_dict.items() if k in accepted_params_set}
             filtered_out_kwargs = original_kwargs_keys - set(filtered_kwargs.keys())
             if filtered_out_kwargs:
                 log(f"Filtered out keyword arguments not accepted by function: {filtered_out_kwargs}")
             
-            # Also check if any positional arguments should be converted to keyword arguments
-            # if they match parameter names (though this is less common)
-            
             # For positional arguments, limit to the number of parameters the function has
-            # We want to be careful here: if there are more positional args than parameters,
-            # and some parameters are already provided as keywords, we need to account for that
-            num_total_params = len(accepted_params)
             # Count how many positional params are NOT already in kwargs
-            positional_params_not_in_kwargs = [p for p in sig_result.get("params", []) if p not in filtered_kwargs]
+            positional_params_not_in_kwargs = [p for p in accepted_params if p not in filtered_kwargs]
             max_positional = len(positional_params_not_in_kwargs)
             
             # Limit positional arguments to what the function can accept
             if len(args_list) > max_positional:
-                log(f"Limiting positional arguments from {len(args_list)} to {max_positional} (function has {num_total_params} params, {len(filtered_kwargs)} provided as kwargs)")
+                log(f"Limiting positional arguments from {len(args_list)} to {max_positional} (function has {len(accepted_params)} params, {len(filtered_kwargs)} provided as kwargs)")
                 filtered_args = args_list[:max_positional]
             else:
                 filtered_args = args_list
             
             args_list = filtered_args
             kwargs_dict = filtered_kwargs
+            
+            # Check again for missing required parameters after filtering
+            provided_params = set(filtered_kwargs.keys())
+            provided_positional_count = len(filtered_args)
+            for i, param_name in enumerate(accepted_params):
+                if param_name not in params_with_defaults:  # Required parameter
+                    if param_name not in provided_params and i >= provided_positional_count:
+                        if param_name not in missing_required:  # Avoid duplicates
+                            missing_required.append(param_name)
+            
+            if missing_required:
+                missing_params_str = ', '.join(missing_required)
+                error_msg = f"Required parameters could not be extracted and will be missing: {missing_params_str}"
+                log(error_msg, "ERROR")
+                # Return an error so the caller knows arguments are incomplete
+                return {"error": error_msg}
+            
             log(f"Filtered arguments to match function signature: args={args_list}, kwargs={kwargs_dict}")
         else:
             # If we can't get the signature, we can't safely filter arguments

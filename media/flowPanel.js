@@ -21,6 +21,8 @@
     loadingCallSites: new Set(), // Set of functionIds for which we're loading call sites
     selectedCallSite: new Map(), // functionId -> selected call site
     functionSignatures: new Map(), // functionId -> Array of parameter names
+    functionParamTypes: new Map(), // functionId -> Array of parameter types
+    functionParamDefaults: new Map(), // functionId -> Array of parameter default values
     loadingSignatures: new Set(), // Set of functionIds for which we're loading signatures
     lastClickedLine: new Map(), // functionId -> { line, stopLine } - track last clicked line for execution
     expandedCallSites: new Set(), // Set of parentIds with expanded call sites
@@ -121,12 +123,45 @@
   }
 
   function cloneArgs(args) {
-    return {
-      args: Array.isArray(args && args.args) ? [].concat(args.args) : [],
-      kwargs: args && args.kwargs && typeof args.kwargs === 'object' && args.kwargs !== null
-        ? Object.assign({}, args.kwargs)
-        : {},
+    const cloned = {
+      args: [],
+      kwargs: {}
     };
+    
+    // Deep clone args array, preserving Python expressions
+    if (Array.isArray(args && args.args)) {
+      cloned.args = args.args.map(function(arg) {
+        if (typeof arg === 'object' && arg !== null && arg.__python_expr__) {
+          // Preserve Python expression format
+          return { __python_expr__: true, __value__: arg.__value__ };
+        }
+        try {
+          return JSON.parse(JSON.stringify(arg));
+        } catch {
+          return arg;
+        }
+      });
+    }
+    
+    // Deep clone kwargs object, preserving Python expressions
+    if (args && args.kwargs && typeof args.kwargs === 'object' && args.kwargs !== null) {
+      for (const key in args.kwargs) {
+        if (args.kwargs.hasOwnProperty(key)) {
+          const val = args.kwargs[key];
+          if (typeof val === 'object' && val !== null && val.__python_expr__) {
+            cloned.kwargs[key] = { __python_expr__: true, __value__: val.__value__ };
+          } else {
+            try {
+              cloned.kwargs[key] = JSON.parse(JSON.stringify(val));
+            } catch {
+              cloned.kwargs[key] = val;
+            }
+          }
+        }
+      }
+    }
+    
+    return cloned;
   }
 
   function normalisePath(value) {
@@ -180,15 +215,75 @@
     return stored ? cloneArgs(stored) : null;
   }
 
-  function setCallArgsForFunction(functionId, args) {
+  function setCallArgsForFunction(functionId, args, options) {
     if (!functionId || !args) {
       return;
     }
-    state.callArgsByFunction.set(functionId, cloneArgs(args));
+    const settings = options || {};
+    const shouldSync = settings.sync !== false;
+    const cloned = cloneArgs(args);
+    state.callArgsByFunction.set(functionId, cloned);
+    if (shouldSync && typeof vscode !== 'undefined') {
+      vscode.postMessage({
+        type: 'store-call-args',
+        functionId,
+        args: cloned,
+      });
+    }
   }
 
   function makePendingKey(functionId, line) {
     return functionId + '::' + line;
+  }
+
+  function hasValues(record) {
+    if (!record) {
+      return false;
+    }
+    const locals = record.locals && typeof record.locals === 'object' ? record.locals : null;
+    const globals = record.globals && typeof record.globals === 'object' ? record.globals : null;
+    const hasLocals = locals ? Object.keys(locals).length > 0 : false;
+    const hasGlobals = globals ? Object.keys(globals).length > 0 : false;
+    return hasLocals || hasGlobals;
+  }
+
+  function mergeTraceEvents(existing, incoming) {
+    if (!existing) {
+      return incoming;
+    }
+
+    const merged = Object.assign({}, existing, incoming);
+
+    if (!incoming || !incoming.locals || Object.keys(incoming.locals || {}).length === 0) {
+      if (existing.locals) {
+        merged.locals = existing.locals;
+      }
+    }
+
+    if (!incoming || !incoming.globals || Object.keys(incoming.globals || {}).length === 0) {
+      if (existing.globals) {
+        merged.globals = existing.globals;
+      }
+    }
+
+    if ((!incoming || !incoming.filename) && existing.filename) {
+      merged.filename = existing.filename;
+    }
+
+    if ((!incoming || !incoming.function) && existing.function) {
+      merged.function = existing.function;
+    }
+
+    if ((!incoming || !incoming.event) && existing.event) {
+      merged.event = existing.event;
+    }
+
+    if (!hasValues(incoming) && hasValues(existing)) {
+      merged.locals = existing.locals;
+      merged.globals = existing.globals;
+    }
+
+    return merged;
   }
 
   const flowMap = buildFlowMap(flows);
@@ -199,7 +294,7 @@
 
   parents.forEach(function(parentId) {
     if (!state.callArgsByFunction.has(parentId)) {
-      state.callArgsByFunction.set(parentId, cloneArgs(DEFAULT_PARENT_ARGS));
+      setCallArgsForFunction(parentId, DEFAULT_PARENT_ARGS, { sync: false });
     }
   });
 
@@ -225,7 +320,7 @@
     } else if (message.type === 'call-site-args-extracted' && typeof message.functionId === 'string' && message.args) {
       // Arguments extracted from call site - store them and update UI
       console.log('[flowPanel] Received extracted args for', message.functionId, ':', message.args);
-      state.callArgsByFunction.set(message.functionId, cloneArgs(message.args));
+      setCallArgsForFunction(message.functionId, message.args);
       render();
     } else if (message.type === 'call-site-args-error' && typeof message.functionId === 'string') {
       console.error('[flowPanel] Error extracting args from call site:', message.error);
@@ -236,49 +331,38 @@
         // Add or update event in the array
         const eventData = message.event;
         
-        // Remove only events for the EXACT same line and file to prevent duplicates
-        // Keep events for other lines so previously clicked lines remain visible
-        if (state.tracerEvents && eventData.filename && eventData.line !== undefined) {
-          const eventFile = eventData.filename.replace(/\\/g, '/');
-          const eventLine = eventData.line;
-          console.log('[flowPanel] Received event - line:', eventLine, 'file:', eventFile);
-          state.tracerEvents = state.tracerEvents.filter(function(e) {
-            if (!e.filename || e.line === undefined) return true; // Keep events without filename or line
-            const eFile = e.filename.replace(/\\/g, '/');
-            // Only remove events for the same file AND EXACT same line
-            // This allows multiple lines to have events simultaneously
-            if (eFile === eventFile || eventFile.endsWith(eFile) || eFile.endsWith(eventFile)) {
-              // Remove only if it's the EXACT same line (not adjacent)
-              if (e.line === eventLine) {
-                console.log('[flowPanel] Removing event at line:', e.line, 'for file:', eFile, '(exact match with', eventLine, ')');
-                return false;
-              }
+        const eventLine = typeof eventData.line === 'number' ? eventData.line : undefined;
+        const eventFile = eventData.filename ? normalisePath(eventData.filename) : '';
+        let mergedIntoExisting = false;
+
+        if (eventLine !== undefined) {
+          for (let i = 0; i < state.tracerEvents.length; i += 1) {
+            const existing = state.tracerEvents[i];
+            const existingLine = typeof existing.line === 'number' ? existing.line : undefined;
+            if (existingLine !== eventLine) {
+              continue;
             }
-            return true; // Keep events for other lines or other files
-          });
+
+            const existingFile = existing.filename ? normalisePath(existing.filename) : '';
+            const filesMatch = (!eventFile || !existingFile)
+              ? true
+              : (existingFile === eventFile || existingFile.endsWith(eventFile) || eventFile.endsWith(existingFile));
+
+            if (!filesMatch) {
+              continue;
+            }
+
+            const merged = mergeTraceEvents(existing, eventData);
+            state.tracerEvents[i] = merged;
+            mergedIntoExisting = true;
+            console.log('[flowPanel] Merged tracer event into existing line:', eventLine, 'file:', eventFile || '<unknown>');
+            break;
+          }
         }
-        
-        // Check if event already exists for this exact line and file
-        const eventKey = `${eventData.line}:${eventData.filename || ''}`;
-        const duplicateExists = state.tracerEvents.some(function(e) {
-          const eKey = `${e.line}:${e.filename || ''}`;
-          return eKey === eventKey;
-        });
-        
-        if (!duplicateExists) {
-          // Add the new event
+
+        if (!mergedIntoExisting) {
           console.log('[flowPanel] Adding event at line:', eventData.line, 'for file:', eventData.filename);
           state.tracerEvents.push(eventData);
-        } else {
-          // Update existing event instead of adding duplicate
-          const existingIndex = state.tracerEvents.findIndex(function(e) {
-            const eKey = `${e.line}:${e.filename || ''}`;
-            return eKey === eventKey;
-          });
-          if (existingIndex >= 0) {
-            state.tracerEvents[existingIndex] = eventData;
-            console.log('[flowPanel] Updated existing event at line:', eventData.line);
-          }
         }
 
         const functionIdForEvent = findFunctionIdForEvent(eventData);
@@ -322,11 +406,23 @@
       // Store function signature
       state.loadingSignatures.delete(message.functionId);
       state.functionSignatures.set(message.functionId, message.params);
+      if (Array.isArray(message.paramTypes)) {
+        state.functionParamTypes.set(message.functionId, message.paramTypes);
+      }
+      if (Array.isArray(message.paramDefaults)) {
+        state.functionParamDefaults.set(message.functionId, message.paramDefaults);
+      }
       render();
     } else if (message.type === 'show-args-form' && typeof message.functionId === 'string') {
       // Store function signature (we use inline args section instead of modal)
       if (Array.isArray(message.params)) {
         state.functionSignatures.set(message.functionId, message.params);
+        if (Array.isArray(message.paramTypes)) {
+          state.functionParamTypes.set(message.functionId, message.paramTypes);
+        }
+        if (Array.isArray(message.paramDefaults)) {
+          state.functionParamDefaults.set(message.functionId, message.paramDefaults);
+        }
         render();
       }
       
@@ -434,38 +530,59 @@
           const args = [];
           const kwargs = {};
           
+          // Helper function to parse argument value (supports JSON and Python expressions)
+          function parseArgumentValue(value) {
+            const trimmed = value.trim();
+            if (!trimmed) {
+              return null;
+            }
+            
+            // Try JSON first (for simple values)
+            try {
+              const parsed = JSON.parse(trimmed);
+              // Check if it's a simple JSON value (not a string that looks like code)
+              if (typeof parsed === 'string' && (trimmed.startsWith('get_') || trimmed.includes('()') || trimmed.includes('(') && trimmed.includes(')'))) {
+                // Looks like a function call - treat as Python expression
+                return {
+                  __python_expr__: true,
+                  __value__: trimmed
+                };
+              }
+              return parsed;
+            } catch {
+              // Not valid JSON - check if it looks like Python code
+              // If it contains function calls, class instantiation, etc., treat as Python expression
+              if (trimmed.includes('(') || trimmed.includes('[') || trimmed.includes('.') || 
+                  trimmed.match(/^[A-Z][a-zA-Z0-9_]*\(/) || trimmed.startsWith('get_') || trimmed.startsWith('create_')) {
+                return {
+                  __python_expr__: true,
+                  __value__: trimmed
+                };
+              }
+              // Otherwise treat as plain string (fallback)
+              return trimmed;
+            }
+          }
+          
           // Collect all args and kwargs from inputs
           // Use arrays to maintain order for positional args
           const argsByIndex = [];
           argInputs.forEach(function(input) {
             const argType = input.getAttribute('data-arg-type');
             const value = input.value.trim();
+            const parsed = parseArgumentValue(value);
+            
+            if (parsed === null) {
+              // Empty value - skip this argument
+              return;
+            }
             
             if (argType === 'args') {
               const index = parseInt(input.getAttribute('data-arg-index'), 10);
-              if (value) {
-                try {
-                  // Try to parse as JSON first
-                  argsByIndex[index] = JSON.parse(value);
-                } catch {
-                  // If JSON parsing fails, treat as plain string
-                  argsByIndex[index] = value;
-                }
-              } else {
-                // Empty value - skip this argument (don't include it)
-              }
+              argsByIndex[index] = parsed;
             } else if (argType === 'kwargs') {
               const key = input.getAttribute('data-arg-key');
-              if (value) {
-                try {
-                  // Try to parse as JSON first
-                  kwargs[key] = JSON.parse(value);
-                } catch {
-                  // If JSON parsing fails, treat as plain string
-                  kwargs[key] = value;
-                }
-              }
-              // If empty, just don't include this kwarg (which removes it)
+              kwargs[key] = parsed;
             }
           });
           
@@ -477,12 +594,8 @@
           }
           
           // Store the updated arguments (create new object to ensure reference is updated)
-          // Use Object.assign or spread to ensure we create a completely new object
-          const newArgs = { 
-            args: JSON.parse(JSON.stringify(args)), // Deep clone to ensure new reference
-            kwargs: JSON.parse(JSON.stringify(kwargs)) 
-          };
-          state.callArgsByFunction.set(parentId, newArgs);
+          const newArgs = cloneArgs({ args: args, kwargs: kwargs });
+          setCallArgsForFunction(parentId, newArgs);
           console.log('[flowPanel] Saved arguments for', parentId, ':', newArgs);
           // Force a verification read to ensure it's stored
           const verifyStored = state.callArgsByFunction.get(parentId);
@@ -534,6 +647,34 @@
           });
         }
         render();
+      }
+    } else if (action === 'insert-template') {
+      const template = target.getAttribute('data-template');
+      const argType = target.getAttribute('data-arg-type');
+      const inputIndex = target.getAttribute('data-input-index');
+      const argKey = target.getAttribute('data-arg-key');
+      
+      if (template) {
+        // Find the corresponding input
+        let input = null;
+        if (argType === 'args' && inputIndex !== null) {
+          input = root.querySelector('.arg-input[data-arg-type="args"][data-arg-index="' + escapeCss(inputIndex) + '"]');
+        } else if (argType === 'kwargs' && argKey) {
+          input = root.querySelector('.arg-input[data-arg-type="kwargs"][data-arg-key="' + escapeCss(argKey) + '"]');
+        }
+        
+        if (input) {
+          input.value = template;
+          input.focus();
+          // Trigger input event to update any listeners
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      }
+    } else if (action === 'show-help') {
+      const helpText = target.getAttribute('data-help');
+      if (helpText) {
+        // Show help in a simple alert for now (could be enhanced with a tooltip)
+        alert(helpText);
       }
     } else if (action === 'open-source') {
       const identifier = target.getAttribute('data-target');
@@ -713,9 +854,91 @@
   }
 
 
+  // Helper function to get type-aware placeholder and template based on parameter name and type
+  function getTypeHelper(paramName, paramType) {
+    const nameLower = paramName.toLowerCase();
+    
+    // Common patterns based on parameter name
+    if (nameLower.includes('db') || nameLower.includes('connection') || nameLower.includes('conn')) {
+      return {
+        placeholder: 'Python: get_db() or create_connection()',
+        template: 'get_db()',
+        helpText: 'Database connections are typically singletons. Use the function that provides the connection.'
+      };
+    }
+    
+    if (nameLower.includes('session')) {
+      return {
+        placeholder: 'Python: get_session() or Session()',
+        template: 'get_session()',
+        helpText: 'Session objects usually come from a factory or singleton.'
+      };
+    }
+    
+    if (nameLower.includes('cache') || nameLower.includes('redis')) {
+      return {
+        placeholder: 'Python: get_cache() or Cache()',
+        template: 'get_cache()',
+        helpText: 'Cache instances are typically shared singletons.'
+      };
+    }
+    
+    if (nameLower.includes('config') || nameLower.includes('settings')) {
+      return {
+        placeholder: 'Python: get_config() or Settings()',
+        template: 'get_config()',
+        helpText: 'Configuration is usually loaded from environment or config files.'
+      };
+    }
+    
+    if (nameLower.includes('client') || nameLower.includes('api')) {
+      return {
+        placeholder: 'Python: get_client() or Client()',
+        template: 'get_client()',
+        helpText: 'API clients are often singletons or factory-created instances.'
+      };
+    }
+    
+    // Type-based patterns
+    if (paramType) {
+      const typeLower = paramType.toLowerCase();
+      if (typeLower.includes('dict') || typeLower.includes('mapping') || typeLower.includes('dict[')) {
+        return {
+          placeholder: 'JSON: {"key": "value"} or Python: dict(...)',
+          template: '{}',
+          helpText: 'Enter as JSON object or Python dict expression.'
+        };
+      }
+      if (typeLower.includes('list') || typeLower.includes('array') || typeLower.includes('sequence') || typeLower.includes('list[')) {
+        return {
+          placeholder: 'JSON: [1, 2, 3] or Python: list(...)',
+          template: '[]',
+          helpText: 'Enter as JSON array or Python list expression.'
+        };
+      }
+      if (typeLower.includes('class') || typeLower.includes('type') || !typeLower.match(/^(str|int|float|bool|none|dict|list|tuple|set|optional|union)/)) {
+        return {
+          placeholder: 'Python expression: ClassName() or get_instance()',
+          template: '',
+          helpText: 'Complex objects require Python expressions that evaluate to the expected type.'
+        };
+      }
+    }
+    
+    // Default
+    return {
+      placeholder: 'JSON value or Python expression',
+      template: '',
+      helpText: 'Enter a JSON value (strings, numbers, booleans, arrays, objects) or a Python expression.'
+    };
+  }
+
   function renderParentArgsSection(parentId) {
     // Get function signature to map parameter names
     const params = state.functionSignatures.get(parentId);
+    const paramTypes = state.functionParamTypes.get(parentId);
+    const paramDefaults = state.functionParamDefaults.get(parentId);
+    
     if (!params && !state.loadingSignatures.has(parentId)) {
       // Request function signature
       state.loadingSignatures.add(parentId);
@@ -773,11 +996,46 @@
           const argValue = storedArgs && storedArgs.args && storedArgs.args[displayIdx] !== undefined 
             ? storedArgs.args[displayIdx] 
             : '';
-          // Format value for display - use JSON.stringify for all values
-          const valueStr = argValue !== '' ? JSON.stringify(argValue) : '';
+          
+          // Get type info and helper
+          const paramType = paramTypes && paramTypes[actualIndex] ? paramTypes[actualIndex] : null;
+          const paramDefault = paramDefaults && paramDefaults[actualIndex] !== undefined ? paramDefaults[actualIndex] : null;
+          const typeHelper = getTypeHelper(paramName, paramType);
+          
+          // Format value for display
+          let valueStr = '';
+          if (argValue !== '') {
+            // Check if it's a Python expression (stored as object with __python_expr__)
+            if (typeof argValue === 'object' && argValue !== null && argValue.__python_expr__) {
+              valueStr = argValue.__value__ || '';
+            } else {
+              valueStr = JSON.stringify(argValue);
+            }
+          } else if (paramDefault !== null && paramDefault !== undefined) {
+            // Show default value as placeholder hint
+            valueStr = '';
+          }
+          
           html += '<div class="arg-item">';
-          html += '<label class="arg-label">' + escapeHtml(paramName) + ':</label>';
-          html += '<input type="text" class="arg-input" data-arg-type="args" data-arg-index="' + displayIdx + '" value="' + escapeAttribute(valueStr) + '" placeholder="Enter value (JSON format)" />';
+          html += '<div class="arg-header">';
+          html += '<label class="arg-label">' + escapeHtml(paramName);
+          if (paramType) {
+            html += ' <span class="arg-type">:' + escapeHtml(paramType) + '</span>';
+          }
+          if (paramDefault !== null && paramDefault !== undefined && !hasArgs) {
+            html += ' <span class="arg-default">= ' + escapeHtml(String(paramDefault)) + '</span>';
+          }
+          html += '</label>';
+          if (typeHelper.helpText) {
+            html += '<button type="button" class="help-btn" data-action="show-help" data-help="' + escapeAttribute(typeHelper.helpText) + '" title="Show help">?</button>';
+          }
+          html += '</div>';
+          html += '<div class="arg-input-wrapper">';
+          html += '<input type="text" class="arg-input" data-arg-type="args" data-arg-index="' + displayIdx + '" data-param-type="' + escapeAttribute(paramType || '') + '" value="' + escapeAttribute(valueStr) + '" placeholder="' + escapeAttribute(typeHelper.placeholder) + '" />';
+          if (typeHelper.template) {
+            html += '<button type="button" class="template-btn" data-action="insert-template" data-template="' + escapeAttribute(typeHelper.template) + '" data-input-index="' + displayIdx + '" data-arg-type="args" title="Insert template">📋</button>';
+          }
+          html += '</div>';
           html += '</div>';
         });
         html += '</div>';
@@ -805,30 +1063,78 @@
         if (kwargsKeys.length > 0) {
           kwargsKeys.forEach(function(key) {
             const argValue = storedArgs.kwargs[key];
-            const valueStr = JSON.stringify(argValue);
+            // Find param index for type info
+            const paramIndex = params ? params.indexOf(key) : -1;
+            const paramType = paramTypes && paramIndex >= 0 ? paramTypes[paramIndex] : null;
+            const typeHelper = getTypeHelper(key, paramType);
+            
+            // Format value for display
+            let valueStr = '';
+            if (typeof argValue === 'object' && argValue !== null && argValue.__python_expr__) {
+              valueStr = argValue.__value__ || '';
+            } else {
+              valueStr = JSON.stringify(argValue);
+            }
+            
             html += '<div class="arg-item">';
-            html += '<label class="arg-label">' + escapeHtml(key) + ':</label>';
-            html += '<input type="text" class="arg-input" data-arg-type="kwargs" data-arg-key="' + escapeAttribute(key) + '" value="' + escapeAttribute(valueStr) + '" />';
+            html += '<div class="arg-header">';
+            html += '<label class="arg-label">' + escapeHtml(key);
+            if (paramType) {
+              html += ' <span class="arg-type">:' + escapeHtml(paramType) + '</span>';
+            }
+            html += '</label>';
+            if (typeHelper.helpText) {
+              html += '<button type="button" class="help-btn" data-action="show-help" data-help="' + escapeAttribute(typeHelper.helpText) + '" title="Show help">?</button>';
+            }
+            html += '</div>';
+            html += '<div class="arg-input-wrapper">';
+            html += '<input type="text" class="arg-input" data-arg-type="kwargs" data-arg-key="' + escapeAttribute(key) + '" data-param-type="' + escapeAttribute(paramType || '') + '" value="' + escapeAttribute(valueStr) + '" placeholder="' + escapeAttribute(typeHelper.placeholder) + '" />';
+            if (typeHelper.template) {
+              html += '<button type="button" class="template-btn" data-action="insert-template" data-template="' + escapeAttribute(typeHelper.template) + '" data-arg-key="' + escapeAttribute(key) + '" data-arg-type="kwargs" title="Insert template">📋</button>';
+            }
+            html += '</div>';
             html += '</div>';
           });
         }
         
         // Show inputs for remaining parameters that aren't already in kwargs
         if (params) {
-          params.forEach(function(paramName) {
+          params.forEach(function(paramName, actualIndex) {
             // Skip if already shown as positional or already in kwargs
             if (paramName === 'self' || paramName === 'cls' || kwargsKeys.indexOf(paramName) >= 0) {
               return;
             }
             // Check if this param was already shown as positional
-            // Use paramIndexMap to check if it's a positional param
             if (paramIndexMap.has(paramName)) {
               return; // Already shown as positional
             }
+            
+            // Get type info and helper
+            const paramType = paramTypes && paramTypes[actualIndex] ? paramTypes[actualIndex] : null;
+            const paramDefault = paramDefaults && paramDefaults[actualIndex] !== undefined ? paramDefaults[actualIndex] : null;
+            const typeHelper = getTypeHelper(paramName, paramType);
+            
             // Show as optional keyword argument
             html += '<div class="arg-item">';
-            html += '<label class="arg-label">' + escapeHtml(paramName) + ':</label>';
-            html += '<input type="text" class="arg-input" data-arg-type="kwargs" data-arg-key="' + escapeAttribute(paramName) + '" value="" placeholder="Optional (JSON format)" />';
+            html += '<div class="arg-header">';
+            html += '<label class="arg-label">' + escapeHtml(paramName);
+            if (paramType) {
+              html += ' <span class="arg-type">:' + escapeHtml(paramType) + '</span>';
+            }
+            if (paramDefault !== null && paramDefault !== undefined) {
+              html += ' <span class="arg-default">= ' + escapeHtml(String(paramDefault)) + '</span>';
+            }
+            html += '</label>';
+            if (typeHelper.helpText) {
+              html += '<button type="button" class="help-btn" data-action="show-help" data-help="' + escapeAttribute(typeHelper.helpText) + '" title="Show help">?</button>';
+            }
+            html += '</div>';
+            html += '<div class="arg-input-wrapper">';
+            html += '<input type="text" class="arg-input" data-arg-type="kwargs" data-arg-key="' + escapeAttribute(paramName) + '" data-param-type="' + escapeAttribute(paramType || '') + '" value="" placeholder="' + escapeAttribute(typeHelper.placeholder) + '" />';
+            if (typeHelper.template) {
+              html += '<button type="button" class="template-btn" data-action="insert-template" data-template="' + escapeAttribute(typeHelper.template) + '" data-arg-key="' + escapeAttribute(paramName) + '" data-arg-type="kwargs" title="Insert template">📋</button>';
+            }
+            html += '</div>';
             html += '</div>';
           });
         }

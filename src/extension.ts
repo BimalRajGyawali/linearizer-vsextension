@@ -94,12 +94,49 @@ function cloneCallArgs(args: NormalisedCallArgs): NormalisedCallArgs {
 	};
 }
 
+function buildStorageKeys(functionId: string): string[] {
+	if (!functionId) {
+		return [];
+	}
+	const trimmed = functionId.trim();
+	if (!trimmed) {
+		return [];
+	}
+	const normalisedPath = trimmed.replace(/\+/g, '/').replace(/^\.\//, '');
+	const withSlash = normalisedPath.startsWith('/') ? normalisedPath : `/${normalisedPath}`;
+	const withoutSlash = withSlash.slice(1);
+	const unique = new Set<string>([withSlash, withoutSlash]);
+	return Array.from(unique);
+}
+
 function getStoredCallArgs(functionId: string): NormalisedCallArgs | undefined {
-	return storedCallArgs.get(functionId);
+	const keys = buildStorageKeys(functionId);
+	for (const key of keys) {
+		const value = storedCallArgs.get(key);
+		if (value) {
+			return cloneCallArgs(value);
+		}
+	}
+	return undefined;
 }
 
 function setStoredCallArgs(functionId: string, args: NormalisedCallArgs): void {
-	storedCallArgs.set(functionId, cloneCallArgs(args));
+	const keys = buildStorageKeys(functionId);
+	if (!keys.length) {
+		return;
+	}
+	for (const key of keys) {
+		storedCallArgs.set(key, cloneCallArgs(args));
+	}
+}
+
+function hasCallArgs(args?: NormalisedCallArgs): boolean {
+	if (!args) {
+		return false;
+	}
+	const hasArgsArray = Array.isArray(args.args) && args.args.length > 0;
+	const hasKwargs = args.kwargs && Object.keys(args.kwargs).length > 0;
+	return Boolean(hasArgsArray || hasKwargs);
 }
 
 class TracerManager {
@@ -1381,8 +1418,12 @@ async function findCallSites(
 		const errorStdout = (error as any)?.stdout ? String((error as any).stdout) : '';
 		const errorStderr = (error as any)?.stderr ? String((error as any).stderr) : '';
 		console.error('[extension] Error finding call sites:', errorMessage);
-		if (errorStdout) console.error('[extension] stdout:', errorStdout);
-		if (errorStderr) console.error('[extension] stderr:', errorStderr);
+		if (errorStdout) {
+			console.error('[extension] stdout:', errorStdout);
+		}
+		if (errorStderr) {
+			console.error('[extension] stderr:', errorStderr);
+		}
 		throw error; // Re-throw so the caller can handle it
 	}
 }
@@ -1450,7 +1491,12 @@ async function handleTraceLine(
 	try {
 		const pythonPath = await getPythonPath();
 		const entryFullId = functionId.startsWith('/') ? functionId.slice(1) : functionId;
-		let resolvedArgs = callArgs ? normaliseCallArgs(callArgs) : cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+		const storedArgs = getStoredCallArgs(functionId);
+		let resolvedArgs = callArgs
+			? normaliseCallArgs(callArgs)
+			: storedArgs
+				? cloneCallArgs(storedArgs)
+				: cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
 		let argsJson: string;
 		let hasExtractedArgs = false; // Track if we extracted args from parent
 
@@ -1477,71 +1523,83 @@ async function handleTraceLine(
 
 				// Check if parent function requires arguments
 				const parentSignature = await getFunctionSignature(pythonPath, currentRepoRoot!, parentEntryFullId, context.extensionPath);
-				const hasRequiredParams = parentSignature && parentSignature.params && parentSignature.params.length > 0;
+				const signatureParams = parentSignature?.params || [];
+				const hasRequiredParams = signatureParams.length > 0;
+				let effectiveParentArgs = parentStoredArgs;
 				
 				// If required params but no stored args, recursively trace up the chain to find a parent with stored args
-				if (hasRequiredParams && (!parentStoredArgs || (Object.keys(parentStoredArgs.kwargs || {}).length === 0 && (parentStoredArgs.args || []).length === 0))) {
+				if (hasRequiredParams && !hasCallArgs(effectiveParentArgs)) {
 					console.log('[extension] Parent function requires args but has none, searching call sites:', parentId);
 					// Try to find call sites and trace from grandparent (recursive case)
 					const callSites = await findCallSites(pythonPath, currentRepoRoot!, parentId, context.extensionPath);
 					
 					if (callSites && callSites.length > 0) {
 						console.log('[extension] Found', callSites.length, 'call sites for parent function');
+						let extractionError: Error | undefined;
 						for (const callSite of callSites) {
-							if (callSite.calling_function_id) {
-								const grandParentId = callSite.calling_function_id.startsWith('/') 
-									? callSite.calling_function_id 
-									: '/' + callSite.calling_function_id;
-								const grandParentStoredArgs = getStoredCallArgs(grandParentId);
-								
-								console.log('[extension] Checking call site from:', grandParentId, 'has stored args:', !!grandParentStoredArgs);
-								
-								if (grandParentStoredArgs) {
-									console.log('[extension] Found grandparent with stored args, tracing recursively:', grandParentId);
-									// Recursively trace grandparent to get parent's args
-									const grandParentEvent = await traceParentFunction(
-										grandParentId,
-										callSite.line,
-										grandParentStoredArgs,
-										visited
-									);
-									
-									console.log('[extension] Extracting parent args from grandparent execution at line', callSite.line);
-									// Extract parent's args from grandparent's execution
-									const extractedParentArgs = await extractCallArguments(
-										pythonPath,
-										currentRepoRoot!,
-										parentId,
-										callSite.file,
-										callSite.line,
-										grandParentEvent.locals,
-										grandParentEvent.globals,
-										context.extensionPath,
-									);
-									
-									if (extractedParentArgs && !('error' in extractedParentArgs)) {
-										parentStoredArgs = normaliseCallArgs(extractedParentArgs);
-										console.log('[extension] Successfully extracted parent args from grandparent:', parentStoredArgs);
-										break;
-									} else {
-										const error = extractedParentArgs && 'error' in extractedParentArgs ? extractedParentArgs.error : 'Unknown error';
-										console.warn('[extension] Failed to extract parent args from call site:', error);
-									}
-								}
+							if (!callSite.calling_function_id) {
+								continue;
 							}
+
+							const grandParentId = callSite.calling_function_id.startsWith('/')
+								? callSite.calling_function_id
+								: '/' + callSite.calling_function_id;
+							const grandParentStoredArgs = getStoredCallArgs(grandParentId);
+							console.log('[extension] Checking call site from:', grandParentId, 'has stored args:', !!grandParentStoredArgs);
+
+							try {
+								const grandParentEvent = await traceParentFunction(
+									grandParentId,
+									callSite.line,
+									grandParentStoredArgs,
+									new Set(visited),
+								);
+
+								console.log('[extension] Extracting parent args from grandparent execution at line', callSite.line);
+								const extractedParentArgs = await extractCallArguments(
+									pythonPath,
+									currentRepoRoot!,
+									parentId,
+									callSite.file,
+									callSite.line,
+									grandParentEvent.locals,
+									grandParentEvent.globals,
+									context.extensionPath,
+								);
+
+								if (extractedParentArgs && !('error' in extractedParentArgs)) {
+									effectiveParentArgs = normaliseCallArgs(extractedParentArgs);
+									console.log('[extension] Successfully extracted parent args from grandparent:', effectiveParentArgs);
+									break;
+								}
+
+								const error = extractedParentArgs && 'error' in extractedParentArgs ? extractedParentArgs.error : 'Unknown error';
+								console.warn('[extension] Failed to extract parent args from call site:', error);
+							} catch (error) {
+								extractionError = error instanceof Error ? error : new Error(String(error));
+								console.warn('[extension] Failed while tracing grandparent', grandParentId, 'at line', callSite.line, ':', extractionError.message);
+							}
+						}
+
+						if (!hasCallArgs(effectiveParentArgs) && extractionError) {
+							throw extractionError;
 						}
 					} else {
 						console.log('[extension] No call sites found for parent function:', parentId);
 					}
 					
-					// If still no args and function requires them, error
-					if (!parentStoredArgs || (Object.keys(parentStoredArgs.kwargs || {}).length === 0 && (parentStoredArgs.args || []).length === 0)) {
-						throw new Error(`Parent function ${parentId} requires arguments (${parentSignature.params.join(', ')}) but none were provided. Please provide arguments for the parent function first.`);
+					// If still no args and function requires them, surface a guidance error
+					if (!hasCallArgs(effectiveParentArgs)) {
+						const signatureLabel = signatureParams.length > 0 ? ` (${signatureParams.join(', ')})` : '';
+						throw new Error(
+							`Arguments for ${parentId}${signatureLabel} are required. Please run the top-level function in the flow with its arguments before tracing nested calls.`,
+						);
 					}
 				}
 				
 				// Use stored args if available, otherwise empty args (valid for no-param functions)
-				const finalParentArgs = parentStoredArgs || cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+				const finalParentArgs = effectiveParentArgs ? cloneCallArgs(effectiveParentArgs) : cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+				setStoredCallArgs(parentId, finalParentArgs);
 				
 				// Check cache first to avoid redundant tracing
 				const cacheKey = getCacheKey(parentId, callLine, finalParentArgs);
@@ -1641,46 +1699,38 @@ async function handleTraceLine(
 		}
 
 		// If we have callArgs or extracted args from parent, use them directly
-		// For nested functions, we should always extract args from parent - never prompt for input
 		if (callArgs || hasExtractedArgs) {
+			setStoredCallArgs(functionId, resolvedArgs);
 			argsJson = JSON.stringify(resolvedArgs);
 		} else {
-			// Only prompt for input if this is a top-level parent function (not nested)
-			// If nested, we should have extracted args from parent above
-			if (!parentContext) {
-				const signature = await getFunctionSignature(pythonPath, currentRepoRoot, entryFullId, context.extensionPath);
-				const defaultJson = JSON.stringify(resolvedArgs);
-				if (signature && signature.params.length > 0) {
-					const paramInput = await vscode.window.showInputBox({
-						prompt: `Enter function arguments as JSON (params: ${signature.params.join(', ')}). Example: {"args": [1, 2], "kwargs": {"key": "value"}}`,
-						placeHolder: defaultJson,
-						value: defaultJson,
-					});
-
-					if (paramInput === undefined) {
-						return; // User cancelled
-					}
-
-					if (paramInput.trim()) {
-						try {
-							const parsed = JSON.parse(paramInput);
-							if (!isTraceCallArgs(parsed)) {
-								throw new Error('Invalid argument structure');
-							}
-							resolvedArgs = normaliseCallArgs(parsed);
-						} catch {
-							vscode.window.showErrorMessage('Invalid JSON format for arguments');
-							return;
-						}
-					} else {
-						resolvedArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
-					}
-				}
-			} else {
-				// This is a nested function but we somehow didn't extract args
-				// This shouldn't happen, but just use empty args as fallback
-				resolvedArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+			if (parentContext) {
+				// Nested function without extracted args – abort and ask user to run parent first
+				vscode.window.showErrorMessage(
+					`Unable to resolve arguments for ${functionId}. Trace the parent function in the flow first so its arguments are captured.`,
+				);
+				return;
 			}
+
+			const signature = await getFunctionSignature(pythonPath, currentRepoRoot, entryFullId, context.extensionPath);
+			const params = signature?.params ?? [];
+			if (params.length > 0 && !hasCallArgs(resolvedArgs)) {
+				const functionName = entryFullId.split('::').pop() || entryFullId;
+				if (flowPanel?.webview) {
+					flowPanel.webview.postMessage({
+						type: 'show-args-form',
+						functionId,
+						params,
+						functionName,
+					});
+				}
+				vscode.window.showInformationMessage(
+					`Arguments are required for ${functionName}. Use the flow panel to provide them, then trace again.`,
+				);
+				return;
+			}
+
+			// No parameters or arguments already stored – continue with defaults
+			setStoredCallArgs(functionId, resolvedArgs);
 			argsJson = JSON.stringify(resolvedArgs);
 		}
 
