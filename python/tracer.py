@@ -857,11 +857,11 @@ def main():
     dbg.target_function = fn_name  # Only stop in the target function
     dbg.repo_root = repo_root
     log(f"Created PersistentDebugger, target_file={abs_path}, target_function={fn_name}")
+    log(f"Configuring initial stop_line={stop_line} for function {fn_name}")
+    dbg.continue_until(stop_line, fn_name)
     log(f"Starting function execution with args={args_list}, kwargs={kwargs_dict}")
     dbg.run_function_once(fn, args_list, kwargs_dict)
     # Run until initial stop_line in the target function
-    log(f"Continuing until stop_line={stop_line} in function {fn_name}")
-    dbg.continue_until(stop_line, fn_name)
     
     # Wait for event with timeout to detect if thread died
     log("Waiting for event (timeout=30.0s)")

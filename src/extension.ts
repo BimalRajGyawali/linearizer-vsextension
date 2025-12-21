@@ -358,7 +358,12 @@ class TracerManager {
 		extensionPath: string,
 		pythonPath: string,
 		suppressWebview: boolean = false,
+		stopLineOverride?: number,
 	): Promise<TracerEvent> {
+		const requestedStopLine = typeof stopLineOverride === 'number'
+			? stopLineOverride
+			: displayLine + 1;
+		const targetStopLine = Math.max(1, Math.floor(requestedStopLine));
 		const firstTime = this.process === undefined;
 		const needsNewTracer = this.currentFlow !== entryFullId;
 
@@ -374,7 +379,7 @@ class TracerManager {
 		if (firstTime) {
 			this.outputChannel.appendLine(`[Rust-like] First time - spawning tracer`);
 			this.currentFlow = entryFullId;
-			this.spawnTracer(repoRoot, entryFullId, displayLine + 1, argsJson, extensionPath, pythonPath);
+			this.spawnTracer(repoRoot, entryFullId, targetStopLine, argsJson, extensionPath, pythonPath);
 		}
 
 		// If new flow detected, kill old tracer and spawn new one
@@ -401,7 +406,7 @@ class TracerManager {
 			
 			// Spawn new tracer for the new function
 			this.currentFlow = entryFullId;
-			this.spawnTracer(repoRoot, entryFullId, displayLine + 1, argsJson, extensionPath, pythonPath);
+			this.spawnTracer(repoRoot, entryFullId, targetStopLine, argsJson, extensionPath, pythonPath);
 		}
 
 		// Determine if this is the first call for this tracer
@@ -409,8 +414,8 @@ class TracerManager {
 
 		// Send continue command if not first call
 		if (!isFirstCall && this.process && this.process.stdin && !this.process.stdin.destroyed) {
-			this.outputChannel.appendLine(`[Rust-like] Sending continue_to ${displayLine + 1}`);
-			this.process.stdin.write(`${displayLine + 1}\n`);
+			this.outputChannel.appendLine(`[Rust-like] Sending continue_to ${targetStopLine}`);
+			this.process.stdin.write(`${targetStopLine}\n`);
 		} else {
 			this.outputChannel.appendLine(`[Rust-like] First call for this function — Python will send initial event`);
 		}
@@ -450,7 +455,7 @@ class TracerManager {
 					this.pendingReadResolve = undefined;
 					this.pendingReadReject = undefined;
 				}
-				reject(new Error(`Timeout waiting for function to reach line ${displayLine + 1}`));
+				reject(new Error(`Timeout waiting for function to reach line ${targetStopLine}`));
 			}, 30000);
 
 			this.pendingReadResolve = resolveWrapper;
@@ -980,6 +985,7 @@ async function showFlowPanel(
 								context.extensionPath,
 								pythonPath,
 								false, // suppressWebview
+								callSite.line,
 							);
 							
 							// Now extract the call arguments at that line
@@ -1486,7 +1492,7 @@ async function handleTraceLine(
 		return;
 	}
 
-		const executionLine = Number.isFinite(stopLine) ? stopLine : displayLine + 1;
+	const executionLine = Number.isFinite(stopLine) ? stopLine : displayLine + 1;
 
 	try {
 		const pythonPath = await getPythonPath();
@@ -1632,6 +1638,7 @@ async function handleTraceLine(
 					context.extensionPath,
 					pythonPath,
 					true, // suppressWebview = true: don't display parent events
+					callLine,
 				);
 
 				if (parentEvent.event === 'error') {
@@ -1753,6 +1760,8 @@ async function handleTraceLine(
 				argsJson,
 				context.extensionPath,
 				pythonPath,
+				false,
+				executionLine,
 			);
 
 			if (event.event === 'error') {
