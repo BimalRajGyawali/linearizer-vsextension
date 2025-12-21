@@ -23,8 +23,8 @@
     functionSignatures: new Map(), // functionId -> Array of parameter names
     loadingSignatures: new Set(), // Set of functionIds for which we're loading signatures
     lastClickedLine: new Map(), // functionId -> { line, stopLine } - track last clicked line for execution
-    argsFormVisible: false, // Whether the arguments form modal is visible
-    argsFormData: null, // { functionId, params: [] }
+    expandedCallSites: new Set(), // Set of parentIds with expanded call sites
+    expandedArgs: new Set(), // Set of parentIds with expanded args section
     tracingParent: new Set(), // Set of parent functionIds currently being traced
     tracingChild: new Set(), // Set of child functionIds currently being traced
   };
@@ -324,18 +324,11 @@
       state.functionSignatures.set(message.functionId, message.params);
       render();
     } else if (message.type === 'show-args-form' && typeof message.functionId === 'string') {
-      // Show the arguments form modal
-      state.argsFormVisible = true;
-      state.argsFormData = {
-        functionId: message.functionId,
-        params: Array.isArray(message.params) ? message.params : [],
-        functionName: typeof message.functionName === 'string' ? message.functionName : null,
-      };
-      // Also store signature for later use
+      // Store function signature (we use inline args section instead of modal)
       if (Array.isArray(message.params)) {
         state.functionSignatures.set(message.functionId, message.params);
+        render();
       }
-      render();
       
       // Focus first input field
       setTimeout(function() {
@@ -363,71 +356,9 @@
     }
   });
 
-  // Handle Escape key to close modal
-  document.addEventListener('keydown', function(event) {
-    if (event.key === 'Escape' && state.argsFormVisible) {
-      state.argsFormVisible = false;
-      state.argsFormData = null;
-      render();
-    }
-  });
 
-  // Handle form submission
-  root.addEventListener('submit', (event) => {
-    if (event.target instanceof HTMLFormElement && event.target.classList.contains('args-form')) {
-      event.preventDefault();
-      const form = event.target;
-      const functionId = form.getAttribute('data-function-id');
-      if (!functionId) return;
-      
-      const inputs = form.querySelectorAll('.form-input');
-      const kwargs = {};
-      
-      inputs.forEach(function(input) {
-        const paramName = input.getAttribute('data-param');
-        const value = input.value.trim();
-        
-        if (value) {
-          // Try to parse as JSON first (supports strings, numbers, booleans, null, arrays, objects)
-          try {
-            kwargs[paramName] = JSON.parse(value);
-          } catch {
-            // If JSON parsing fails, treat as a plain string
-            kwargs[paramName] = value;
-          }
-        }
-      });
-      
-      // Store arguments locally - execution will happen when user clicks a line
-      setCallArgsForFunction(functionId, { args: [], kwargs: kwargs });
-      
-      // Also notify extension to store the args so recursive tracing can find them
-      vscode.postMessage({
-        type: 'store-call-args',
-        functionId: functionId,
-        args: { args: [], kwargs: kwargs },
-      });
-      
-      // Hide form
-      state.argsFormVisible = false;
-      state.argsFormData = null;
-      render();
-      return;
-    }
-  });
 
   root.addEventListener('click', (event) => {
-    // Prevent clicks inside the modal from closing it (except for buttons with actions)
-    const modal = root.querySelector('.args-form-modal');
-    if (modal && modal.contains(event.target)) {
-      const clickedElement = event.target;
-      // Allow clicks on buttons with data-action (like Cancel, Close buttons)
-      if (clickedElement.tagName !== 'BUTTON' || !clickedElement.hasAttribute('data-action')) {
-        // For non-button elements or buttons without actions, stop here to prevent closing
-        return;
-      }
-    }
-    
     const target = findActionTarget(event.target);
     if (!target) {
       return;
@@ -445,6 +376,28 @@
       const parent = target.getAttribute('data-parent');
       if (parent) {
         toggleParent(parent);
+      }
+    } else if (action === 'toggle-call-sites') {
+      const parentId = target.getAttribute('data-parent-id');
+      if (parentId) {
+        const wasExpanded = state.expandedCallSites.has(parentId);
+        if (wasExpanded) {
+          state.expandedCallSites.delete(parentId);
+        } else {
+          state.expandedCallSites.add(parentId);
+        }
+        render();
+      }
+    } else if (action === 'toggle-args') {
+      const parentId = target.getAttribute('data-parent-id');
+      if (parentId) {
+        const wasExpanded = state.expandedArgs.has(parentId);
+        if (wasExpanded) {
+          state.expandedArgs.delete(parentId);
+        } else {
+          state.expandedArgs.add(parentId);
+        }
+        render();
       }
     } else if (action === 'toggle-call') {
       const call = target.getAttribute('data-call');
@@ -560,19 +513,26 @@
     } else if (action === 'execute-with-args') {
       const parentId = target.getAttribute('data-parent-id');
       if (parentId) {
-        // Request function signature first, then show form
-        vscode.postMessage({
-          type: 'request-args-form',
-          functionId: parentId,
-        });
-      }
-    } else if (action === 'close-args-form') {
-      // Only close if clicking directly on the overlay, not on the modal content
-      const clickedElement = event.target;
-      const modal = root.querySelector('.args-form-modal');
-      if (modal && (clickedElement === target || !modal.contains(clickedElement))) {
-        state.argsFormVisible = false;
-        state.argsFormData = null;
+        // Expand the parent if not already expanded to show the args section
+        if (!state.expandedParents.has(parentId)) {
+          state.expandedParents.add(parentId);
+          // Request call sites when expanding
+          if (!state.callSitesByFunction.has(parentId) && !state.loadingCallSites.has(parentId)) {
+            state.loadingCallSites.add(parentId);
+            console.log('[flowPanel] Requesting call sites for parent:', parentId);
+            vscode.postMessage({ type: 'find-call-sites', functionId: parentId });
+          }
+        }
+        // Expand the args section
+        state.expandedArgs.add(parentId);
+        // Request function signature if not already loaded
+        if (!state.functionSignatures.has(parentId) && !state.loadingSignatures.has(parentId)) {
+          state.loadingSignatures.add(parentId);
+          vscode.postMessage({
+            type: 'request-function-signature',
+            functionId: parentId,
+          });
+        }
         render();
       }
     } else if (action === 'open-source') {
@@ -725,7 +685,6 @@
     } else {
       content = parents.map((parentId) => renderParentBlock(parentId)).join('');
     }
-    content += renderArgsFormModal();
     content += renderLoadingOverlay();
     root.innerHTML = content;
   }
@@ -753,72 +712,8 @@
       '</div>';
   }
 
-  function renderArgsFormModal() {
-    if (!state.argsFormVisible || !state.argsFormData) {
-      return '';
-    }
-    
-    const { functionId, params, functionName } = state.argsFormData;
-    const functionDisplay = functionName || extractDisplayName(functionId);
-    
-    let formFields = '';
-    if (params && params.length > 0) {
-      params.forEach(function(paramName, index) {
-        formFields += `
-          <div class="form-field">
-            <label for="param-${index}" class="form-label">${escapeHtml(paramName)}</label>
-            <input 
-              type="text" 
-              id="param-${index}" 
-              class="form-input" 
-              data-param="${escapeAttribute(paramName)}"
-              placeholder="Enter value (JSON: strings use quotes, numbers/booleans without quotes)"
-              autocomplete="off"
-            />
-          </div>
-        `;
-      });
-    } else {
-      formFields = '<div class="form-field"><p class="form-info">This function has no parameters.</p></div>';
-    }
-    
-    return `
-      <div class="args-form-overlay" data-action="close-args-form">
-        <div class="args-form-modal">
-          <div class="args-form-header">
-            <h3 class="args-form-title">Function Arguments</h3>
-            <button type="button" class="args-form-close" data-action="close-args-form" aria-label="Close">&times;</button>
-          </div>
-          <div class="args-form-body">
-            <div class="args-form-info">
-              <div class="args-form-function-name">
-                <span class="info-label">Function:</span>
-                <span class="info-value">${escapeHtml(functionDisplay)}</span>
-              </div>
-            </div>
-            <form class="args-form" data-function-id="${escapeAttribute(functionId)}">
-              ${formFields}
-              <div class="form-help-text">
-                <span class="help-icon">💡</span>
-                <span>After saving, click any line number in the function to execute it with these arguments.</span>
-              </div>
-              <div class="form-actions">
-                <button type="button" class="form-btn form-btn-secondary" data-action="close-args-form">Cancel</button>
-                <button type="submit" class="form-btn form-btn-primary">Done</button>
-              </div>
-            </form>
-          </div>
-        </div>
-      </div>
-    `;
-  }
 
   function renderParentArgsSection(parentId) {
-    const storedArgs = getCallArgsForFunction(parentId);
-    if (!storedArgs || (storedArgs.args.length === 0 && Object.keys(storedArgs.kwargs || {}).length === 0)) {
-      return '<div class="parent-args-section"><div class="placeholder mini">No arguments set. Select a call site or provide arguments manually.</div></div>';
-    }
-
     // Get function signature to map parameter names
     const params = state.functionSignatures.get(parentId);
     if (!params && !state.loadingSignatures.has(parentId)) {
@@ -830,45 +725,125 @@
       });
     }
 
+    const storedArgs = getCallArgsForFunction(parentId);
+    const hasArgs = storedArgs && (storedArgs.args.length > 0 || Object.keys(storedArgs.kwargs || {}).length > 0);
+    const isExpanded = state.expandedArgs.has(parentId);
+
     let html = '<div class="parent-args-section">';
-    html += '<div class="parent-args-header">Function Arguments:</div>';
-    html += '<div class="parent-args-content">';
+    html += '<button type="button" class="section-toggle" data-action="toggle-args" data-parent-id="' + escapeAttribute(parentId) + '">';
+    html += '<span class="chevron ' + (isExpanded ? 'open' : '') + '"></span>';
     
-    // Render positional arguments with parameter names
-    if (storedArgs.args && storedArgs.args.length > 0) {
-      html += '<div class="args-group">';
-      html += '<div class="args-group-label">Positional Arguments:</div>';
-      storedArgs.args.forEach(function(arg, index) {
-        // Format value for display - use JSON.stringify for all values
-        const valueStr = JSON.stringify(arg);
-        // Use parameter name if available, otherwise use index
-        const paramName = params && params[index] ? params[index] : '[' + index + ']';
-        html += '<div class="arg-item">';
-        html += '<label class="arg-label">' + escapeHtml(paramName) + ':</label>';
-        html += '<input type="text" class="arg-input" data-arg-type="args" data-arg-index="' + index + '" value="' + escapeAttribute(valueStr) + '" />';
+    if (hasArgs) {
+      const argsCount = (storedArgs.args ? storedArgs.args.length : 0) + (storedArgs.kwargs ? Object.keys(storedArgs.kwargs).length : 0);
+      html += '<span class="section-title">Arguments <span class="section-badge">' + argsCount + ' set</span></span>';
+    } else if (params && params.length > 0) {
+      html += '<span class="section-title">Arguments <span class="section-badge empty">Not set</span></span>';
+    } else {
+      html += '<span class="section-title">Arguments <span class="section-badge">Loading...</span></span>';
+    }
+    html += '</button>';
+    
+    if (isExpanded) {
+      html += '<div class="section-content">';
+      html += '<div class="parent-args-content">';
+      
+      // Build a map of param names to indices (excluding self/cls)
+      const paramIndexMap = new Map(); // paramName -> displayIndex (for args array)
+      let displayIndex = 0;
+      if (params) {
+        params.forEach(function(paramName, actualIndex) {
+          // Skip 'self' and 'cls' parameters (they're not user-provided)
+          if (paramName !== 'self' && paramName !== 'cls') {
+            paramIndexMap.set(paramName, displayIndex);
+            displayIndex++;
+          }
+        });
+      }
+      
+      // Show inputs for positional arguments based on function signature
+      if (params && params.length > 0) {
+        html += '<div class="args-group">';
+        html += '<div class="args-group-label">Positional Arguments:</div>';
+        params.forEach(function(paramName, actualIndex) {
+          // Skip 'self' and 'cls' parameters (they're not user-provided)
+          if (paramName === 'self' || paramName === 'cls') {
+            return;
+          }
+          const displayIdx = paramIndexMap.get(paramName);
+          const argValue = storedArgs && storedArgs.args && storedArgs.args[displayIdx] !== undefined 
+            ? storedArgs.args[displayIdx] 
+            : '';
+          // Format value for display - use JSON.stringify for all values
+          const valueStr = argValue !== '' ? JSON.stringify(argValue) : '';
+          html += '<div class="arg-item">';
+          html += '<label class="arg-label">' + escapeHtml(paramName) + ':</label>';
+          html += '<input type="text" class="arg-input" data-arg-type="args" data-arg-index="' + displayIdx + '" value="' + escapeAttribute(valueStr) + '" placeholder="Enter value (JSON format)" />';
+          html += '</div>';
+        });
         html += '</div>';
-      });
+      } else if (hasArgs && storedArgs.args && storedArgs.args.length > 0) {
+        // No signature yet, but we have args - show them with indices
+        html += '<div class="args-group">';
+        html += '<div class="args-group-label">Positional Arguments:</div>';
+        storedArgs.args.forEach(function(arg, index) {
+          const valueStr = JSON.stringify(arg);
+          html += '<div class="arg-item">';
+          html += '<label class="arg-label">[' + index + ']:</label>';
+          html += '<input type="text" class="arg-input" data-arg-type="args" data-arg-index="' + index + '" value="' + escapeAttribute(valueStr) + '" />';
+          html += '</div>';
+        });
+        html += '</div>';
+      }
+      
+      // Show keyword arguments - include any stored ones, and also allow adding new ones
+      const kwargsKeys = storedArgs && storedArgs.kwargs ? Object.keys(storedArgs.kwargs) : [];
+      if (kwargsKeys.length > 0 || params) {
+        html += '<div class="args-group">';
+        html += '<div class="args-group-label">Keyword Arguments:</div>';
+        
+        // Show stored kwargs
+        if (kwargsKeys.length > 0) {
+          kwargsKeys.forEach(function(key) {
+            const argValue = storedArgs.kwargs[key];
+            const valueStr = JSON.stringify(argValue);
+            html += '<div class="arg-item">';
+            html += '<label class="arg-label">' + escapeHtml(key) + ':</label>';
+            html += '<input type="text" class="arg-input" data-arg-type="kwargs" data-arg-key="' + escapeAttribute(key) + '" value="' + escapeAttribute(valueStr) + '" />';
+            html += '</div>';
+          });
+        }
+        
+        // Show inputs for remaining parameters that aren't already in kwargs
+        if (params) {
+          params.forEach(function(paramName) {
+            // Skip if already shown as positional or already in kwargs
+            if (paramName === 'self' || paramName === 'cls' || kwargsKeys.indexOf(paramName) >= 0) {
+              return;
+            }
+            // Check if this param was already shown as positional
+            // Use paramIndexMap to check if it's a positional param
+            if (paramIndexMap.has(paramName)) {
+              return; // Already shown as positional
+            }
+            // Show as optional keyword argument
+            html += '<div class="arg-item">';
+            html += '<label class="arg-label">' + escapeHtml(paramName) + ':</label>';
+            html += '<input type="text" class="arg-input" data-arg-type="kwargs" data-arg-key="' + escapeAttribute(paramName) + '" value="" placeholder="Optional (JSON format)" />';
+            html += '</div>';
+          });
+        }
+        
+        html += '</div>';
+      }
+      
+      if (!hasArgs && (!params || params.length === 0)) {
+        html += '<div class="placeholder mini">Loading function signature...</div>';
+      }
+      
+      html += '<button type="button" class="compact-btn save-args-btn" data-action="save-parent-args" data-parent-id="' + escapeAttribute(parentId) + '">Save Arguments</button>';
+      html += '</div>';
       html += '</div>';
     }
-    
-    // Render keyword arguments
-    if (storedArgs.kwargs && Object.keys(storedArgs.kwargs).length > 0) {
-      html += '<div class="args-group">';
-      html += '<div class="args-group-label">Keyword Arguments:</div>';
-      Object.keys(storedArgs.kwargs).forEach(function(key) {
-        const argValue = storedArgs.kwargs[key];
-        // Format value for display - use JSON.stringify for all values
-        const valueStr = JSON.stringify(argValue);
-        html += '<div class="arg-item">';
-        html += '<label class="arg-label">' + escapeHtml(key) + ':</label>';
-        html += '<input type="text" class="arg-input" data-arg-type="kwargs" data-arg-key="' + escapeAttribute(key) + '" value="' + escapeAttribute(valueStr) + '" />';
-        html += '</div>';
-      });
-      html += '</div>';
-    }
-    
-    html += '<button type="button" class="save-args-btn" data-action="save-parent-args" data-parent-id="' + escapeAttribute(parentId) + '">Save Arguments</button>';
-    html += '</div>';
     html += '</div>';
     
     return html;
@@ -878,40 +853,47 @@
     const callSites = state.callSitesByFunction.get(parentId);
     const loading = state.loadingCallSites.has(parentId);
     const selected = state.selectedCallSite.get(parentId);
-
-    if (loading) {
-      return '<div class="call-sites-section"><div class="placeholder mini">Loading call sites...</div></div>';
-    }
-
-    if (!callSites || callSites.length === 0) {
-      return '<div class="call-sites-section">' +
-        '<div class="placeholder mini">No call sites found. Provide arguments to execute this function.</div>' +
-        '<button type="button" class="execute-with-args-btn" data-action="execute-with-args" data-parent-id="' + escapeAttribute(parentId) + '">Provide Arguments</button>' +
-        '</div>';
-    }
+    const isExpanded = state.expandedCallSites.has(parentId);
 
     let html = '<div class="call-sites-section">';
-    html += '<div class="call-sites-header">Call Sites (' + callSites.length + '):</div>';
-    html += '<button type="button" class="execute-with-args-btn" data-action="execute-with-args" data-parent-id="' + escapeAttribute(parentId) + '" title="Click to provide function arguments manually">Provide Arguments Manually</button>';
-    html += '<div class="call-sites-list">';
+    html += '<button type="button" class="section-toggle" data-action="toggle-call-sites" data-parent-id="' + escapeAttribute(parentId) + '">';
+    html += '<span class="chevron ' + (isExpanded ? 'open' : '') + '"></span>';
     
-    callSites.forEach(function(callSite, index) {
-      const isSelected = selected && selected.line === callSite.line && selected.file === callSite.file;
-      const callingFunctionName = callSite.calling_function || '&lt;top-level&gt;';
-      const fileDisplay = callSite.file.split('/').pop() || callSite.file;
-      const callSiteKey = parentId + '::' + callSite.file + '::' + callSite.line;
-      
-      html += '<div class="call-site-item ' + (isSelected ? 'selected' : '') + '" data-call-site-index="' + index + '" data-action="select-call-site" data-parent-id="' + escapeAttribute(parentId) + '">';
-      html += '<div class="call-site-header">';
-      html += '<span class="call-site-file">' + escapeHtml(fileDisplay) + '</span>';
-      html += '<span class="call-site-line">:' + callSite.line + '</span>';
-      html += '<span class="call-site-function"> in ' + escapeHtml(callingFunctionName) + '()</span>';
-      html += '</div>';
-      html += '<div class="call-site-code">' + escapeHtml(callSite.call_line) + '</div>';
-      html += '</div>';
-    });
+    if (loading) {
+      html += '<span class="section-title">Call Sites <span class="section-badge">Loading...</span></span>';
+    } else if (!callSites || callSites.length === 0) {
+      html += '<span class="section-title">Call Sites <span class="section-badge empty">None</span></span>';
+    } else {
+      html += '<span class="section-title">Call Sites <span class="section-badge">' + callSites.length + '</span></span>';
+    }
+    html += '</button>';
     
-    html += '</div>';
+    if (isExpanded) {
+      html += '<div class="section-content">';
+      if (loading) {
+        html += '<div class="placeholder mini">Loading call sites...</div>';
+      } else if (!callSites || callSites.length === 0) {
+        html += '<div class="placeholder mini">No call sites found.</div>';
+      } else {
+        html += '<div class="call-sites-list">';
+        callSites.forEach(function(callSite, index) {
+          const isSelected = selected && selected.line === callSite.line && selected.file === callSite.file;
+          const callingFunctionName = callSite.calling_function || '&lt;top-level&gt;';
+          const fileDisplay = callSite.file.split('/').pop() || callSite.file;
+          
+          html += '<div class="call-site-item ' + (isSelected ? 'selected' : '') + '" data-call-site-index="' + index + '" data-action="select-call-site" data-parent-id="' + escapeAttribute(parentId) + '">';
+          html += '<div class="call-site-header">';
+          html += '<span class="call-site-file">' + escapeHtml(fileDisplay) + '</span>';
+          html += '<span class="call-site-line">:' + callSite.line + '</span>';
+          html += '<span class="call-site-function"> in ' + escapeHtml(callingFunctionName) + '()</span>';
+          html += '</div>';
+          html += '<div class="call-site-code">' + escapeHtml(callSite.call_line) + '</div>';
+          html += '</div>';
+        });
+        html += '</div>';
+      }
+      html += '</div>';
+    }
     html += '</div>';
     
     return html;
@@ -933,7 +915,8 @@
     const parentArgsSection = isExpanded ? renderParentArgsSection(parentId) : '';
     
     const body = isExpanded
-      ? (callSitesSection + parentArgsSection + (fn
+      ? ('<div class="config-sections">' + callSitesSection + parentArgsSection + '</div>' +
+        (fn
         ? '<div class="function-container">' + renderFunctionBody(parentId, new Set([parentId]), null) + '</div>'
         : '<div class="placeholder mini">No function body captured for ' + escapeHtml(title) + '.</div>'))
       : '';

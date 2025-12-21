@@ -96,9 +96,10 @@ h2 {
 
 .parent-block {
   border: 1px solid var(--vscode-editorWidget-border);
-  border-radius: 6px;
+  border-radius: 8px;
   background: var(--vscode-editorWidget-background);
   overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
 }
 
 .parent-header {
@@ -106,8 +107,9 @@ h2 {
   justify-content: space-between;
   align-items: center;
   gap: 8px;
-  padding: 10px 12px;
+  padding: 12px 16px;
   border-bottom: 1px solid var(--vscode-editorWidget-border);
+  background: var(--vscode-editorWidget-background);
 }
 
 .parent-toggle {
@@ -134,14 +136,20 @@ h2 {
 .chevron {
   width: 0;
   height: 0;
-  border-left: 6px solid transparent;
-  border-right: 6px solid transparent;
-  border-top: 8px solid var(--vscode-descriptionForeground);
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid var(--vscode-descriptionForeground);
   transition: transform 0.15s ease-in-out;
+  flex-shrink: 0;
 }
 
 .chevron.open {
   transform: rotate(180deg);
+}
+
+.section-toggle .chevron {
+  border-top-color: var(--vscode-foreground);
+  opacity: 0.7;
 }
 
 .sequence-chips {
@@ -159,29 +167,91 @@ h2 {
   border: 1px solid var(--vscode-editorWidget-border);
 }
 
+.config-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin-top: 0;
+  border-top: 1px solid var(--vscode-editorWidget-border);
+  background: var(--vscode-editor-background);
+  opacity: 0.95;
+}
+
 .call-sites-section {
-  padding: 12px;
   border-bottom: 1px solid var(--vscode-editorWidget-border);
   background: var(--vscode-editor-background);
 }
 
 .parent-args-section {
-  padding: 12px;
   border-bottom: 1px solid var(--vscode-editorWidget-border);
   background: var(--vscode-editor-background);
 }
 
-.parent-args-header {
-  font-weight: 600;
-  margin-bottom: 12px;
-  font-size: 0.9rem;
-  color: var(--vscode-foreground);
+.section-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+  color: inherit;
+  text-align: left;
+  transition: background-color 0.15s ease;
 }
+
+.section-toggle:hover {
+  background: var(--vscode-list-hoverBackground, rgba(90, 90, 90, 0.08));
+}
+
+.section-title {
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--vscode-foreground);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.section-badge {
+  font-size: 0.75rem;
+  padding: 2px 6px;
+  border-radius: 10px;
+  background: var(--vscode-badge-background, rgba(128, 128, 128, 0.2));
+  color: var(--vscode-badge-foreground, var(--vscode-foreground));
+  font-weight: 500;
+}
+
+.section-badge.empty {
+  background: var(--vscode-inputValidation-warningBackground, rgba(255, 193, 7, 0.15));
+  color: var(--vscode-inputValidation-warningForeground, #ffc107);
+}
+
+.section-content {
+  padding: 10px 12px 12px 28px;
+  border-top: 1px solid var(--vscode-editorWidget-border);
+  background: var(--vscode-editor-background);
+  animation: slideDown 0.2s ease-out;
+}
+
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    max-height: 0;
+  }
+  to {
+    opacity: 1;
+    max-height: 1000px;
+  }
+}
+
 
 .parent-args-content {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 
 .args-group {
@@ -204,21 +274,21 @@ h2 {
 }
 
 .arg-label {
-  min-width: 80px;
-  font-size: 0.85rem;
+  min-width: 100px;
+  font-size: 0.8rem;
   color: var(--vscode-foreground);
   font-weight: 500;
 }
 
 .arg-input {
   flex: 1;
-  padding: 6px 8px;
+  padding: 5px 8px;
   font-family: var(--vscode-editor-font-family, 'Courier New', Consolas, monospace);
-  font-size: 0.85rem;
+  font-size: 0.8rem;
   background: var(--vscode-input-background);
   color: var(--vscode-input-foreground);
   border: 1px solid var(--vscode-input-border);
-  border-radius: 2px;
+  border-radius: 3px;
 }
 
 .arg-input:focus {
@@ -226,45 +296,44 @@ h2 {
   border-color: var(--vscode-focusBorder);
 }
 
-.save-args-btn {
+.compact-btn {
   margin-top: 8px;
-  padding: 8px 16px;
+  padding: 6px 12px;
   background: var(--vscode-button-background, #0e639c);
   color: var(--vscode-button-foreground, #ffffff);
   border: none;
   border-radius: 4px;
-  font-size: 0.9rem;
+  font-size: 0.85rem;
   font-weight: 500;
   cursor: pointer;
   transition: background-color 0.15s ease;
   align-self: flex-start;
 }
 
-.save-args-btn:hover {
+.compact-btn:hover {
   background: var(--vscode-button-hoverBackground, #1177bb);
 }
 
-.save-args-btn:active {
+.compact-btn:active {
   background: var(--vscode-button-activeBackground, #0a4d73);
 }
 
-.call-sites-header {
-  font-weight: 600;
-  margin-bottom: 8px;
-  font-size: 0.9rem;
-  color: var(--vscode-foreground);
+.save-args-btn {
+  margin-top: 8px;
 }
+
 
 .call-sites-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
+  margin-bottom: 8px;
 }
 
 .call-site-item {
-  padding: 8px 12px;
+  padding: 6px 10px;
   border: 1px solid var(--vscode-editorWidget-border);
-  border-radius: 4px;
+  border-radius: 3px;
   background: var(--vscode-editorWidget-background);
   cursor: pointer;
   transition: background-color 0.15s ease, border-color 0.15s ease;
@@ -305,39 +374,18 @@ h2 {
 
 .call-site-code {
   font-family: var(--vscode-editor-font-family, 'Courier New', Consolas, monospace);
-  font-size: 0.85rem;
+  font-size: 0.8rem;
   color: var(--vscode-editor-foreground);
-  padding-left: 12px;
+  padding-left: 10px;
   white-space: pre;
+  opacity: 0.9;
 }
 
-.execute-with-args-btn {
-  margin-top: 8px;
-  margin-bottom: 12px;
-  padding: 8px 16px;
-  background: var(--vscode-button-background, #0e639c);
-  color: var(--vscode-button-foreground, #ffffff);
-  border: none;
-  border-radius: 4px;
-  font-size: 0.9rem;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background-color 0.15s ease;
-  display: block;
-  width: 100%;
-}
-
-.execute-with-args-btn:hover {
-  background: var(--vscode-button-hoverBackground, #1177bb);
-}
-
-.execute-with-args-btn:active {
-  background: var(--vscode-button-activeBackground, #0a4d73);
-}
 
 .function-container {
-  padding: 0;
+  padding: 16px;
   overflow: hidden;
+  background: var(--vscode-editor-background);
 }
 
 .code-block {
@@ -348,11 +396,11 @@ h2 {
   line-height: var(--vscode-editor-line-height, 22px);
   background: var(--vscode-editor-background);
   border: 1px solid var(--vscode-editorWidget-border);
-  border-radius: 4px;
+  border-radius: 6px;
   overflow-x: auto;
   overflow-y: hidden;
   position: relative;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.15);
 }
 
 .code-line {
