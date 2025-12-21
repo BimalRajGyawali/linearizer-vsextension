@@ -933,12 +933,53 @@ def main():
             log(f"Received user input: '{user_input}'")
             with open("debugger_input.log", "a") as f:
                 f.write(f"Received input: {user_input}\n")
+
             if not user_input or user_input == "0":
                 log("User input is empty or '0', breaking loop")
                 break
-            line = int(user_input)
-            log(f"Parsed line number: {line}")
-            dbg.continue_until(line)
+
+            command_data = None
+            if user_input.startswith("{") and user_input.endswith("}"):
+                try:
+                    command_data = json.loads(user_input)
+                    log(f"Parsed JSON command: {command_data}")
+                except json.JSONDecodeError as decode_error:
+                    log(f"Failed to decode JSON command: {decode_error}", "ERROR")
+                    command_data = None
+
+            if command_data is not None:
+                line_value = command_data.get("line")
+                if line_value is None:
+                    log("JSON command missing required 'line' field", "ERROR")
+                    continue
+
+                try:
+                    line = int(line_value)
+                except (TypeError, ValueError):
+                    log(f"Invalid line value in command: {line_value}", "ERROR")
+                    continue
+
+                function_override = command_data.get("function")
+                file_override = command_data.get("file")
+
+                if file_override:
+                    if not os.path.isabs(file_override):
+                        file_override = os.path.join(repo_root, file_override.lstrip("/"))
+                    dbg.target_file = os.path.abspath(file_override)
+                    log(f"Updated target_file to {dbg.target_file}")
+
+                # Allow explicit null to reset to default behaviour
+                if function_override is not None and function_override != "":
+                    dbg.target_function = str(function_override)
+                    log(f"Updated target_function to {dbg.target_function}")
+                    dbg.continue_until(line, dbg.target_function)
+                else:
+                    dbg.continue_until(line)
+            else:
+                line = int(user_input)
+                log(f"Parsed line number: {line}")
+                dbg.continue_until(line)
+
             log("Waiting for event after continue_until")
             dbg.wait_for_event()
             log(f"Sending event: {dbg.last_event.get('event', 'unknown') if dbg.last_event else 'None'}")
@@ -946,7 +987,7 @@ def main():
         except Exception as e:
             log_exception(e, "interactive stepping loop")
             # Don't print to stderr, just log it
-    
+
     log("Tracer exiting")
     if _log_file:
         _log_file.close()
