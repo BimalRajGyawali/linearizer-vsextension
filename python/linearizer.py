@@ -18,18 +18,30 @@ CALL_RE_WITH_PATH = re.compile(r"(?:/\S+::)?([A-Za-z_]\w*)\s*\(")
 DEF_LINE_RE = re.compile(r"^\s*def\s+[A-Za-z_]\w*\s*\((.*)\)\s*(?:->\s*(.*))?:\s*$")
 
 
-def run_git_diff(repo: str) -> Tuple[int, str, str]:
+def run_git_diff(repo: str, cached: bool = False) -> Tuple[int, str, str]:
     cmd = [
         "git",
         "-C",
         repo,
         "diff",
-        "--relative",
-        "--ignore-space-at-eol",
-        "-b",
-        "-w",
-        "--ignore-blank-lines",
     ]
+    if cached:
+        cmd.append("--cached")
+    cmd.extend(
+        [
+            "--relative",
+            "--ignore-space-at-eol",
+            "-b",
+            "-w",
+            "--ignore-blank-lines",
+        ],
+    )
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def run_git_status(repo: str) -> Tuple[int, str, str]:
+    cmd = ["git", "-C", repo, "status", "--porcelain"]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return proc.returncode, proc.stdout, proc.stderr
 
@@ -150,8 +162,41 @@ def parse_diff(diff_text: str):
     return filtered_files
 
 
+def extract_new_python_files(repo_root: str) -> Set[str]:
+    code, stdout, _ = run_git_status(repo_root)
+    if code != 0 or not stdout:
+        return set()
+
+    new_files: Set[str] = set()
+
+    def collect_python_paths(rel_path: str):
+        abs_path = os.path.join(repo_root, rel_path)
+        if os.path.isdir(abs_path):
+            for root, _, files in os.walk(abs_path):
+                for fname in files:
+                    if not fname.endswith(".py"):
+                        continue
+                    rel_child = os.path.relpath(os.path.join(root, fname), repo_root).replace("\\", "/")
+                    new_files.add(rel_child)
+        else:
+            if rel_path.endswith(".py") and os.path.isfile(abs_path):
+                new_files.add(rel_path)
+
+    for line in stdout.splitlines():
+        if not line:
+            continue
+        status = line[:2]
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        normalized = path.replace("\\", "/")
+        if status == "??" or "A" in status:
+            collect_python_paths(normalized)
+    return new_files
+
+
 def find_changed_functions(parsed_files):
-    changed = {}
+    changed: Dict[str, Set[str]] = {}
     for f in parsed_files:
         file_path = f["file"]
         funcs: Set[str] = set()
@@ -163,7 +208,7 @@ def find_changed_functions(parsed_files):
                     if m:
                         funcs.add(m.group(1))
         if funcs:
-            changed[file_path] = funcs
+            changed.setdefault(file_path, set()).update(funcs)
     return changed
 
 
@@ -270,7 +315,7 @@ def qualify_calls_in_line(
     return re.sub(r"\b[A-Za-z_]\w*\s*\(", replacer, line)
 
 
-def extract_functions_from_file(path: str, function_names: set, repo_root: Optional[str] = None):
+def extract_functions_from_file(path: str, function_names: Optional[Set[str]], repo_root: Optional[str] = None):
     text = Path(path).read_text().splitlines()
     results = {}
     current_name = None
@@ -278,6 +323,7 @@ def extract_functions_from_file(path: str, function_names: set, repo_root: Optio
     current_start_line = 0
     imports_map = parse_imports(path)
     local_funcs = set()
+    target_all = not function_names
     for i, line in enumerate(text):
         lineno = i + 1
         m = PY_FUNC_DEF.match(line)
@@ -288,7 +334,7 @@ def extract_functions_from_file(path: str, function_names: set, repo_root: Optio
                 key = make_full_id(path, current_name)
                 results[key] = full_body
                 save_function(path, current_name, full_body, current_start_line, repo_root)
-            current_name = name if name in function_names else None
+            current_name = name if (target_all or (function_names and name in function_names)) else None
             if current_name:
                 local_funcs.add(current_name)
                 current_start_line = lineno
@@ -435,9 +481,18 @@ def main(argv: Optional[List[str]] = None):
     args = p.parse_args(argv)
     repo_root = os.path.abspath(args.repo)
     try:
-        res = run_git_diff(repo_root)
-        parsed = parse_diff(res[1])
-        changed_funcs = find_changed_functions(parsed)
+        parsed_diffs = []
+        for cached in (False, True):
+            diff_code, diff_stdout, _ = run_git_diff(repo_root, cached=cached)
+            if diff_code == 0 and diff_stdout:
+                parsed_diffs.extend(parse_diff(diff_stdout))
+
+        changed_funcs_raw = find_changed_functions(parsed_diffs)
+        changed_funcs: Dict[str, Optional[Set[str]]] = {k: v for k, v in changed_funcs_raw.items()}
+
+        for new_file in extract_new_python_files(repo_root):
+            changed_funcs.setdefault(new_file, None)
+
         if not changed_funcs:
             print(json.dumps({"parents": []}, indent=2))
             return
