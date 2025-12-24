@@ -1197,6 +1197,7 @@ async function showFlowPanel(
 											flowPanel.webview.postMessage({
 												type: 'call-site-args-error',
 												functionId: targetFunctionId,
+												callSite,
 												error: warningMessage,
 											});
 										}
@@ -1288,6 +1289,7 @@ async function showFlowPanel(
 									flowPanel.webview.postMessage({
 										type: 'call-site-args-error',
 										functionId: targetFunctionId,
+										callSite,
 										error: errorMsg,
 									});
 								}
@@ -1324,6 +1326,7 @@ async function showFlowPanel(
 										flowPanel.webview.postMessage({
 											type: 'call-site-args-error',
 											functionId: targetFunctionId,
+											callSite,
 											error: errorMsg,
 										});
 									}
@@ -1333,6 +1336,7 @@ async function showFlowPanel(
 									flowPanel.webview.postMessage({
 										type: 'call-site-args-error',
 										functionId: targetFunctionId,
+										callSite,
 										error: 'The calling function could not be determined and the call line is not available.',
 									});
 								}

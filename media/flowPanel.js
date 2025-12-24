@@ -11,6 +11,8 @@
     kwargs: {},
   };
 
+  const INLINE_VAR_DISPLAY_LIMIT = 5;
+
   const state = {
     expandedParents: new Set(),
     expandedCalls: new Set(),
@@ -29,7 +31,77 @@
     expandedArgs: new Set(), // Set of parentIds with expanded args section
     tracingParent: new Set(), // Set of parent functionIds currently being traced
     tracingChild: new Set(), // Set of child functionIds currently being traced
+    projectionView: null, // { functionId, line, file, code, variables: [{scope,name,value,type}]} or null
+    pendingTraceRequest: null, // { functionId, line }
+    callSiteStatuses: new Map(), // functionId -> Map(callSiteKey -> { state: 'success' | 'error', message?: string })
   };
+  let pendingTraceTimer = null;
+
+  function makeCallSiteKey(callSite) {
+    if (!callSite || typeof callSite !== 'object') {
+      return '';
+    }
+    const file = typeof callSite.file === 'string' ? normalisePath(callSite.file) : '';
+    const line = typeof callSite.line === 'number' ? callSite.line : '';
+    const caller = callSite.calling_function_id || callSite.calling_function || '';
+    const callText = callSite.call_line || '';
+    return [file, line, caller, callText].join('::');
+  }
+
+  function setCallSiteStatus(functionId, callSite, status) {
+    if (!functionId || !callSite) {
+      return;
+    }
+    const key = makeCallSiteKey(callSite);
+    if (!key) {
+      return;
+    }
+    if (!state.callSiteStatuses.has(functionId)) {
+      state.callSiteStatuses.set(functionId, new Map());
+    }
+    state.callSiteStatuses.get(functionId).set(key, status);
+  }
+
+  function getCallSiteStatus(functionId, callSite) {
+    if (!functionId || !callSite) {
+      return null;
+    }
+    const key = makeCallSiteKey(callSite);
+    if (!key) {
+      return null;
+    }
+    const map = state.callSiteStatuses.get(functionId);
+    if (!map) {
+      return null;
+    }
+    return map.get(key) || null;
+  }
+
+  function clearPendingTraceLock(options) {
+    if (pendingTraceTimer) {
+      clearTimeout(pendingTraceTimer);
+      pendingTraceTimer = null;
+    }
+    if (state.pendingTraceRequest) {
+      state.pendingTraceRequest = null;
+      if (options && options.render !== false) {
+        render();
+      }
+    }
+  }
+
+  function markPendingTrace(functionId, lineNumber) {
+    if (pendingTraceTimer) {
+      clearTimeout(pendingTraceTimer);
+    }
+    state.pendingTraceRequest = { functionId, line: lineNumber };
+    pendingTraceTimer = setTimeout(function() {
+      console.warn('[flowPanel] Trace request auto-cleared after timeout');
+      pendingTraceTimer = null;
+      state.pendingTraceRequest = null;
+      render();
+    }, 35000);
+  }
   
   // Helper function to format values for display
   function formatValue(value) {
@@ -58,6 +130,59 @@
     } catch {
       return '[object]';
     }
+  }
+
+  function formatInlineValue(value, maxLength) {
+    const limit = typeof maxLength === 'number' && maxLength > 5 ? maxLength : 60;
+    const formatted = formatValue(value);
+    if (formatted.length <= limit) {
+      return formatted;
+    }
+    return formatted.slice(0, limit - 1) + '…';
+  }
+
+  function buildProjectionRows(event) {
+    if (!event) {
+      return [];
+    }
+    const rows = [];
+    const seen = new Set();
+    const locals = event.locals && typeof event.locals === 'object' ? event.locals : {};
+    Object.entries(locals).forEach(function(entry) {
+      const name = String(entry[0]);
+      seen.add(name);
+      rows.push({
+        scope: 'Local',
+        name,
+        value: entry[1],
+        displayValue: formatValue(entry[1]),
+        type: getValueType(entry[1]),
+      });
+    });
+
+    const globals = event.globals && typeof event.globals === 'object' ? event.globals : {};
+    Object.entries(globals).forEach(function(entry) {
+      const name = String(entry[0]);
+      if (seen.has(name)) {
+        return;
+      }
+      rows.push({
+        scope: 'Global',
+        name,
+        value: entry[1],
+        displayValue: formatValue(entry[1]),
+        type: getValueType(entry[1]),
+      });
+    });
+
+    rows.sort(function(a, b) {
+      if (a.scope === b.scope) {
+        return a.name.localeCompare(b.name);
+      }
+      return a.scope === 'Local' ? -1 : 1;
+    });
+
+    return rows;
   }
   
   // Helper function to get value type for styling
@@ -169,6 +294,16 @@
       return '';
     }
     return value.replace(/\\/g, '/');
+  }
+
+  function filesRoughlyMatch(candidate, target) {
+    if (!target) {
+      return true;
+    }
+    if (!candidate) {
+      return false;
+    }
+    return candidate === target || candidate.endsWith(target) || target.endsWith(candidate);
   }
 
   function findFunctionIdForEvent(event) {
@@ -321,9 +456,21 @@
       // Arguments extracted from call site - store them and update UI
       console.log('[flowPanel] Received extracted args for', message.functionId, ':', message.args);
       setCallArgsForFunction(message.functionId, message.args);
+      if (message.callSite) {
+        setCallSiteStatus(message.functionId, message.callSite, {
+          state: 'success',
+          message: 'Arguments captured from call site',
+        });
+      }
       render();
     } else if (message.type === 'call-site-args-error' && typeof message.functionId === 'string') {
       console.error('[flowPanel] Error extracting args from call site:', message.error);
+      if (message.callSite) {
+        setCallSiteStatus(message.functionId, message.callSite, {
+          state: 'error',
+          message: message.error || 'Failed to extract arguments',
+        });
+      }
       // Show error but don't prevent rendering
       render();
     } else if (message.type === 'tracer-event') {
@@ -365,6 +512,8 @@
           state.tracerEvents.push(eventData);
         }
 
+  clearPendingTraceLock({ render: false });
+
         const functionIdForEvent = findFunctionIdForEvent(eventData);
         if (functionIdForEvent) {
           const derivedArgs = buildArgsFromEvent(eventData);
@@ -399,6 +548,7 @@
       });
       
       if (existingIndex < 0) {
+        clearPendingTraceLock({ render: false });
         state.tracerEvents.push(errorEvent);
         render();
       }
@@ -681,85 +831,19 @@
       if (identifier) {
         vscode.postMessage({ type: 'open-source', identifier });
       }
-    } else if (action === 'trace-line') {
+    } else if (action === 'open-projection') {
       const functionId = target.getAttribute('data-function');
-      const line = target.getAttribute('data-line');
-      const stopLine = target.getAttribute('data-stop-line');
-      const callTarget = target.getAttribute('data-call-target');
-      const parentFunctionId = target.getAttribute('data-parent-function');
-      const parentLine = target.getAttribute('data-parent-line');
-      const callLine = target.getAttribute('data-call-line');
-      
-      console.log('[flowPanel] Trace-line clicked, functionId:', functionId, 'line:', line, 'parent:', parentFunctionId, 'parentLine:', parentLine);
-      if (functionId && line) {
-        const lineNumber = parseInt(line, 10);
-        const stopLineCandidate = stopLine ? parseInt(stopLine, 10) : lineNumber + 1;
-        const stopLineNum = Number.isFinite(stopLineCandidate) ? stopLineCandidate : lineNumber + 1;
-        
-        // Store the clicked line for auto-execution after args update
-        state.lastClickedLine.set(functionId, { line: lineNumber, stopLine: stopLineNum });
-        
-        // Don't clear events when clicking - allow multiple lines to show values simultaneously
-        // The event handler will manage duplicates for the same line
-        
-        const payload = { 
-          type: 'trace-line', 
-          functionId, 
-          line: lineNumber, 
-          stopLine: stopLineNum 
-        };
-
-        // If this is a nested function, include parent context
-        if (parentFunctionId && parentLine && callLine) {
-          payload.parentFunctionId = parentFunctionId;
-          payload.parentLine = parseInt(parentLine, 10);
-          payload.callLine = parseInt(callLine, 10);
-          payload.isNested = true;
-          
-          // Always include parent's stored arguments so extension can execute parent function
-          // If parent doesn't have stored args, we need to prevent execution
-          const parentStoredArgs = getCallArgsForFunction(parentFunctionId);
-          if (!parentStoredArgs) {
-            console.warn('[flowPanel] Nested function clicked but parent has no stored args:', parentFunctionId);
-            // Show message to user (can't use vscode.window in webview, so we'll let extension handle it)
-            // But we should still send the message so extension can show proper error
-          } else {
-            payload.parentCallArgs = parentStoredArgs;
-          }
-        }
-
-        if (callTarget) {
-          const pendingKey = makePendingKey(functionId, lineNumber);
-          state.pendingCallTargets.set(pendingKey, callTarget);
-        }
-
-        // Always get the latest stored arguments (in case they were just updated)
-        const storedArgs = getCallArgsForFunction(functionId);
-        if (storedArgs) {
-          console.log('[flowPanel] Using stored args for', functionId, ':', storedArgs);
-          payload.callArgs = storedArgs;
-        } else if (parents.indexOf(functionId) >= 0) {
-          // For parent functions without stored args, don't execute automatically
-          // User must either select a call site (which auto-executes) or use the "Provide Arguments" button
-          const callSites = state.callSitesByFunction.get(functionId);
-          if (!callSites || callSites.length === 0) {
-            // No call sites - user must use the button
-            // Note: We can't use vscode.window here since this is in the webview
-            // Instead, we'll just return silently - the button is visible in the UI
-            console.log('[flowPanel] No stored args and no call sites - user should use "Provide Arguments" button');
-            return;
-          } else {
-            // Call sites exist - user should select one or use the button
-            console.log('[flowPanel] No stored args but call sites exist - user should select a call site or use "Provide Arguments" button');
-            return;
-          }
-        }
-
-        console.log('[flowPanel] Sending trace-line message', payload);
-        vscode.postMessage(payload);
-      } else {
-        console.error('[flowPanel] Missing functionId or line:', { functionId, line });
+      const lineValue = target.getAttribute('data-line');
+      const filePath = target.getAttribute('data-file');
+      const codeSnippet = target.getAttribute('data-code') || '';
+      const lineNumber = lineValue ? parseInt(lineValue, 10) : NaN;
+      if (functionId && Number.isFinite(lineNumber)) {
+        toggleProjection(functionId, filePath, lineNumber, codeSnippet);
       }
+    } else if (action === 'close-projection') {
+      closeProjection();
+    } else if (action === 'trace-line') {
+      executeTraceLineFromTarget(target);
     }
   });
 
@@ -777,6 +861,21 @@
           node.scrollIntoView({ behavior: 'smooth', block: 'center' });
         }
       }
+    }
+  });
+
+  root.addEventListener('dblclick', (event) => {
+    const codeLine = event.target.closest('.code-line');
+    if (!codeLine) {
+      return;
+    }
+    event.preventDefault();
+    executeTraceLineFromTarget(codeLine);
+  });
+
+  window.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && state.projectionView) {
+      closeProjection();
     }
   });
 
@@ -819,6 +918,132 @@
     render();
   }
 
+  function toggleProjection(functionId, filePath, lineNumber, codeSnippet) {
+    const targetLine = Number(lineNumber);
+    if (!functionId || !Number.isFinite(targetLine)) {
+      return;
+    }
+
+    if (
+      state.projectionView &&
+      state.projectionView.functionId === functionId &&
+      state.projectionView.line === targetLine
+    ) {
+      closeProjection();
+      return;
+    }
+
+    const targetFile = normalisePath(filePath || (functions[functionId]?.file || ''));
+    const match = state.tracerEvents.find(function(event) {
+      if (!event || event.line !== targetLine) {
+        return false;
+      }
+      const eventFile = normalisePath(event.filename || '');
+      return filesRoughlyMatch(eventFile, targetFile);
+    });
+
+    if (!match) {
+      console.warn('[flowPanel] No tracer event found for projection at line', targetLine, 'in', targetFile);
+      return;
+    }
+
+    state.projectionView = {
+      functionId,
+      file: targetFile,
+      line: targetLine,
+      code: codeSnippet || '',
+      variables: buildProjectionRows(match),
+    };
+    render();
+  }
+
+  function closeProjection() {
+    if (!state.projectionView) {
+      return;
+    }
+    state.projectionView = null;
+    render();
+  }
+
+  function executeTraceLineFromTarget(target) {
+    if (!target) {
+      return;
+    }
+    const functionId = target.getAttribute('data-function');
+    const line = target.getAttribute('data-line');
+    const stopLine = target.getAttribute('data-stop-line');
+    const callTarget = target.getAttribute('data-call-target');
+    const parentFunctionId = target.getAttribute('data-parent-function');
+    const parentLine = target.getAttribute('data-parent-line');
+    const callLine = target.getAttribute('data-call-line');
+
+    if (!functionId || !line) {
+      console.error('[flowPanel] Missing functionId or line:', { functionId, line });
+      return;
+    }
+
+    const lineNumber = parseInt(line, 10);
+    const stopLineCandidate = stopLine ? parseInt(stopLine, 10) : lineNumber + 1;
+    const stopLineNum = Number.isFinite(stopLineCandidate) ? stopLineCandidate : lineNumber + 1;
+
+    if (state.pendingTraceRequest) {
+      const pending = state.pendingTraceRequest;
+      if (pending.functionId === functionId && pending.line === lineNumber) {
+        console.log('[flowPanel] Trace already in flight for function', functionId, 'line', lineNumber);
+        return;
+      }
+      console.warn('[flowPanel] Trace request skipped because another line is still executing:', pending);
+      return;
+    }
+
+    state.lastClickedLine.set(functionId, { line: lineNumber, stopLine: stopLineNum });
+
+    const payload = {
+      type: 'trace-line',
+      functionId,
+      line: lineNumber,
+      stopLine: stopLineNum,
+    };
+
+    if (parentFunctionId && parentLine && callLine) {
+      payload.parentFunctionId = parentFunctionId;
+      payload.parentLine = parseInt(parentLine, 10);
+      payload.callLine = parseInt(callLine, 10);
+      payload.isNested = true;
+
+      const parentStoredArgs = getCallArgsForFunction(parentFunctionId);
+      if (!parentStoredArgs) {
+        console.warn('[flowPanel] Nested function clicked but parent has no stored args:', parentFunctionId);
+      } else {
+        payload.parentCallArgs = parentStoredArgs;
+      }
+    }
+
+    if (callTarget) {
+      const pendingKey = makePendingKey(functionId, lineNumber);
+      state.pendingCallTargets.set(pendingKey, callTarget);
+    }
+
+    const storedArgs = getCallArgsForFunction(functionId);
+    if (storedArgs) {
+      console.log('[flowPanel] Using stored args for', functionId, ':', storedArgs);
+      payload.callArgs = storedArgs;
+    } else if (parents.indexOf(functionId) >= 0) {
+      const callSites = state.callSitesByFunction.get(functionId);
+      if (!callSites || callSites.length === 0) {
+        console.log('[flowPanel] No stored args and no call sites - user should use "Provide Arguments" button');
+        return;
+      } else {
+        console.log('[flowPanel] No stored args but call sites exist - user should select a call site or use "Provide Arguments" button');
+        return;
+      }
+    }
+
+    console.log('[flowPanel] Sending trace-line message', payload);
+    markPendingTrace(functionId, lineNumber);
+    vscode.postMessage(payload);
+  }
+
   function render() {
     let content = '';
     if (!parents.length) {
@@ -827,7 +1052,11 @@
       content = parents.map((parentId) => renderParentBlock(parentId)).join('');
     }
     content += renderLoadingOverlay();
+    content += renderProjectionPanel();
     root.innerHTML = content;
+
+    const tracingActive = state.tracingParent.size > 0 || state.tracingChild.size > 0;
+    root.classList.toggle('is-tracing', tracingActive);
   }
 
   function renderLoadingOverlay() {
@@ -851,6 +1080,35 @@
       '<div class="loading-spinner"></div>' +
       '<div class="loading-message">' + escapeHtml(message) + '</div>' +
       '</div>';
+  }
+
+  function renderProjectionPanel() {
+    const projection = state.projectionView;
+    if (!projection) {
+      return '';
+    }
+
+    const rows = projection.variables.length
+      ? projection.variables.map(function(entry) {
+          return '<div class="projection-row">' +
+            '<span class="projection-cell projection-scope">' + escapeHtml(entry.scope) + '</span>' +
+            '<span class="projection-cell projection-name">' + escapeHtml(entry.name) + '</span>' +
+            '<code class="projection-cell projection-value tracer-var-value-' + entry.type + '">' + escapeHtml(entry.displayValue) + '</code>' +
+            '</div>';
+        }).join('')
+      : '<div class="projection-empty">No variables captured for this line.</div>';
+
+    return '<section class="projection-dock" role="region" aria-label="Line values">' +
+      '<header class="projection-header">' +
+        '<div>' +
+          '<div class="projection-title">' + escapeHtml(extractDisplayName(projection.functionId)) + '</div>' +
+          '<div class="projection-subtitle">Line ' + projection.line + ' · ' + escapeHtml(projection.file || '') + '</div>' +
+        '</div>' +
+        '<button type="button" class="projection-close" data-action="close-projection" aria-label="Close">×</button>' +
+      '</header>' +
+      '<pre class="projection-code"><code>' + escapeHtml(projection.code || '') + '</code></pre>' +
+      '<div class="projection-grid">' + rows + '</div>' +
+    '</section>';
   }
 
 
@@ -1186,14 +1444,24 @@
           const isSelected = selected && selected.line === callSite.line && selected.file === callSite.file;
           const callingFunctionName = callSite.calling_function || '&lt;top-level&gt;';
           const fileDisplay = callSite.file.split('/').pop() || callSite.file;
+          const status = getCallSiteStatus(parentId, callSite);
+          const statusClass = status ? (' ' + (status.state === 'success' ? 'success' : 'error')) : '';
+          const statusLabel = status && status.message
+            ? escapeHtml(status.message)
+            : (status && status.state === 'success'
+              ? 'Arguments captured'
+              : '');
           
-          html += '<div class="call-site-item ' + (isSelected ? 'selected' : '') + '" data-call-site-index="' + index + '" data-action="select-call-site" data-parent-id="' + escapeAttribute(parentId) + '">';
+          html += '<div class="call-site-item ' + (isSelected ? 'selected' : '') + statusClass + '" data-call-site-index="' + index + '" data-action="select-call-site" data-parent-id="' + escapeAttribute(parentId) + '">';
           html += '<div class="call-site-header">';
           html += '<span class="call-site-file">' + escapeHtml(fileDisplay) + '</span>';
           html += '<span class="call-site-line">:' + callSite.line + '</span>';
           html += '<span class="call-site-function"> in ' + escapeHtml(callingFunctionName) + '()</span>';
           html += '</div>';
           html += '<div class="call-site-code">' + escapeHtml(callSite.call_line) + '</div>';
+          if (statusLabel) {
+            html += '<div class="call-site-status call-site-status-' + status.state + '">' + statusLabel + '</div>';
+          }
           html += '</div>';
         });
         html += '</div>';
@@ -1288,12 +1556,28 @@
       
       const isTracerLine = lineEvents.length > 0;
       const lineClass = isTracerLine ? 'code-line tracer-active' : 'code-line';
-      const callTargetAttr = formatted.calls.length === 1 ? ' data-call-target="' + escapeAttribute(formatted.calls[0].targetId) + '"' : '';
+      const callTargetValue = formatted.calls.length === 1 ? formatted.calls[0].targetId : '';
+      const callTargetAttr = callTargetValue ? ' data-call-target="' + escapeAttribute(callTargetValue) + '"' : '';
       
       // Add parent context attributes if this is a nested function
-      const parentAttrs = parentContext 
-        ? ' data-parent-function="' + escapeAttribute(parentContext.parentFunctionId) + '" data-parent-line="' + parentContext.parentLineNumber + '" data-call-line="' + parentContext.callLineInParent + '"'
-        : '';
+      const parentAttrList = parentContext
+        ? [
+            'data-parent-function="' + escapeAttribute(parentContext.parentFunctionId) + '"',
+            'data-parent-line="' + parentContext.parentLineNumber + '"',
+            'data-call-line="' + parentContext.callLineInParent + '"'
+          ]
+        : [];
+      const parentAttrs = parentAttrList.length ? ' ' + parentAttrList.join(' ') : '';
+
+      const wrapperAttrList = [
+        'data-function="' + escapeAttribute(functionId) + '"',
+        'data-line="' + lineNumber + '"'
+      ];
+      if (callTargetValue) {
+        wrapperAttrList.push('data-call-target="' + escapeAttribute(callTargetValue) + '"');
+      }
+      const allLineAttrs = wrapperAttrList.concat(parentAttrList);
+      const wrapperAttrs = allLineAttrs.length ? ' ' + allLineAttrs.join(' ') : '';
       
       // Inline variable display (code-like execution view)
       let inlineVarsHtml = '';
@@ -1301,23 +1585,33 @@
         const latestEvent = regularEvents[regularEvents.length - 1];
         const vars = pickVarsForLine(line, latestEvent.locals, latestEvent.globals);
         if (vars && vars.length > 0) {
+          const visibleVars = vars.slice(0, INLINE_VAR_DISPLAY_LIMIT);
           inlineVarsHtml = '<div class="tracer-inline-vars">';
-          vars.forEach(function(v, idx) {
-            const valueStr = formatValue(v.value);
+          visibleVars.forEach(function(v) {
+            const valueStr = formatInlineValue(v.value, 56);
+            const fullValue = formatValue(v.value);
             const valueType = getValueType(v.value);
-            inlineVarsHtml += '<span class="tracer-var-item">' +
-              (v.isGlobal ? '<span class="tracer-var-global">global </span>' : '') +
+            const tooltip = `${v.isGlobal ? 'global ' : ''}${v.key} = ${fullValue}`;
+            inlineVarsHtml += '<div class="tracer-var-pill" title="' + escapeAttribute(tooltip) + '">' +
+              (v.isGlobal ? '<span class="tracer-var-badge" title="Global value">GLOBAL</span>' : '') +
               '<span class="tracer-var-name">' + escapeHtml(v.key) + '</span>' +
-              '<span class="tracer-var-equals"> = </span>' +
-              '<span class="tracer-var-value tracer-var-value-' + valueType + '">' + escapeHtml(valueStr) + '</span>' +
-              (idx < vars.length - 1 ? '<span class="tracer-var-separator"> </span>' : '') +
-              '</span>';
+              '<span class="tracer-var-equals">=</span>' +
+              '<code class="tracer-var-value tracer-var-value-' + valueType + '">' + escapeHtml(valueStr) + '</code>' +
+              '</div>';
           });
+
+          if (vars.length > visibleVars.length) {
+            const hiddenPreview = vars.slice(visibleVars.length)
+              .map(function(v) { return `${v.key} = ${formatValue(v.value)}`; })
+              .join('\n');
+            inlineVarsHtml += '<span class="tracer-var-more" title="' + escapeAttribute(hiddenPreview) + '">+' + (vars.length - visibleVars.length) + ' more</span>';
+          }
+          inlineVarsHtml += '<button type="button" class="tracer-project-btn" data-action="open-projection" data-function="' + escapeAttribute(functionId) + '" data-file="' + escapeAttribute(fn.file || '') + '" data-line="' + lineNumber + '" data-code="' + escapeAttribute(line.trim()) + '">Projection view</button>';
           inlineVarsHtml += '</div>';
         }
       }
       
-      html += '<div class="' + lineClass + '">' +
+      html += '<div class="' + lineClass + '"' + wrapperAttrs + '>' +
         '<button type="button" class="line-number" data-action="trace-line" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '"' + callTargetAttr + parentAttrs + ' title="Click to execute up to this line">' + lineNumber + '</button>' +
         '<div class="code-snippet-wrapper">' +
         '<span class="code-snippet">' + codeHtml + '</span>' +
