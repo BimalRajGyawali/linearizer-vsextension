@@ -19,8 +19,9 @@ let flowPanel: vscode.WebviewPanel | undefined;
 let flowPanelMessageDisposable: vscode.Disposable | undefined;
 let currentFunctionBodies: Record<string, FunctionBody> = {};
 let currentRepoRoot: string | undefined;
-let activeTracer: TracerManager | undefined;
 let tracerOutputChannel: vscode.OutputChannel | undefined;
+const tracerManagers = new Map<string, TracerManager>();
+const lastExecutedLineByContext = new Map<string, number>();
 const storedCallArgs: Map<string, NormalisedCallArgs> = new Map();
 
 // Cache for parent execution contexts to avoid redundant tracing
@@ -30,6 +31,73 @@ interface ExecutionContext {
 	file: string;
 }
 const parentExecutionContextCache = new Map<string, ExecutionContext>();
+
+function getTracerManagerKey(repoRoot: string, entryFullId: string, argsJson: string): string {
+	return JSON.stringify({ repoRoot, entryFullId, argsJson });
+}
+
+function getArgsContextKey(functionId: string, args: NormalisedCallArgs): string {
+	return `${functionId}::${JSON.stringify(args)}`;
+}
+
+function getOrCreateTracerManager(
+	context: vscode.ExtensionContext,
+	repoRoot: string,
+	entryFullId: string,
+	argsJson: string,
+	webview?: vscode.Webview,
+): TracerManager {
+	const key = getTracerManagerKey(repoRoot, entryFullId, argsJson);
+	let manager = tracerManagers.get(key);
+	if (!manager) {
+		if (!tracerOutputChannel) {
+			tracerOutputChannel = vscode.window.createOutputChannel('Linearizer Tracer');
+			context.subscriptions.push(tracerOutputChannel);
+		}
+		manager = new TracerManager(tracerOutputChannel, webview);
+		tracerManagers.set(key, manager);
+	}
+	manager.setWebview(webview);
+	return manager;
+}
+
+function stopAllTracers(): void {
+	for (const manager of tracerManagers.values()) {
+		manager.stop();
+	}
+	tracerManagers.clear();
+	lastExecutedLineByContext.clear();
+	parentExecutionContextCache.clear();
+}
+
+function clearTracingForFunction(functionId: string): void {
+	const normalizedId = functionId.startsWith('/') ? functionId.slice(1) : functionId;
+	const withSlash = functionId.startsWith('/') ? functionId : `/${normalizedId}`;
+
+	for (const [key, manager] of Array.from(tracerManagers.entries())) {
+		const parsed = JSON.parse(key) as { entryFullId: string };
+		if (parsed.entryFullId === normalizedId) {
+			manager.stop();
+			tracerManagers.delete(key);
+		}
+	}
+
+	for (const argsKey of Array.from(lastExecutedLineByContext.keys())) {
+		if (argsKey.startsWith(`${normalizedId}::`)) {
+			lastExecutedLineByContext.delete(argsKey);
+		}
+	}
+
+	for (const cacheKey of Array.from(parentExecutionContextCache.keys())) {
+		if (cacheKey.startsWith(`${withSlash}:`) || cacheKey.startsWith(`${normalizedId}:`)) {
+			parentExecutionContextCache.delete(cacheKey);
+		}
+	}
+
+	for (const storageKey of buildStorageKeys(functionId)) {
+		storedCallArgs.delete(storageKey);
+	}
+}
 
 function getCacheKey(parentId: string, callLine: number, args: NormalisedCallArgs): string {
 	// Create a cache key from function ID, call line, and args
@@ -56,6 +124,12 @@ interface TraceCallArgs {
 interface NormalisedCallArgs {
 	args: unknown[];
 	kwargs: Record<string, unknown>;
+}
+
+interface TracerContinueOptions {
+	targetFile?: string;
+	targetFunction?: string | null;
+	contextSuffix?: string;
 }
 
 // Baseline empty arguments for parent functions – actual values come from user input
@@ -94,12 +168,49 @@ function cloneCallArgs(args: NormalisedCallArgs): NormalisedCallArgs {
 	};
 }
 
+function buildStorageKeys(functionId: string): string[] {
+	if (!functionId) {
+		return [];
+	}
+	const trimmed = functionId.trim();
+	if (!trimmed) {
+		return [];
+	}
+	const normalisedPath = trimmed.replace(/\+/g, '/').replace(/^\.\//, '');
+	const withSlash = normalisedPath.startsWith('/') ? normalisedPath : `/${normalisedPath}`;
+	const withoutSlash = withSlash.slice(1);
+	const unique = new Set<string>([withSlash, withoutSlash]);
+	return Array.from(unique);
+}
+
 function getStoredCallArgs(functionId: string): NormalisedCallArgs | undefined {
-	return storedCallArgs.get(functionId);
+	const keys = buildStorageKeys(functionId);
+	for (const key of keys) {
+		const value = storedCallArgs.get(key);
+		if (value) {
+			return cloneCallArgs(value);
+		}
+	}
+	return undefined;
 }
 
 function setStoredCallArgs(functionId: string, args: NormalisedCallArgs): void {
-	storedCallArgs.set(functionId, cloneCallArgs(args));
+	const keys = buildStorageKeys(functionId);
+	if (!keys.length) {
+		return;
+	}
+	for (const key of keys) {
+		storedCallArgs.set(key, cloneCallArgs(args));
+	}
+}
+
+function hasCallArgs(args?: NormalisedCallArgs): boolean {
+	if (!args) {
+		return false;
+	}
+	const hasArgsArray = Array.isArray(args.args) && args.args.length > 0;
+	const hasKwargs = args.kwargs && Object.keys(args.kwargs).length > 0;
+	return Boolean(hasArgsArray || hasKwargs);
 }
 
 class TracerManager {
@@ -116,6 +227,12 @@ class TracerManager {
 	private currentDisplayLine: number | undefined;
 	private currentDisplayFile: string | undefined;
 	private suppressWebviewEvents: boolean = false; // Suppress webview events for parent tracing
+	private lastEvent: TracerEvent | undefined;
+	private maxStopLineReached: number | undefined;
+	private lastContextKey: string | undefined;
+	private pendingStopLine: number | undefined;
+	private pendingContextKey: string | undefined;
+	private cachedEvents: Map<string, Map<number, TracerEvent>> = new Map();
 
 	constructor(outputChannel: vscode.OutputChannel, webview?: vscode.Webview) {
 		this.outputChannel = outputChannel;
@@ -166,8 +283,71 @@ class TracerManager {
 		this.pendingDisplayFile = undefined;
 	}
 
+	private buildContextKey(
+		repoRoot: string,
+		entryFullId: string,
+		argsJson: string,
+		suffix?: string,
+	): string {
+		const base = `${repoRoot}::${entryFullId}::${argsJson}`;
+		return suffix ? `${base}::${suffix}` : base;
+	}
+
+	private cloneEvent(event: TracerEvent): TracerEvent {
+		return JSON.parse(JSON.stringify(event)) as TracerEvent;
+	}
+
+	private getCachedEvent(
+		contextKey: string,
+		stopLine: number,
+		displayLine: number,
+		displayFile: string | undefined,
+	): TracerEvent | undefined {
+		const contextCache = this.cachedEvents.get(contextKey);
+		if (!contextCache) {
+			return undefined;
+		}
+		const cached = contextCache.get(stopLine);
+		if (!cached) {
+			return undefined;
+		}
+		const cloned = this.cloneEvent(cached);
+		cloned.line = displayLine;
+		if (displayFile) {
+			cloned.filename = displayFile;
+		}
+		return cloned;
+	}
+
 	private processIncomingEvent(rawEvent: TracerEvent): void {
 		const decorated = this.decorateEvent(rawEvent);
+
+		if (this.pendingContextKey) {
+			this.lastContextKey = this.pendingContextKey;
+		}
+
+		if (typeof this.pendingStopLine === 'number') {
+			const pendingStopLine = this.pendingStopLine;
+			this.maxStopLineReached = typeof this.maxStopLineReached === 'number'
+				? Math.max(this.maxStopLineReached, pendingStopLine)
+				: pendingStopLine;
+		}
+
+		const cacheContextKey = this.pendingContextKey ?? this.lastContextKey;
+		if (
+			cacheContextKey &&
+			typeof this.pendingStopLine === 'number' &&
+			decorated.event !== 'error'
+		) {
+			let contextCache = this.cachedEvents.get(cacheContextKey);
+			if (!contextCache) {
+				contextCache = new Map<number, TracerEvent>();
+				this.cachedEvents.set(cacheContextKey, contextCache);
+			}
+			contextCache.set(this.pendingStopLine, this.cloneEvent(decorated));
+		}
+
+		this.lastEvent = decorated;
 		
 		// Log for debugging first click issues
 		if (decorated.event === 'line') {
@@ -186,6 +366,9 @@ class TracerManager {
 			// Only emit to webview if there's no pending resolver (queued events)
 			this.emitTracerEvent(decorated);
 		}
+
+		this.pendingStopLine = undefined;
+		this.pendingContextKey = undefined;
 	}
 
 	private spawnTracer(
@@ -221,6 +404,11 @@ class TracerManager {
 
 		this.stderrBuffer = '';
 		this.eventQueue = [];
+		this.lastEvent = undefined;
+		this.maxStopLineReached = undefined;
+		this.lastContextKey = undefined;
+		this.pendingStopLine = undefined;
+		this.pendingContextKey = undefined;
 
 		// Handle stderr data - accumulate and parse JSON lines
 		this.process.stderr?.on('data', (data: Buffer) => {
@@ -321,7 +509,13 @@ class TracerManager {
 		extensionPath: string,
 		pythonPath: string,
 		suppressWebview: boolean = false,
+		stopLineOverride?: number,
+		continueOverrides?: TracerContinueOptions,
 	): Promise<TracerEvent> {
+		const requestedStopLine = typeof stopLineOverride === 'number'
+			? stopLineOverride
+			: displayLine + 1;
+		const targetStopLine = Math.max(1, Math.floor(requestedStopLine));
 		const firstTime = this.process === undefined;
 		const needsNewTracer = this.currentFlow !== entryFullId;
 
@@ -333,11 +527,54 @@ class TracerManager {
 		this.currentDisplayLine = displayLine;
 		this.currentDisplayFile = displayFile;
 
+		const contextKey = this.buildContextKey(
+			repoRoot,
+			entryFullId,
+			argsJson,
+			continueOverrides?.contextSuffix,
+		);
+		const cachedEvent = this.getCachedEvent(contextKey, targetStopLine, displayLine, displayFile);
+		if (cachedEvent) {
+			this.outputChannel.appendLine(
+				`[Rust-like] Using cached tracer result for stop_line=${targetStopLine}`
+			);
+			this.lastEvent = cachedEvent;
+			this.lastContextKey = contextKey;
+			this.maxStopLineReached = typeof this.maxStopLineReached === 'number'
+				? Math.max(this.maxStopLineReached, targetStopLine)
+				: targetStopLine;
+			this.clearPendingDisplay();
+			return cachedEvent;
+		}
+
+		if (
+			this.lastEvent &&
+			this.lastContextKey === contextKey &&
+			typeof this.maxStopLineReached === 'number' &&
+			targetStopLine <= this.maxStopLineReached
+		) {
+			this.outputChannel.appendLine(
+				`[Rust-like] Reusing cached tracer result (requested stop_line=${targetStopLine}, max=${this.maxStopLineReached})`
+			);
+			const cachedEventFromLast: TracerEvent = {
+				...this.lastEvent,
+				line: displayLine,
+			};
+			if (displayFile) {
+				cachedEventFromLast.filename = displayFile;
+			} else if (this.lastEvent.filename) {
+				cachedEventFromLast.filename = this.lastEvent.filename;
+			}
+			this.lastEvent = cachedEventFromLast;
+			this.clearPendingDisplay();
+			return cachedEventFromLast;
+		}
+
 		// Spawn tracer if not alive
 		if (firstTime) {
 			this.outputChannel.appendLine(`[Rust-like] First time - spawning tracer`);
 			this.currentFlow = entryFullId;
-			this.spawnTracer(repoRoot, entryFullId, displayLine + 1, argsJson, extensionPath, pythonPath);
+			this.spawnTracer(repoRoot, entryFullId, targetStopLine, argsJson, extensionPath, pythonPath);
 		}
 
 		// If new flow detected, kill old tracer and spawn new one
@@ -364,16 +601,27 @@ class TracerManager {
 			
 			// Spawn new tracer for the new function
 			this.currentFlow = entryFullId;
-			this.spawnTracer(repoRoot, entryFullId, displayLine + 1, argsJson, extensionPath, pythonPath);
+			this.spawnTracer(repoRoot, entryFullId, targetStopLine, argsJson, extensionPath, pythonPath);
 		}
 
 		// Determine if this is the first call for this tracer
 		const isFirstCall = firstTime || needsNewTracer;
-
+		this.pendingStopLine = targetStopLine;
+		this.pendingContextKey = contextKey;
 		// Send continue command if not first call
 		if (!isFirstCall && this.process && this.process.stdin && !this.process.stdin.destroyed) {
-			this.outputChannel.appendLine(`[Rust-like] Sending continue_to ${displayLine + 1}`);
-			this.process.stdin.write(`${displayLine + 1}\n`);
+			const continuePayload: Record<string, unknown> = { line: targetStopLine };
+			if (continueOverrides?.targetFunction !== undefined) {
+				continuePayload.function = continueOverrides.targetFunction;
+			}
+			if (continueOverrides?.targetFile) {
+				continuePayload.file = continueOverrides.targetFile;
+			}
+			const payloadText = JSON.stringify(continuePayload);
+			this.outputChannel.appendLine(
+				`[Rust-like] Sending continue command ${payloadText}`,
+			);
+			this.process.stdin.write(`${payloadText}\n`);
 		} else {
 			this.outputChannel.appendLine(`[Rust-like] First call for this function — Python will send initial event`);
 		}
@@ -413,7 +661,7 @@ class TracerManager {
 					this.pendingReadResolve = undefined;
 					this.pendingReadReject = undefined;
 				}
-				reject(new Error(`Timeout waiting for function to reach line ${displayLine + 1}`));
+				reject(new Error(`Timeout waiting for function to reach line ${targetStopLine}`));
 			}, 30000);
 
 			this.pendingReadResolve = resolveWrapper;
@@ -500,6 +748,12 @@ class TracerManager {
 		this.clearPendingDisplay();
 		this.currentDisplayLine = undefined;
 		this.currentDisplayFile = undefined;
+		this.lastEvent = undefined;
+		this.maxStopLineReached = undefined;
+		this.lastContextKey = undefined;
+		this.pendingStopLine = undefined;
+		this.pendingContextKey = undefined;
+		this.cachedEvents.clear();
 	}
 }
 
@@ -588,10 +842,7 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
-	if (activeTracer) {
-		activeTracer.stop();
-		activeTracer = undefined;
-	}
+	stopAllTracers();
 }
 
 function renderChangedFunctions(channel: vscode.OutputChannel, changedFunctions: ChangedFunction[]): void {
@@ -655,10 +906,7 @@ async function showFlowPanel(
 		context.subscriptions.push(flowPanel);
 		flowPanel.onDidDispose(
 			() => {
-				if (activeTracer) {
-					activeTracer.stop();
-					activeTracer = undefined;
-				}
+				stopAllTracers();
 				flowPanel = undefined;
 				currentFunctionBodies = {};
 				currentRepoRoot = undefined;
@@ -907,43 +1155,60 @@ async function showFlowPanel(
 						const targetFunctionId = message.functionId; // The parent function to execute
 						
 						// Check if we have a calling function ID
-						if (callSite.calling_function_id) {
-							// We have a calling function - execute it first to get runtime context
-							// We need to ensure activeTracer exists or create one
-							if (!activeTracer) {
-								if (!tracerOutputChannel) {
-									tracerOutputChannel = vscode.window.createOutputChannel('Linearizer Tracer');
-									context.subscriptions.push(tracerOutputChannel);
+							if (callSite.calling_function_id) {
+								const callingFunctionId = callSite.calling_function_id.startsWith('/') 
+									? callSite.calling_function_id.slice(1) 
+									: callSite.calling_function_id;
+							
+								console.log('[extension] Executing calling function:', {
+									callingFunctionId,
+									file: callSite.file,
+									line: callSite.line,
+									targetFunctionId
+								});
+							
+								// Validate the calling function ID format
+								if (!callingFunctionId.includes('::')) {
+									throw new Error(`Invalid calling function ID format: ${callSite.calling_function_id}. Expected format: path/to/file.py::function_name`);
 								}
-								activeTracer = new TracerManager(tracerOutputChannel);
-							}
-							
-							const callingFunctionId = callSite.calling_function_id.startsWith('/') 
-								? callSite.calling_function_id.slice(1) 
-								: callSite.calling_function_id;
-							
-							console.log('[extension] Executing calling function:', {
-								callingFunctionId,
-								file: callSite.file,
-								line: callSite.line,
-								targetFunctionId
-							});
-							
-							// Validate the calling function ID format
-							if (!callingFunctionId.includes('::')) {
-								throw new Error(`Invalid calling function ID format: ${callSite.calling_function_id}. Expected format: path/to/file.py::function_name`);
-							}
-							
-							const callSiteEvent = await activeTracer.getTracerData(
-								currentRepoRoot!,
-								callingFunctionId,
-								callSite.line - 1, // displayLine is 0-indexed, callSite.line is 1-indexed
-								callSite.file,
-								JSON.stringify({ args: [], kwargs: {} }), // Dummy args - we'll extract real ones
-								context.extensionPath,
-								pythonPath,
-								false, // suppressWebview
-							);
+
+								const defaultCallArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+								const callingArgsJson = JSON.stringify(defaultCallArgs);
+								const callingTracer = getOrCreateTracerManager(
+									context,
+									currentRepoRoot!,
+									callingFunctionId,
+									callingArgsJson,
+									flowPanel?.webview,
+								);
+								callingTracer.setSuppressWebviewEvents(false);
+
+								const callSiteEvent = await callingTracer.getTracerData(
+									currentRepoRoot!,
+									callingFunctionId,
+									callSite.line - 1, // displayLine is 0-indexed, callSite.line is 1-indexed
+									callSite.file,
+									callingArgsJson,
+									context.extensionPath,
+									pythonPath,
+									false, // suppressWebview
+									callSite.line,
+									undefined,
+								);
+
+								const callingArgsKey = getArgsContextKey(callingFunctionId, defaultCallArgs);
+								const previousLine = lastExecutedLineByContext.get(callingArgsKey) ?? 0;
+								lastExecutedLineByContext.set(callingArgsKey, Math.max(previousLine, callSite.line));
+
+								const callingParentId = callSite.calling_function_id.startsWith('/')
+									? callSite.calling_function_id
+									: `/${callSite.calling_function_id}`;
+								const callingCacheKey = getCacheKey(callingParentId, callSite.line, defaultCallArgs);
+								parentExecutionContextCache.set(callingCacheKey, {
+									locals: callSiteEvent.locals || {},
+									globals: callSiteEvent.globals || {},
+									file: callSite.file,
+								});
 							
 							// Now extract the call arguments at that line
 							const extractedArgs = await extractCallArguments(
@@ -1032,18 +1297,12 @@ async function showFlowPanel(
 					vscode.window.showErrorMessage(`Error executing from call site: ${error instanceof Error ? error.message : String(error)}`);
 				}
 			} else if (message.type === 'stop-trace') {
-				if (activeTracer) {
-					activeTracer.stop();
-					activeTracer = undefined;
-				}
+				stopAllTracers();
 			} else if (message.type === 'reset-tracer' && typeof message.functionId === 'string') {
 				// Reset tracer when arguments are updated - this ensures a new tracer is created
 				// with the new arguments on the next execution
 				console.log('[extension] Resetting tracer for function:', message.functionId);
-				if (activeTracer) {
-					activeTracer.stop();
-					activeTracer = undefined;
-				}
+				clearTracingForFunction(message.functionId);
 			}
 		});
 		context.subscriptions.push(flowPanelMessageDisposable);
@@ -1381,8 +1640,12 @@ async function findCallSites(
 		const errorStdout = (error as any)?.stdout ? String((error as any).stdout) : '';
 		const errorStderr = (error as any)?.stderr ? String((error as any).stderr) : '';
 		console.error('[extension] Error finding call sites:', errorMessage);
-		if (errorStdout) console.error('[extension] stdout:', errorStdout);
-		if (errorStderr) console.error('[extension] stderr:', errorStderr);
+		if (errorStdout) {
+			console.error('[extension] stdout:', errorStdout);
+		}
+		if (errorStderr) {
+			console.error('[extension] stderr:', errorStderr);
+		}
 		throw error; // Re-throw so the caller can handle it
 	}
 }
@@ -1426,6 +1689,15 @@ interface ParentContext {
 	parentCallArgs?: TraceCallArgs;
 }
 
+interface ParentTraceDetails {
+	tracer: TracerManager;
+	args: NormalisedCallArgs;
+	argsJson: string;
+	entryFullId: string;
+	body: FunctionBody;
+	context: ExecutionContext;
+}
+
 async function handleTraceLine(
 	functionId: string,
 	displayLine: number,
@@ -1445,24 +1717,44 @@ async function handleTraceLine(
 		return;
 	}
 
-		const executionLine = Number.isFinite(stopLine) ? stopLine : displayLine + 1;
+	const resolveAbsolutePath = (filePath: string): string => {
+		if (path.isAbsolute(filePath)) {
+			return filePath;
+		}
+		const trimmed = filePath.startsWith('/') ? filePath.slice(1) : filePath;
+		return path.join(currentRepoRoot!, trimmed);
+	};
+
+	const getFunctionNameForDebugger = (identifier: string): string | undefined => {
+		const trimmed = identifier.startsWith('/') ? identifier.slice(1) : identifier;
+		const display = extractDisplayNameFromId(trimmed, '').trim();
+		return display.length > 0 ? display : undefined;
+	};
+
+	const executionLine = Number.isFinite(stopLine) ? stopLine : displayLine + 1;
 
 	try {
 		const pythonPath = await getPythonPath();
 		const entryFullId = functionId.startsWith('/') ? functionId.slice(1) : functionId;
-		let resolvedArgs = callArgs ? normaliseCallArgs(callArgs) : cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+		const storedArgs = getStoredCallArgs(functionId);
+		let resolvedArgs = callArgs
+			? normaliseCallArgs(callArgs)
+			: storedArgs
+				? cloneCallArgs(storedArgs)
+				: cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
 		let argsJson: string;
 		let hasExtractedArgs = false; // Track if we extracted args from parent
+		let parentTraceDetails: ParentTraceDetails | undefined;
 
 		// If this is a nested function, trace the parent chain recursively to get arguments
 		if (parentContext && !callArgs) {
-			// Helper function to trace a parent function and return its execution context
+			// Helper function to trace a parent function and return execution context plus tracer session
 			async function traceParentFunction(
 				parentId: string,
 				callLine: number,
 				parentStoredArgs: NormalisedCallArgs | undefined,
-				visited: Set<string> = new Set() // To detect circular dependencies
-			): Promise<{ locals: Record<string, unknown>, globals: Record<string, unknown>, file: string }> {
+				visited: Set<string> = new Set(),
+			): Promise<ParentTraceDetails> {
 				if (visited.has(parentId)) {
 					throw new Error(`Circular dependency detected: ${parentId}`);
 				}
@@ -1474,98 +1766,112 @@ async function handleTraceLine(
 				}
 
 				const parentEntryFullId = parentId.startsWith('/') ? parentId.slice(1) : parentId;
+				const parentSignature = await getFunctionSignature(
+					pythonPath,
+					currentRepoRoot!,
+					parentEntryFullId,
+					context.extensionPath,
+				);
+				const signatureParams = parentSignature?.params || [];
+				const hasRequiredParams = signatureParams.length > 0;
+				let effectiveParentArgs = parentStoredArgs;
 
-				// Check if parent function requires arguments
-				const parentSignature = await getFunctionSignature(pythonPath, currentRepoRoot!, parentEntryFullId, context.extensionPath);
-				const hasRequiredParams = parentSignature && parentSignature.params && parentSignature.params.length > 0;
-				
-				// If required params but no stored args, recursively trace up the chain to find a parent with stored args
-				if (hasRequiredParams && (!parentStoredArgs || (Object.keys(parentStoredArgs.kwargs || {}).length === 0 && (parentStoredArgs.args || []).length === 0))) {
+				if (hasRequiredParams && !hasCallArgs(effectiveParentArgs)) {
 					console.log('[extension] Parent function requires args but has none, searching call sites:', parentId);
-					// Try to find call sites and trace from grandparent (recursive case)
 					const callSites = await findCallSites(pythonPath, currentRepoRoot!, parentId, context.extensionPath);
-					
+
 					if (callSites && callSites.length > 0) {
 						console.log('[extension] Found', callSites.length, 'call sites for parent function');
+						let extractionError: Error | undefined;
 						for (const callSite of callSites) {
-							if (callSite.calling_function_id) {
-								const grandParentId = callSite.calling_function_id.startsWith('/') 
-									? callSite.calling_function_id 
-									: '/' + callSite.calling_function_id;
-								const grandParentStoredArgs = getStoredCallArgs(grandParentId);
-								
-								console.log('[extension] Checking call site from:', grandParentId, 'has stored args:', !!grandParentStoredArgs);
-								
-								if (grandParentStoredArgs) {
-									console.log('[extension] Found grandparent with stored args, tracing recursively:', grandParentId);
-									// Recursively trace grandparent to get parent's args
-									const grandParentEvent = await traceParentFunction(
-										grandParentId,
-										callSite.line,
-										grandParentStoredArgs,
-										visited
-									);
-									
-									console.log('[extension] Extracting parent args from grandparent execution at line', callSite.line);
-									// Extract parent's args from grandparent's execution
-									const extractedParentArgs = await extractCallArguments(
-										pythonPath,
-										currentRepoRoot!,
-										parentId,
-										callSite.file,
-										callSite.line,
-										grandParentEvent.locals,
-										grandParentEvent.globals,
-										context.extensionPath,
-									);
-									
-									if (extractedParentArgs && !('error' in extractedParentArgs)) {
-										parentStoredArgs = normaliseCallArgs(extractedParentArgs);
-										console.log('[extension] Successfully extracted parent args from grandparent:', parentStoredArgs);
-										break;
-									} else {
-										const error = extractedParentArgs && 'error' in extractedParentArgs ? extractedParentArgs.error : 'Unknown error';
-										console.warn('[extension] Failed to extract parent args from call site:', error);
-									}
-								}
+							if (!callSite.calling_function_id) {
+								continue;
 							}
+
+							const grandParentId = callSite.calling_function_id.startsWith('/')
+								? callSite.calling_function_id
+								: `/${callSite.calling_function_id}`;
+							const grandParentStoredArgs = getStoredCallArgs(grandParentId);
+
+							try {
+								const grandParentDetails = await traceParentFunction(
+									grandParentId,
+									callSite.line,
+									grandParentStoredArgs,
+									new Set(visited),
+								);
+
+								console.log('[extension] Extracting parent args from grandparent execution at line', callSite.line);
+								const extractedParentArgs = await extractCallArguments(
+									pythonPath,
+									currentRepoRoot!,
+									parentId,
+									callSite.file,
+									callSite.line,
+									grandParentDetails.context.locals,
+									grandParentDetails.context.globals,
+									context.extensionPath,
+								);
+
+								if (extractedParentArgs && !('error' in extractedParentArgs)) {
+									effectiveParentArgs = normaliseCallArgs(extractedParentArgs);
+									console.log('[extension] Successfully extracted parent args from grandparent:', effectiveParentArgs);
+									break;
+								}
+
+								const error = extractedParentArgs && 'error' in extractedParentArgs
+									? extractedParentArgs.error
+									: 'Unknown error';
+								console.warn('[extension] Failed to extract parent args from call site:', error);
+							} catch (error) {
+								extractionError = error instanceof Error ? error : new Error(String(error));
+								console.warn('[extension] Failed while tracing grandparent', grandParentId, 'at line', callSite.line, ':', extractionError.message);
+							}
+						}
+
+						if (!hasCallArgs(effectiveParentArgs) && extractionError) {
+							throw extractionError;
 						}
 					} else {
 						console.log('[extension] No call sites found for parent function:', parentId);
 					}
-					
-					// If still no args and function requires them, error
-					if (!parentStoredArgs || (Object.keys(parentStoredArgs.kwargs || {}).length === 0 && (parentStoredArgs.args || []).length === 0)) {
-						throw new Error(`Parent function ${parentId} requires arguments (${parentSignature.params.join(', ')}) but none were provided. Please provide arguments for the parent function first.`);
+
+					if (!hasCallArgs(effectiveParentArgs)) {
+						const signatureLabel = signatureParams.length > 0 ? ` (${signatureParams.join(', ')})` : '';
+						throw new Error(
+							`Arguments for ${parentId}${signatureLabel} are required. Please run the top-level function in the flow with its arguments before tracing nested calls.`,
+						);
 					}
 				}
-				
-				// Use stored args if available, otherwise empty args (valid for no-param functions)
-				const finalParentArgs = parentStoredArgs || cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
-				
-				// Check cache first to avoid redundant tracing
-				const cacheKey = getCacheKey(parentId, callLine, finalParentArgs);
-				const cached = parentExecutionContextCache.get(cacheKey);
-				if (cached) {
-					console.log('[extension] Using cached execution context for parent:', parentId);
-					return cached;
-				}
+
+				const finalParentArgs = effectiveParentArgs
+					? cloneCallArgs(effectiveParentArgs)
+					: cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+				setStoredCallArgs(parentId, finalParentArgs);
 
 				const parentArgsJson = JSON.stringify(finalParentArgs);
+				const parentTracer = getOrCreateTracerManager(
+					context,
+					currentRepoRoot!,
+					parentEntryFullId,
+					parentArgsJson,
+					flowPanel?.webview,
+				);
 
-				// Create or get tracer
-				if (!tracerOutputChannel) {
-					tracerOutputChannel = vscode.window.createOutputChannel('Linearizer Tracer');
+				const overrides: TracerContinueOptions = {
+					targetFile: resolveAbsolutePath(parentBody.file),
+					contextSuffix: `parent::${parentEntryFullId}::line:${callLine}`,
+				};
+				const parentFunctionName = getFunctionNameForDebugger(parentEntryFullId);
+				if (parentFunctionName) {
+					overrides.targetFunction = parentFunctionName;
 				}
-				if (!activeTracer) {
-					activeTracer = new TracerManager(tracerOutputChannel, flowPanel?.webview);
-				}
-				activeTracer.setWebview(flowPanel?.webview);
 
+				parentTracer.setSuppressWebviewEvents(true);
 				console.log('[extension] Tracing parent function:', parentEntryFullId, 'with args:', parentArgsJson);
-				
-				// Trace parent to the call line
-				const parentEvent = await activeTracer.getTracerData(
+
+				const cacheKey = getCacheKey(parentId, callLine, finalParentArgs);
+				const parentEvent = await parentTracer.getTracerData(
 					currentRepoRoot!,
 					parentEntryFullId,
 					callLine,
@@ -1573,66 +1879,71 @@ async function handleTraceLine(
 					parentArgsJson,
 					context.extensionPath,
 					pythonPath,
-					true, // suppressWebview = true: don't display parent events
+					true,
+					callLine,
+					overrides,
 				);
 
 				if (parentEvent.event === 'error') {
 					throw new Error(`Error tracing parent function ${parentId}: ${parentEvent.error || 'Unknown error'}`);
 				}
 
-				const result = {
+				const executionContext: ExecutionContext = {
 					locals: parentEvent.locals || {},
 					globals: parentEvent.globals || {},
 					file: parentBody.file,
 				};
 
-				// Cache the result
-				parentExecutionContextCache.set(cacheKey, result);
+				parentExecutionContextCache.set(cacheKey, executionContext);
 				console.log('[extension] Cached execution context for parent:', parentId);
 
-				return result;
+				const parentArgsKey = getArgsContextKey(parentEntryFullId, finalParentArgs);
+				const prevLine = lastExecutedLineByContext.get(parentArgsKey) ?? 0;
+				lastExecutedLineByContext.set(parentArgsKey, Math.max(prevLine, callLine));
+				parentTracer.setSuppressWebviewEvents(false);
+
+				return {
+					tracer: parentTracer,
+					args: finalParentArgs,
+					argsJson: parentArgsJson,
+					entryFullId: parentEntryFullId,
+					body: parentBody,
+					context: executionContext,
+				};
 			}
 
 			try {
-				// Get parent's stored args (from message or stored state)
 				let parentStoredArgs: NormalisedCallArgs | undefined = parentContext.parentCallArgs
 					? normaliseCallArgs(parentContext.parentCallArgs)
 					: getStoredCallArgs(parentContext.parentFunctionId);
 
-				// Trace the parent function to get its execution context
-				const parentEvent = await traceParentFunction(
+				const parentDetails = await traceParentFunction(
 					parentContext.parentFunctionId,
 					parentContext.callLine,
-					parentStoredArgs
+					parentStoredArgs,
 				);
 
-				// Extract call arguments for the nested function (functionId) from parent's execution
-				// This automatically filters args to match the nested function's signature
+				parentTraceDetails = parentDetails;
+
 				const extractedArgs = await extractCallArguments(
 					pythonPath,
 					currentRepoRoot!,
-					functionId, // The nested function being called
-					parentEvent.file, // The parent function's file where the call happens
+					functionId,
+					parentDetails.context.file,
 					parentContext.callLine,
-					parentEvent.locals,
-					parentEvent.globals,
+					parentDetails.context.locals,
+					parentDetails.context.globals,
 					context.extensionPath,
 				);
 
 				if (extractedArgs && !('error' in extractedArgs)) {
-					// extractCallArguments already filters args to match the function's signature
 					resolvedArgs = normaliseCallArgs(extractedArgs);
-					hasExtractedArgs = true; // Mark that we have extracted args
+					hasExtractedArgs = true;
 					console.log('[extension] Extracted and filtered args for nested function:', resolvedArgs);
 				} else {
 					const errorMsg = extractedArgs && 'error' in extractedArgs ? extractedArgs.error : 'Failed to extract call arguments';
 					vscode.window.showErrorMessage(`Error extracting arguments from parent function: ${errorMsg}`);
 					return;
-				}
-				
-				// Reset suppress flag so nested function events will be displayed
-				if (activeTracer) {
-					activeTracer.setSuppressWebviewEvents(false);
 				}
 			} catch (error) {
 				vscode.window.showErrorMessage(`Error tracing parent function: ${error instanceof Error ? error.message : String(error)}`);
@@ -1641,61 +1952,124 @@ async function handleTraceLine(
 		}
 
 		// If we have callArgs or extracted args from parent, use them directly
-		// For nested functions, we should always extract args from parent - never prompt for input
 		if (callArgs || hasExtractedArgs) {
+			setStoredCallArgs(functionId, resolvedArgs);
 			argsJson = JSON.stringify(resolvedArgs);
 		} else {
-			// Only prompt for input if this is a top-level parent function (not nested)
-			// If nested, we should have extracted args from parent above
-			if (!parentContext) {
-				const signature = await getFunctionSignature(pythonPath, currentRepoRoot, entryFullId, context.extensionPath);
-				const defaultJson = JSON.stringify(resolvedArgs);
-				if (signature && signature.params.length > 0) {
-					const paramInput = await vscode.window.showInputBox({
-						prompt: `Enter function arguments as JSON (params: ${signature.params.join(', ')}). Example: {"args": [1, 2], "kwargs": {"key": "value"}}`,
-						placeHolder: defaultJson,
-						value: defaultJson,
-					});
-
-					if (paramInput === undefined) {
-						return; // User cancelled
-					}
-
-					if (paramInput.trim()) {
-						try {
-							const parsed = JSON.parse(paramInput);
-							if (!isTraceCallArgs(parsed)) {
-								throw new Error('Invalid argument structure');
-							}
-							resolvedArgs = normaliseCallArgs(parsed);
-						} catch {
-							vscode.window.showErrorMessage('Invalid JSON format for arguments');
-							return;
-						}
-					} else {
-						resolvedArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
-					}
-				}
-			} else {
-				// This is a nested function but we somehow didn't extract args
-				// This shouldn't happen, but just use empty args as fallback
-				resolvedArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+			if (parentContext) {
+				// Nested function without extracted args – abort and ask user to run parent first
+				vscode.window.showErrorMessage(
+					`Unable to resolve arguments for ${functionId}. Trace the parent function in the flow first so its arguments are captured.`,
+				);
+				return;
 			}
+
+			const signature = await getFunctionSignature(pythonPath, currentRepoRoot, entryFullId, context.extensionPath);
+			const params = signature?.params ?? [];
+			if (params.length > 0 && !hasCallArgs(resolvedArgs)) {
+				const functionName = entryFullId.split('::').pop() || entryFullId;
+				if (flowPanel?.webview) {
+					flowPanel.webview.postMessage({
+						type: 'show-args-form',
+						functionId,
+						params,
+						functionName,
+					});
+				}
+				vscode.window.showInformationMessage(
+					`Arguments are required for ${functionName}. Use the flow panel to provide them, then trace again.`,
+				);
+				return;
+			}
+
+			// No parameters or arguments already stored – continue with defaults
+			setStoredCallArgs(functionId, resolvedArgs);
 			argsJson = JSON.stringify(resolvedArgs);
 		}
 
-		// Create or reuse tracer
-		if (!tracerOutputChannel) {
-			tracerOutputChannel = vscode.window.createOutputChannel('Linearizer Tracer');
+		if (parentTraceDetails && !callArgs) {
+			const nestedOverrides: TracerContinueOptions = {
+				targetFile: resolveAbsolutePath(functionBody.file),
+				contextSuffix: `nested::${parentTraceDetails.entryFullId}::${functionId}`,
+			};
+			const nestedFunctionName = getFunctionNameForDebugger(functionId);
+			if (nestedFunctionName) {
+				nestedOverrides.targetFunction = nestedFunctionName;
+			}
+
+			try {
+				const event = await parentTraceDetails.tracer.getTracerData(
+					currentRepoRoot,
+					parentTraceDetails.entryFullId,
+					displayLine,
+					functionBody.file,
+					parentTraceDetails.argsJson,
+					context.extensionPath,
+					pythonPath,
+					false,
+					executionLine,
+					nestedOverrides,
+				);
+
+				if (event.event === 'error') {
+					const errorMessage = event.error || 'Unknown tracer error';
+					vscode.window.showErrorMessage(`Tracer error: ${errorMessage}`);
+					return;
+				}
+
+				const executionContextKey = getCacheKey(functionId, executionLine, resolvedArgs);
+				parentExecutionContextCache.set(executionContextKey, {
+					locals: { ...(event.locals ?? {}) },
+					globals: { ...(event.globals ?? {}) },
+					file: functionBody.file,
+				});
+
+				const nestedEntryFullId = functionId.startsWith('/') ? functionId.slice(1) : functionId;
+				const argsKey = getArgsContextKey(nestedEntryFullId, resolvedArgs);
+				const prevExecutedLine = lastExecutedLineByContext.get(argsKey) ?? 0;
+				lastExecutedLineByContext.set(argsKey, Math.max(prevExecutedLine, executionLine));
+
+				if (flowPanel?.webview) {
+					const finalEvent = {
+						...event,
+						line: displayLine,
+						filename: event.filename ?? functionBody.file,
+					};
+					flowPanel.webview.postMessage({
+						type: 'tracer-event',
+						event: finalEvent,
+					});
+				}
+
+				vscode.window.showInformationMessage(`Tracer reached line ${displayLine} in ${functionId}`);
+				return;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				vscode.window.showErrorMessage(`Tracer error: ${message}`);
+
+				if (flowPanel?.webview) {
+					flowPanel.webview.postMessage({
+						type: 'tracer-error',
+						error: message,
+						line: displayLine,
+						filename: functionBody.file,
+					});
+				}
+				return;
+			}
 		}
-		if (!activeTracer) {
-			activeTracer = new TracerManager(tracerOutputChannel, flowPanel?.webview);
-		}
-		// Update webview reference in case it changed
-		activeTracer.setWebview(flowPanel?.webview);
-		
+
+		const tracerManager = getOrCreateTracerManager(
+			context,
+			currentRepoRoot,
+			entryFullId,
+			argsJson,
+			flowPanel?.webview,
+		);
+		tracerManager.setSuppressWebviewEvents(false);
+
 		try {
-			const event = await activeTracer.getTracerData(
+			const event = await tracerManager.getTracerData(
 				currentRepoRoot,
 				entryFullId,
 				displayLine,
@@ -1703,6 +2077,8 @@ async function handleTraceLine(
 				argsJson,
 				context.extensionPath,
 				pythonPath,
+				false,
+				executionLine,
 			);
 
 			if (event.event === 'error') {
@@ -1711,7 +2087,17 @@ async function handleTraceLine(
 				return;
 			}
 
-			
+			const executionContextKey = getCacheKey(functionId, executionLine, resolvedArgs);
+			parentExecutionContextCache.set(executionContextKey, {
+				locals: { ...(event.locals ?? {}) },
+				globals: { ...(event.globals ?? {}) },
+				file: functionBody.file,
+			});
+
+			const argsKey = getArgsContextKey(entryFullId, resolvedArgs);
+			const prevExecutedLine = lastExecutedLineByContext.get(argsKey) ?? 0;
+			lastExecutedLineByContext.set(argsKey, Math.max(prevExecutedLine, executionLine));
+
 			if (flowPanel?.webview) {
 				// Ensure we only send one event with the exact displayLine
 				// Override any line number from the tracer to match the clicked line

@@ -21,10 +21,12 @@
     loadingCallSites: new Set(), // Set of functionIds for which we're loading call sites
     selectedCallSite: new Map(), // functionId -> selected call site
     functionSignatures: new Map(), // functionId -> Array of parameter names
+    functionParamTypes: new Map(), // functionId -> Array of parameter types
+    functionParamDefaults: new Map(), // functionId -> Array of parameter default values
     loadingSignatures: new Set(), // Set of functionIds for which we're loading signatures
     lastClickedLine: new Map(), // functionId -> { line, stopLine } - track last clicked line for execution
-    argsFormVisible: false, // Whether the arguments form modal is visible
-    argsFormData: null, // { functionId, params: [] }
+    expandedCallSites: new Set(), // Set of parentIds with expanded call sites
+    expandedArgs: new Set(), // Set of parentIds with expanded args section
     tracingParent: new Set(), // Set of parent functionIds currently being traced
     tracingChild: new Set(), // Set of child functionIds currently being traced
   };
@@ -121,12 +123,45 @@
   }
 
   function cloneArgs(args) {
-    return {
-      args: Array.isArray(args && args.args) ? [].concat(args.args) : [],
-      kwargs: args && args.kwargs && typeof args.kwargs === 'object' && args.kwargs !== null
-        ? Object.assign({}, args.kwargs)
-        : {},
+    const cloned = {
+      args: [],
+      kwargs: {}
     };
+    
+    // Deep clone args array, preserving Python expressions
+    if (Array.isArray(args && args.args)) {
+      cloned.args = args.args.map(function(arg) {
+        if (typeof arg === 'object' && arg !== null && arg.__python_expr__) {
+          // Preserve Python expression format
+          return { __python_expr__: true, __value__: arg.__value__ };
+        }
+        try {
+          return JSON.parse(JSON.stringify(arg));
+        } catch {
+          return arg;
+        }
+      });
+    }
+    
+    // Deep clone kwargs object, preserving Python expressions
+    if (args && args.kwargs && typeof args.kwargs === 'object' && args.kwargs !== null) {
+      for (const key in args.kwargs) {
+        if (args.kwargs.hasOwnProperty(key)) {
+          const val = args.kwargs[key];
+          if (typeof val === 'object' && val !== null && val.__python_expr__) {
+            cloned.kwargs[key] = { __python_expr__: true, __value__: val.__value__ };
+          } else {
+            try {
+              cloned.kwargs[key] = JSON.parse(JSON.stringify(val));
+            } catch {
+              cloned.kwargs[key] = val;
+            }
+          }
+        }
+      }
+    }
+    
+    return cloned;
   }
 
   function normalisePath(value) {
@@ -180,15 +215,75 @@
     return stored ? cloneArgs(stored) : null;
   }
 
-  function setCallArgsForFunction(functionId, args) {
+  function setCallArgsForFunction(functionId, args, options) {
     if (!functionId || !args) {
       return;
     }
-    state.callArgsByFunction.set(functionId, cloneArgs(args));
+    const settings = options || {};
+    const shouldSync = settings.sync !== false;
+    const cloned = cloneArgs(args);
+    state.callArgsByFunction.set(functionId, cloned);
+    if (shouldSync && typeof vscode !== 'undefined') {
+      vscode.postMessage({
+        type: 'store-call-args',
+        functionId,
+        args: cloned,
+      });
+    }
   }
 
   function makePendingKey(functionId, line) {
     return functionId + '::' + line;
+  }
+
+  function hasValues(record) {
+    if (!record) {
+      return false;
+    }
+    const locals = record.locals && typeof record.locals === 'object' ? record.locals : null;
+    const globals = record.globals && typeof record.globals === 'object' ? record.globals : null;
+    const hasLocals = locals ? Object.keys(locals).length > 0 : false;
+    const hasGlobals = globals ? Object.keys(globals).length > 0 : false;
+    return hasLocals || hasGlobals;
+  }
+
+  function mergeTraceEvents(existing, incoming) {
+    if (!existing) {
+      return incoming;
+    }
+
+    const merged = Object.assign({}, existing, incoming);
+
+    if (!incoming || !incoming.locals || Object.keys(incoming.locals || {}).length === 0) {
+      if (existing.locals) {
+        merged.locals = existing.locals;
+      }
+    }
+
+    if (!incoming || !incoming.globals || Object.keys(incoming.globals || {}).length === 0) {
+      if (existing.globals) {
+        merged.globals = existing.globals;
+      }
+    }
+
+    if ((!incoming || !incoming.filename) && existing.filename) {
+      merged.filename = existing.filename;
+    }
+
+    if ((!incoming || !incoming.function) && existing.function) {
+      merged.function = existing.function;
+    }
+
+    if ((!incoming || !incoming.event) && existing.event) {
+      merged.event = existing.event;
+    }
+
+    if (!hasValues(incoming) && hasValues(existing)) {
+      merged.locals = existing.locals;
+      merged.globals = existing.globals;
+    }
+
+    return merged;
   }
 
   const flowMap = buildFlowMap(flows);
@@ -199,7 +294,7 @@
 
   parents.forEach(function(parentId) {
     if (!state.callArgsByFunction.has(parentId)) {
-      state.callArgsByFunction.set(parentId, cloneArgs(DEFAULT_PARENT_ARGS));
+      setCallArgsForFunction(parentId, DEFAULT_PARENT_ARGS, { sync: false });
     }
   });
 
@@ -225,7 +320,7 @@
     } else if (message.type === 'call-site-args-extracted' && typeof message.functionId === 'string' && message.args) {
       // Arguments extracted from call site - store them and update UI
       console.log('[flowPanel] Received extracted args for', message.functionId, ':', message.args);
-      state.callArgsByFunction.set(message.functionId, cloneArgs(message.args));
+      setCallArgsForFunction(message.functionId, message.args);
       render();
     } else if (message.type === 'call-site-args-error' && typeof message.functionId === 'string') {
       console.error('[flowPanel] Error extracting args from call site:', message.error);
@@ -236,49 +331,38 @@
         // Add or update event in the array
         const eventData = message.event;
         
-        // Remove only events for the EXACT same line and file to prevent duplicates
-        // Keep events for other lines so previously clicked lines remain visible
-        if (state.tracerEvents && eventData.filename && eventData.line !== undefined) {
-          const eventFile = eventData.filename.replace(/\\/g, '/');
-          const eventLine = eventData.line;
-          console.log('[flowPanel] Received event - line:', eventLine, 'file:', eventFile);
-          state.tracerEvents = state.tracerEvents.filter(function(e) {
-            if (!e.filename || e.line === undefined) return true; // Keep events without filename or line
-            const eFile = e.filename.replace(/\\/g, '/');
-            // Only remove events for the same file AND EXACT same line
-            // This allows multiple lines to have events simultaneously
-            if (eFile === eventFile || eventFile.endsWith(eFile) || eFile.endsWith(eventFile)) {
-              // Remove only if it's the EXACT same line (not adjacent)
-              if (e.line === eventLine) {
-                console.log('[flowPanel] Removing event at line:', e.line, 'for file:', eFile, '(exact match with', eventLine, ')');
-                return false;
-              }
+        const eventLine = typeof eventData.line === 'number' ? eventData.line : undefined;
+        const eventFile = eventData.filename ? normalisePath(eventData.filename) : '';
+        let mergedIntoExisting = false;
+
+        if (eventLine !== undefined) {
+          for (let i = 0; i < state.tracerEvents.length; i += 1) {
+            const existing = state.tracerEvents[i];
+            const existingLine = typeof existing.line === 'number' ? existing.line : undefined;
+            if (existingLine !== eventLine) {
+              continue;
             }
-            return true; // Keep events for other lines or other files
-          });
+
+            const existingFile = existing.filename ? normalisePath(existing.filename) : '';
+            const filesMatch = (!eventFile || !existingFile)
+              ? true
+              : (existingFile === eventFile || existingFile.endsWith(eventFile) || eventFile.endsWith(existingFile));
+
+            if (!filesMatch) {
+              continue;
+            }
+
+            const merged = mergeTraceEvents(existing, eventData);
+            state.tracerEvents[i] = merged;
+            mergedIntoExisting = true;
+            console.log('[flowPanel] Merged tracer event into existing line:', eventLine, 'file:', eventFile || '<unknown>');
+            break;
+          }
         }
-        
-        // Check if event already exists for this exact line and file
-        const eventKey = `${eventData.line}:${eventData.filename || ''}`;
-        const duplicateExists = state.tracerEvents.some(function(e) {
-          const eKey = `${e.line}:${e.filename || ''}`;
-          return eKey === eventKey;
-        });
-        
-        if (!duplicateExists) {
-          // Add the new event
+
+        if (!mergedIntoExisting) {
           console.log('[flowPanel] Adding event at line:', eventData.line, 'for file:', eventData.filename);
           state.tracerEvents.push(eventData);
-        } else {
-          // Update existing event instead of adding duplicate
-          const existingIndex = state.tracerEvents.findIndex(function(e) {
-            const eKey = `${e.line}:${e.filename || ''}`;
-            return eKey === eventKey;
-          });
-          if (existingIndex >= 0) {
-            state.tracerEvents[existingIndex] = eventData;
-            console.log('[flowPanel] Updated existing event at line:', eventData.line);
-          }
         }
 
         const functionIdForEvent = findFunctionIdForEvent(eventData);
@@ -322,20 +406,25 @@
       // Store function signature
       state.loadingSignatures.delete(message.functionId);
       state.functionSignatures.set(message.functionId, message.params);
-      render();
-    } else if (message.type === 'show-args-form' && typeof message.functionId === 'string') {
-      // Show the arguments form modal
-      state.argsFormVisible = true;
-      state.argsFormData = {
-        functionId: message.functionId,
-        params: Array.isArray(message.params) ? message.params : [],
-        functionName: typeof message.functionName === 'string' ? message.functionName : null,
-      };
-      // Also store signature for later use
-      if (Array.isArray(message.params)) {
-        state.functionSignatures.set(message.functionId, message.params);
+      if (Array.isArray(message.paramTypes)) {
+        state.functionParamTypes.set(message.functionId, message.paramTypes);
+      }
+      if (Array.isArray(message.paramDefaults)) {
+        state.functionParamDefaults.set(message.functionId, message.paramDefaults);
       }
       render();
+    } else if (message.type === 'show-args-form' && typeof message.functionId === 'string') {
+      // Store function signature (we use inline args section instead of modal)
+      if (Array.isArray(message.params)) {
+        state.functionSignatures.set(message.functionId, message.params);
+        if (Array.isArray(message.paramTypes)) {
+          state.functionParamTypes.set(message.functionId, message.paramTypes);
+        }
+        if (Array.isArray(message.paramDefaults)) {
+          state.functionParamDefaults.set(message.functionId, message.paramDefaults);
+        }
+        render();
+      }
       
       // Focus first input field
       setTimeout(function() {
@@ -363,71 +452,9 @@
     }
   });
 
-  // Handle Escape key to close modal
-  document.addEventListener('keydown', function(event) {
-    if (event.key === 'Escape' && state.argsFormVisible) {
-      state.argsFormVisible = false;
-      state.argsFormData = null;
-      render();
-    }
-  });
 
-  // Handle form submission
-  root.addEventListener('submit', (event) => {
-    if (event.target instanceof HTMLFormElement && event.target.classList.contains('args-form')) {
-      event.preventDefault();
-      const form = event.target;
-      const functionId = form.getAttribute('data-function-id');
-      if (!functionId) return;
-      
-      const inputs = form.querySelectorAll('.form-input');
-      const kwargs = {};
-      
-      inputs.forEach(function(input) {
-        const paramName = input.getAttribute('data-param');
-        const value = input.value.trim();
-        
-        if (value) {
-          // Try to parse as JSON first (supports strings, numbers, booleans, null, arrays, objects)
-          try {
-            kwargs[paramName] = JSON.parse(value);
-          } catch {
-            // If JSON parsing fails, treat as a plain string
-            kwargs[paramName] = value;
-          }
-        }
-      });
-      
-      // Store arguments locally - execution will happen when user clicks a line
-      setCallArgsForFunction(functionId, { args: [], kwargs: kwargs });
-      
-      // Also notify extension to store the args so recursive tracing can find them
-      vscode.postMessage({
-        type: 'store-call-args',
-        functionId: functionId,
-        args: { args: [], kwargs: kwargs },
-      });
-      
-      // Hide form
-      state.argsFormVisible = false;
-      state.argsFormData = null;
-      render();
-      return;
-    }
-  });
 
   root.addEventListener('click', (event) => {
-    // Prevent clicks inside the modal from closing it (except for buttons with actions)
-    const modal = root.querySelector('.args-form-modal');
-    if (modal && modal.contains(event.target)) {
-      const clickedElement = event.target;
-      // Allow clicks on buttons with data-action (like Cancel, Close buttons)
-      if (clickedElement.tagName !== 'BUTTON' || !clickedElement.hasAttribute('data-action')) {
-        // For non-button elements or buttons without actions, stop here to prevent closing
-        return;
-      }
-    }
-    
     const target = findActionTarget(event.target);
     if (!target) {
       return;
@@ -445,6 +472,28 @@
       const parent = target.getAttribute('data-parent');
       if (parent) {
         toggleParent(parent);
+      }
+    } else if (action === 'toggle-call-sites') {
+      const parentId = target.getAttribute('data-parent-id');
+      if (parentId) {
+        const wasExpanded = state.expandedCallSites.has(parentId);
+        if (wasExpanded) {
+          state.expandedCallSites.delete(parentId);
+        } else {
+          state.expandedCallSites.add(parentId);
+        }
+        render();
+      }
+    } else if (action === 'toggle-args') {
+      const parentId = target.getAttribute('data-parent-id');
+      if (parentId) {
+        const wasExpanded = state.expandedArgs.has(parentId);
+        if (wasExpanded) {
+          state.expandedArgs.delete(parentId);
+        } else {
+          state.expandedArgs.add(parentId);
+        }
+        render();
       }
     } else if (action === 'toggle-call') {
       const call = target.getAttribute('data-call');
@@ -481,38 +530,59 @@
           const args = [];
           const kwargs = {};
           
+          // Helper function to parse argument value (supports JSON and Python expressions)
+          function parseArgumentValue(value) {
+            const trimmed = value.trim();
+            if (!trimmed) {
+              return null;
+            }
+            
+            // Try JSON first (for simple values)
+            try {
+              const parsed = JSON.parse(trimmed);
+              // Check if it's a simple JSON value (not a string that looks like code)
+              if (typeof parsed === 'string' && (trimmed.startsWith('get_') || trimmed.includes('()') || trimmed.includes('(') && trimmed.includes(')'))) {
+                // Looks like a function call - treat as Python expression
+                return {
+                  __python_expr__: true,
+                  __value__: trimmed
+                };
+              }
+              return parsed;
+            } catch {
+              // Not valid JSON - check if it looks like Python code
+              // If it contains function calls, class instantiation, etc., treat as Python expression
+              if (trimmed.includes('(') || trimmed.includes('[') || trimmed.includes('.') || 
+                  trimmed.match(/^[A-Z][a-zA-Z0-9_]*\(/) || trimmed.startsWith('get_') || trimmed.startsWith('create_')) {
+                return {
+                  __python_expr__: true,
+                  __value__: trimmed
+                };
+              }
+              // Otherwise treat as plain string (fallback)
+              return trimmed;
+            }
+          }
+          
           // Collect all args and kwargs from inputs
           // Use arrays to maintain order for positional args
           const argsByIndex = [];
           argInputs.forEach(function(input) {
             const argType = input.getAttribute('data-arg-type');
             const value = input.value.trim();
+            const parsed = parseArgumentValue(value);
+            
+            if (parsed === null) {
+              // Empty value - skip this argument
+              return;
+            }
             
             if (argType === 'args') {
               const index = parseInt(input.getAttribute('data-arg-index'), 10);
-              if (value) {
-                try {
-                  // Try to parse as JSON first
-                  argsByIndex[index] = JSON.parse(value);
-                } catch {
-                  // If JSON parsing fails, treat as plain string
-                  argsByIndex[index] = value;
-                }
-              } else {
-                // Empty value - skip this argument (don't include it)
-              }
+              argsByIndex[index] = parsed;
             } else if (argType === 'kwargs') {
               const key = input.getAttribute('data-arg-key');
-              if (value) {
-                try {
-                  // Try to parse as JSON first
-                  kwargs[key] = JSON.parse(value);
-                } catch {
-                  // If JSON parsing fails, treat as plain string
-                  kwargs[key] = value;
-                }
-              }
-              // If empty, just don't include this kwarg (which removes it)
+              kwargs[key] = parsed;
             }
           });
           
@@ -524,12 +594,8 @@
           }
           
           // Store the updated arguments (create new object to ensure reference is updated)
-          // Use Object.assign or spread to ensure we create a completely new object
-          const newArgs = { 
-            args: JSON.parse(JSON.stringify(args)), // Deep clone to ensure new reference
-            kwargs: JSON.parse(JSON.stringify(kwargs)) 
-          };
-          state.callArgsByFunction.set(parentId, newArgs);
+          const newArgs = cloneArgs({ args: args, kwargs: kwargs });
+          setCallArgsForFunction(parentId, newArgs);
           console.log('[flowPanel] Saved arguments for', parentId, ':', newArgs);
           // Force a verification read to ensure it's stored
           const verifyStored = state.callArgsByFunction.get(parentId);
@@ -560,20 +626,55 @@
     } else if (action === 'execute-with-args') {
       const parentId = target.getAttribute('data-parent-id');
       if (parentId) {
-        // Request function signature first, then show form
-        vscode.postMessage({
-          type: 'request-args-form',
-          functionId: parentId,
-        });
-      }
-    } else if (action === 'close-args-form') {
-      // Only close if clicking directly on the overlay, not on the modal content
-      const clickedElement = event.target;
-      const modal = root.querySelector('.args-form-modal');
-      if (modal && (clickedElement === target || !modal.contains(clickedElement))) {
-        state.argsFormVisible = false;
-        state.argsFormData = null;
+        // Expand the parent if not already expanded to show the args section
+        if (!state.expandedParents.has(parentId)) {
+          state.expandedParents.add(parentId);
+          // Request call sites when expanding
+          if (!state.callSitesByFunction.has(parentId) && !state.loadingCallSites.has(parentId)) {
+            state.loadingCallSites.add(parentId);
+            console.log('[flowPanel] Requesting call sites for parent:', parentId);
+            vscode.postMessage({ type: 'find-call-sites', functionId: parentId });
+          }
+        }
+        // Expand the args section
+        state.expandedArgs.add(parentId);
+        // Request function signature if not already loaded
+        if (!state.functionSignatures.has(parentId) && !state.loadingSignatures.has(parentId)) {
+          state.loadingSignatures.add(parentId);
+          vscode.postMessage({
+            type: 'request-function-signature',
+            functionId: parentId,
+          });
+        }
         render();
+      }
+    } else if (action === 'insert-template') {
+      const template = target.getAttribute('data-template');
+      const argType = target.getAttribute('data-arg-type');
+      const inputIndex = target.getAttribute('data-input-index');
+      const argKey = target.getAttribute('data-arg-key');
+      
+      if (template) {
+        // Find the corresponding input
+        let input = null;
+        if (argType === 'args' && inputIndex !== null) {
+          input = root.querySelector('.arg-input[data-arg-type="args"][data-arg-index="' + escapeCss(inputIndex) + '"]');
+        } else if (argType === 'kwargs' && argKey) {
+          input = root.querySelector('.arg-input[data-arg-type="kwargs"][data-arg-key="' + escapeCss(argKey) + '"]');
+        }
+        
+        if (input) {
+          input.value = template;
+          input.focus();
+          // Trigger input event to update any listeners
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      }
+    } else if (action === 'show-help') {
+      const helpText = target.getAttribute('data-help');
+      if (helpText) {
+        // Show help in a simple alert for now (could be enhanced with a tooltip)
+        alert(helpText);
       }
     } else if (action === 'open-source') {
       const identifier = target.getAttribute('data-target');
@@ -725,7 +826,6 @@
     } else {
       content = parents.map((parentId) => renderParentBlock(parentId)).join('');
     }
-    content += renderArgsFormModal();
     content += renderLoadingOverlay();
     root.innerHTML = content;
   }
@@ -753,74 +853,92 @@
       '</div>';
   }
 
-  function renderArgsFormModal() {
-    if (!state.argsFormVisible || !state.argsFormData) {
-      return '';
+
+  // Helper function to get type-aware placeholder and template based on parameter name and type
+  function getTypeHelper(paramName, paramType) {
+    const nameLower = paramName.toLowerCase();
+    
+    // Common patterns based on parameter name
+    if (nameLower.includes('db') || nameLower.includes('connection') || nameLower.includes('conn')) {
+      return {
+        placeholder: 'Python: get_db() or create_connection()',
+        template: 'get_db()',
+        helpText: 'Database connections are typically singletons. Use the function that provides the connection.'
+      };
     }
     
-    const { functionId, params, functionName } = state.argsFormData;
-    const functionDisplay = functionName || extractDisplayName(functionId);
-    
-    let formFields = '';
-    if (params && params.length > 0) {
-      params.forEach(function(paramName, index) {
-        formFields += `
-          <div class="form-field">
-            <label for="param-${index}" class="form-label">${escapeHtml(paramName)}</label>
-            <input 
-              type="text" 
-              id="param-${index}" 
-              class="form-input" 
-              data-param="${escapeAttribute(paramName)}"
-              placeholder="Enter value (JSON: strings use quotes, numbers/booleans without quotes)"
-              autocomplete="off"
-            />
-          </div>
-        `;
-      });
-    } else {
-      formFields = '<div class="form-field"><p class="form-info">This function has no parameters.</p></div>';
+    if (nameLower.includes('session')) {
+      return {
+        placeholder: 'Python: get_session() or Session()',
+        template: 'get_session()',
+        helpText: 'Session objects usually come from a factory or singleton.'
+      };
     }
     
-    return `
-      <div class="args-form-overlay" data-action="close-args-form">
-        <div class="args-form-modal">
-          <div class="args-form-header">
-            <h3 class="args-form-title">Function Arguments</h3>
-            <button type="button" class="args-form-close" data-action="close-args-form" aria-label="Close">&times;</button>
-          </div>
-          <div class="args-form-body">
-            <div class="args-form-info">
-              <div class="args-form-function-name">
-                <span class="info-label">Function:</span>
-                <span class="info-value">${escapeHtml(functionDisplay)}</span>
-              </div>
-            </div>
-            <form class="args-form" data-function-id="${escapeAttribute(functionId)}">
-              ${formFields}
-              <div class="form-help-text">
-                <span class="help-icon">💡</span>
-                <span>After saving, click any line number in the function to execute it with these arguments.</span>
-              </div>
-              <div class="form-actions">
-                <button type="button" class="form-btn form-btn-secondary" data-action="close-args-form">Cancel</button>
-                <button type="submit" class="form-btn form-btn-primary">Done</button>
-              </div>
-            </form>
-          </div>
-        </div>
-      </div>
-    `;
+    if (nameLower.includes('cache') || nameLower.includes('redis')) {
+      return {
+        placeholder: 'Python: get_cache() or Cache()',
+        template: 'get_cache()',
+        helpText: 'Cache instances are typically shared singletons.'
+      };
+    }
+    
+    if (nameLower.includes('config') || nameLower.includes('settings')) {
+      return {
+        placeholder: 'Python: get_config() or Settings()',
+        template: 'get_config()',
+        helpText: 'Configuration is usually loaded from environment or config files.'
+      };
+    }
+    
+    if (nameLower.includes('client') || nameLower.includes('api')) {
+      return {
+        placeholder: 'Python: get_client() or Client()',
+        template: 'get_client()',
+        helpText: 'API clients are often singletons or factory-created instances.'
+      };
+    }
+    
+    // Type-based patterns
+    if (paramType) {
+      const typeLower = paramType.toLowerCase();
+      if (typeLower.includes('dict') || typeLower.includes('mapping') || typeLower.includes('dict[')) {
+        return {
+          placeholder: 'JSON: {"key": "value"} or Python: dict(...)',
+          template: '{}',
+          helpText: 'Enter as JSON object or Python dict expression.'
+        };
+      }
+      if (typeLower.includes('list') || typeLower.includes('array') || typeLower.includes('sequence') || typeLower.includes('list[')) {
+        return {
+          placeholder: 'JSON: [1, 2, 3] or Python: list(...)',
+          template: '[]',
+          helpText: 'Enter as JSON array or Python list expression.'
+        };
+      }
+      if (typeLower.includes('class') || typeLower.includes('type') || !typeLower.match(/^(str|int|float|bool|none|dict|list|tuple|set|optional|union)/)) {
+        return {
+          placeholder: 'Python expression: ClassName() or get_instance()',
+          template: '',
+          helpText: 'Complex objects require Python expressions that evaluate to the expected type.'
+        };
+      }
+    }
+    
+    // Default
+    return {
+      placeholder: 'JSON value or Python expression',
+      template: '',
+      helpText: 'Enter a JSON value (strings, numbers, booleans, arrays, objects) or a Python expression.'
+    };
   }
 
   function renderParentArgsSection(parentId) {
-    const storedArgs = getCallArgsForFunction(parentId);
-    if (!storedArgs || (storedArgs.args.length === 0 && Object.keys(storedArgs.kwargs || {}).length === 0)) {
-      return '<div class="parent-args-section"><div class="placeholder mini">No arguments set. Select a call site or provide arguments manually.</div></div>';
-    }
-
     // Get function signature to map parameter names
     const params = state.functionSignatures.get(parentId);
+    const paramTypes = state.functionParamTypes.get(parentId);
+    const paramDefaults = state.functionParamDefaults.get(parentId);
+    
     if (!params && !state.loadingSignatures.has(parentId)) {
       // Request function signature
       state.loadingSignatures.add(parentId);
@@ -830,45 +948,208 @@
       });
     }
 
+    const storedArgs = getCallArgsForFunction(parentId);
+    const hasArgs = storedArgs && (storedArgs.args.length > 0 || Object.keys(storedArgs.kwargs || {}).length > 0);
+    const isExpanded = state.expandedArgs.has(parentId);
+
     let html = '<div class="parent-args-section">';
-    html += '<div class="parent-args-header">Function Arguments:</div>';
-    html += '<div class="parent-args-content">';
+    html += '<button type="button" class="section-toggle" data-action="toggle-args" data-parent-id="' + escapeAttribute(parentId) + '">';
+    html += '<span class="chevron ' + (isExpanded ? 'open' : '') + '"></span>';
     
-    // Render positional arguments with parameter names
-    if (storedArgs.args && storedArgs.args.length > 0) {
-      html += '<div class="args-group">';
-      html += '<div class="args-group-label">Positional Arguments:</div>';
-      storedArgs.args.forEach(function(arg, index) {
-        // Format value for display - use JSON.stringify for all values
-        const valueStr = JSON.stringify(arg);
-        // Use parameter name if available, otherwise use index
-        const paramName = params && params[index] ? params[index] : '[' + index + ']';
-        html += '<div class="arg-item">';
-        html += '<label class="arg-label">' + escapeHtml(paramName) + ':</label>';
-        html += '<input type="text" class="arg-input" data-arg-type="args" data-arg-index="' + index + '" value="' + escapeAttribute(valueStr) + '" />';
+    if (hasArgs) {
+      const argsCount = (storedArgs.args ? storedArgs.args.length : 0) + (storedArgs.kwargs ? Object.keys(storedArgs.kwargs).length : 0);
+      html += '<span class="section-title">Arguments <span class="section-badge">' + argsCount + ' set</span></span>';
+    } else if (params && params.length > 0) {
+      html += '<span class="section-title">Arguments <span class="section-badge empty">Not set</span></span>';
+    } else {
+      html += '<span class="section-title">Arguments <span class="section-badge">Loading...</span></span>';
+    }
+    html += '</button>';
+    
+    if (isExpanded) {
+      html += '<div class="section-content">';
+      html += '<div class="parent-args-content">';
+      
+      // Build a map of param names to indices (excluding self/cls)
+      const paramIndexMap = new Map(); // paramName -> displayIndex (for args array)
+      let displayIndex = 0;
+      if (params) {
+        params.forEach(function(paramName, actualIndex) {
+          // Skip 'self' and 'cls' parameters (they're not user-provided)
+          if (paramName !== 'self' && paramName !== 'cls') {
+            paramIndexMap.set(paramName, displayIndex);
+            displayIndex++;
+          }
+        });
+      }
+      
+      // Show inputs for positional arguments based on function signature
+      if (params && params.length > 0) {
+        html += '<div class="args-group">';
+        html += '<div class="args-group-label">Positional Arguments:</div>';
+        params.forEach(function(paramName, actualIndex) {
+          // Skip 'self' and 'cls' parameters (they're not user-provided)
+          if (paramName === 'self' || paramName === 'cls') {
+            return;
+          }
+          const displayIdx = paramIndexMap.get(paramName);
+          const argValue = storedArgs && storedArgs.args && storedArgs.args[displayIdx] !== undefined 
+            ? storedArgs.args[displayIdx] 
+            : '';
+          
+          // Get type info and helper
+          const paramType = paramTypes && paramTypes[actualIndex] ? paramTypes[actualIndex] : null;
+          const paramDefault = paramDefaults && paramDefaults[actualIndex] !== undefined ? paramDefaults[actualIndex] : null;
+          const typeHelper = getTypeHelper(paramName, paramType);
+          
+          // Format value for display
+          let valueStr = '';
+          if (argValue !== '') {
+            // Check if it's a Python expression (stored as object with __python_expr__)
+            if (typeof argValue === 'object' && argValue !== null && argValue.__python_expr__) {
+              valueStr = argValue.__value__ || '';
+            } else {
+              valueStr = JSON.stringify(argValue);
+            }
+          } else if (paramDefault !== null && paramDefault !== undefined) {
+            // Show default value as placeholder hint
+            valueStr = '';
+          }
+          
+          html += '<div class="arg-item">';
+          html += '<div class="arg-header">';
+          html += '<label class="arg-label">' + escapeHtml(paramName);
+          if (paramType) {
+            html += ' <span class="arg-type">:' + escapeHtml(paramType) + '</span>';
+          }
+          if (paramDefault !== null && paramDefault !== undefined && !hasArgs) {
+            html += ' <span class="arg-default">= ' + escapeHtml(String(paramDefault)) + '</span>';
+          }
+          html += '</label>';
+          if (typeHelper.helpText) {
+            html += '<button type="button" class="help-btn" data-action="show-help" data-help="' + escapeAttribute(typeHelper.helpText) + '" title="Show help">?</button>';
+          }
+          html += '</div>';
+          html += '<div class="arg-input-wrapper">';
+          html += '<input type="text" class="arg-input" data-arg-type="args" data-arg-index="' + displayIdx + '" data-param-type="' + escapeAttribute(paramType || '') + '" value="' + escapeAttribute(valueStr) + '" placeholder="' + escapeAttribute(typeHelper.placeholder) + '" />';
+          if (typeHelper.template) {
+            html += '<button type="button" class="template-btn" data-action="insert-template" data-template="' + escapeAttribute(typeHelper.template) + '" data-input-index="' + displayIdx + '" data-arg-type="args" title="Insert template">📋</button>';
+          }
+          html += '</div>';
+          html += '</div>';
+        });
         html += '</div>';
-      });
+      } else if (hasArgs && storedArgs.args && storedArgs.args.length > 0) {
+        // No signature yet, but we have args - show them with indices
+        html += '<div class="args-group">';
+        html += '<div class="args-group-label">Positional Arguments:</div>';
+        storedArgs.args.forEach(function(arg, index) {
+          const valueStr = JSON.stringify(arg);
+          html += '<div class="arg-item">';
+          html += '<label class="arg-label">[' + index + ']:</label>';
+          html += '<input type="text" class="arg-input" data-arg-type="args" data-arg-index="' + index + '" value="' + escapeAttribute(valueStr) + '" />';
+          html += '</div>';
+        });
+        html += '</div>';
+      }
+      
+      // Show keyword arguments - include any stored ones, and also allow adding new ones
+      const kwargsKeys = storedArgs && storedArgs.kwargs ? Object.keys(storedArgs.kwargs) : [];
+      if (kwargsKeys.length > 0 || params) {
+        html += '<div class="args-group">';
+        html += '<div class="args-group-label">Keyword Arguments:</div>';
+        
+        // Show stored kwargs
+        if (kwargsKeys.length > 0) {
+          kwargsKeys.forEach(function(key) {
+            const argValue = storedArgs.kwargs[key];
+            // Find param index for type info
+            const paramIndex = params ? params.indexOf(key) : -1;
+            const paramType = paramTypes && paramIndex >= 0 ? paramTypes[paramIndex] : null;
+            const typeHelper = getTypeHelper(key, paramType);
+            
+            // Format value for display
+            let valueStr = '';
+            if (typeof argValue === 'object' && argValue !== null && argValue.__python_expr__) {
+              valueStr = argValue.__value__ || '';
+            } else {
+              valueStr = JSON.stringify(argValue);
+            }
+            
+            html += '<div class="arg-item">';
+            html += '<div class="arg-header">';
+            html += '<label class="arg-label">' + escapeHtml(key);
+            if (paramType) {
+              html += ' <span class="arg-type">:' + escapeHtml(paramType) + '</span>';
+            }
+            html += '</label>';
+            if (typeHelper.helpText) {
+              html += '<button type="button" class="help-btn" data-action="show-help" data-help="' + escapeAttribute(typeHelper.helpText) + '" title="Show help">?</button>';
+            }
+            html += '</div>';
+            html += '<div class="arg-input-wrapper">';
+            html += '<input type="text" class="arg-input" data-arg-type="kwargs" data-arg-key="' + escapeAttribute(key) + '" data-param-type="' + escapeAttribute(paramType || '') + '" value="' + escapeAttribute(valueStr) + '" placeholder="' + escapeAttribute(typeHelper.placeholder) + '" />';
+            if (typeHelper.template) {
+              html += '<button type="button" class="template-btn" data-action="insert-template" data-template="' + escapeAttribute(typeHelper.template) + '" data-arg-key="' + escapeAttribute(key) + '" data-arg-type="kwargs" title="Insert template">📋</button>';
+            }
+            html += '</div>';
+            html += '</div>';
+          });
+        }
+        
+        // Show inputs for remaining parameters that aren't already in kwargs
+        if (params) {
+          params.forEach(function(paramName, actualIndex) {
+            // Skip if already shown as positional or already in kwargs
+            if (paramName === 'self' || paramName === 'cls' || kwargsKeys.indexOf(paramName) >= 0) {
+              return;
+            }
+            // Check if this param was already shown as positional
+            if (paramIndexMap.has(paramName)) {
+              return; // Already shown as positional
+            }
+            
+            // Get type info and helper
+            const paramType = paramTypes && paramTypes[actualIndex] ? paramTypes[actualIndex] : null;
+            const paramDefault = paramDefaults && paramDefaults[actualIndex] !== undefined ? paramDefaults[actualIndex] : null;
+            const typeHelper = getTypeHelper(paramName, paramType);
+            
+            // Show as optional keyword argument
+            html += '<div class="arg-item">';
+            html += '<div class="arg-header">';
+            html += '<label class="arg-label">' + escapeHtml(paramName);
+            if (paramType) {
+              html += ' <span class="arg-type">:' + escapeHtml(paramType) + '</span>';
+            }
+            if (paramDefault !== null && paramDefault !== undefined) {
+              html += ' <span class="arg-default">= ' + escapeHtml(String(paramDefault)) + '</span>';
+            }
+            html += '</label>';
+            if (typeHelper.helpText) {
+              html += '<button type="button" class="help-btn" data-action="show-help" data-help="' + escapeAttribute(typeHelper.helpText) + '" title="Show help">?</button>';
+            }
+            html += '</div>';
+            html += '<div class="arg-input-wrapper">';
+            html += '<input type="text" class="arg-input" data-arg-type="kwargs" data-arg-key="' + escapeAttribute(paramName) + '" data-param-type="' + escapeAttribute(paramType || '') + '" value="" placeholder="' + escapeAttribute(typeHelper.placeholder) + '" />';
+            if (typeHelper.template) {
+              html += '<button type="button" class="template-btn" data-action="insert-template" data-template="' + escapeAttribute(typeHelper.template) + '" data-arg-key="' + escapeAttribute(paramName) + '" data-arg-type="kwargs" title="Insert template">📋</button>';
+            }
+            html += '</div>';
+            html += '</div>';
+          });
+        }
+        
+        html += '</div>';
+      }
+      
+      if (!hasArgs && (!params || params.length === 0)) {
+        html += '<div class="placeholder mini">Loading function signature...</div>';
+      }
+      
+      html += '<button type="button" class="compact-btn save-args-btn" data-action="save-parent-args" data-parent-id="' + escapeAttribute(parentId) + '">Save Arguments</button>';
+      html += '</div>';
       html += '</div>';
     }
-    
-    // Render keyword arguments
-    if (storedArgs.kwargs && Object.keys(storedArgs.kwargs).length > 0) {
-      html += '<div class="args-group">';
-      html += '<div class="args-group-label">Keyword Arguments:</div>';
-      Object.keys(storedArgs.kwargs).forEach(function(key) {
-        const argValue = storedArgs.kwargs[key];
-        // Format value for display - use JSON.stringify for all values
-        const valueStr = JSON.stringify(argValue);
-        html += '<div class="arg-item">';
-        html += '<label class="arg-label">' + escapeHtml(key) + ':</label>';
-        html += '<input type="text" class="arg-input" data-arg-type="kwargs" data-arg-key="' + escapeAttribute(key) + '" value="' + escapeAttribute(valueStr) + '" />';
-        html += '</div>';
-      });
-      html += '</div>';
-    }
-    
-    html += '<button type="button" class="save-args-btn" data-action="save-parent-args" data-parent-id="' + escapeAttribute(parentId) + '">Save Arguments</button>';
-    html += '</div>';
     html += '</div>';
     
     return html;
@@ -878,40 +1159,47 @@
     const callSites = state.callSitesByFunction.get(parentId);
     const loading = state.loadingCallSites.has(parentId);
     const selected = state.selectedCallSite.get(parentId);
-
-    if (loading) {
-      return '<div class="call-sites-section"><div class="placeholder mini">Loading call sites...</div></div>';
-    }
-
-    if (!callSites || callSites.length === 0) {
-      return '<div class="call-sites-section">' +
-        '<div class="placeholder mini">No call sites found. Provide arguments to execute this function.</div>' +
-        '<button type="button" class="execute-with-args-btn" data-action="execute-with-args" data-parent-id="' + escapeAttribute(parentId) + '">Provide Arguments</button>' +
-        '</div>';
-    }
+    const isExpanded = state.expandedCallSites.has(parentId);
 
     let html = '<div class="call-sites-section">';
-    html += '<div class="call-sites-header">Call Sites (' + callSites.length + '):</div>';
-    html += '<button type="button" class="execute-with-args-btn" data-action="execute-with-args" data-parent-id="' + escapeAttribute(parentId) + '" title="Click to provide function arguments manually">Provide Arguments Manually</button>';
-    html += '<div class="call-sites-list">';
+    html += '<button type="button" class="section-toggle" data-action="toggle-call-sites" data-parent-id="' + escapeAttribute(parentId) + '">';
+    html += '<span class="chevron ' + (isExpanded ? 'open' : '') + '"></span>';
     
-    callSites.forEach(function(callSite, index) {
-      const isSelected = selected && selected.line === callSite.line && selected.file === callSite.file;
-      const callingFunctionName = callSite.calling_function || '&lt;top-level&gt;';
-      const fileDisplay = callSite.file.split('/').pop() || callSite.file;
-      const callSiteKey = parentId + '::' + callSite.file + '::' + callSite.line;
-      
-      html += '<div class="call-site-item ' + (isSelected ? 'selected' : '') + '" data-call-site-index="' + index + '" data-action="select-call-site" data-parent-id="' + escapeAttribute(parentId) + '">';
-      html += '<div class="call-site-header">';
-      html += '<span class="call-site-file">' + escapeHtml(fileDisplay) + '</span>';
-      html += '<span class="call-site-line">:' + callSite.line + '</span>';
-      html += '<span class="call-site-function"> in ' + escapeHtml(callingFunctionName) + '()</span>';
-      html += '</div>';
-      html += '<div class="call-site-code">' + escapeHtml(callSite.call_line) + '</div>';
-      html += '</div>';
-    });
+    if (loading) {
+      html += '<span class="section-title">Call Sites <span class="section-badge">Loading...</span></span>';
+    } else if (!callSites || callSites.length === 0) {
+      html += '<span class="section-title">Call Sites <span class="section-badge empty">None</span></span>';
+    } else {
+      html += '<span class="section-title">Call Sites <span class="section-badge">' + callSites.length + '</span></span>';
+    }
+    html += '</button>';
     
-    html += '</div>';
+    if (isExpanded) {
+      html += '<div class="section-content">';
+      if (loading) {
+        html += '<div class="placeholder mini">Loading call sites...</div>';
+      } else if (!callSites || callSites.length === 0) {
+        html += '<div class="placeholder mini">No call sites found.</div>';
+      } else {
+        html += '<div class="call-sites-list">';
+        callSites.forEach(function(callSite, index) {
+          const isSelected = selected && selected.line === callSite.line && selected.file === callSite.file;
+          const callingFunctionName = callSite.calling_function || '&lt;top-level&gt;';
+          const fileDisplay = callSite.file.split('/').pop() || callSite.file;
+          
+          html += '<div class="call-site-item ' + (isSelected ? 'selected' : '') + '" data-call-site-index="' + index + '" data-action="select-call-site" data-parent-id="' + escapeAttribute(parentId) + '">';
+          html += '<div class="call-site-header">';
+          html += '<span class="call-site-file">' + escapeHtml(fileDisplay) + '</span>';
+          html += '<span class="call-site-line">:' + callSite.line + '</span>';
+          html += '<span class="call-site-function"> in ' + escapeHtml(callingFunctionName) + '()</span>';
+          html += '</div>';
+          html += '<div class="call-site-code">' + escapeHtml(callSite.call_line) + '</div>';
+          html += '</div>';
+        });
+        html += '</div>';
+      }
+      html += '</div>';
+    }
     html += '</div>';
     
     return html;
@@ -933,7 +1221,8 @@
     const parentArgsSection = isExpanded ? renderParentArgsSection(parentId) : '';
     
     const body = isExpanded
-      ? (callSitesSection + parentArgsSection + (fn
+      ? ('<div class="config-sections">' + callSitesSection + parentArgsSection + '</div>' +
+        (fn
         ? '<div class="function-container">' + renderFunctionBody(parentId, new Set([parentId]), null) + '</div>'
         : '<div class="placeholder mini">No function body captured for ' + escapeHtml(title) + '.</div>'))
       : '';
