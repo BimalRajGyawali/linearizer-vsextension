@@ -1156,71 +1156,120 @@ async function showFlowPanel(
 						
 						// Check if we have a calling function ID
 							if (callSite.calling_function_id) {
-								const callingFunctionId = callSite.calling_function_id.startsWith('/') 
-									? callSite.calling_function_id.slice(1) 
+								const callingFunctionId = callSite.calling_function_id.startsWith('/')
+									? callSite.calling_function_id.slice(1)
 									: callSite.calling_function_id;
-							
+
 								console.log('[extension] Executing calling function:', {
 									callingFunctionId,
 									file: callSite.file,
 									line: callSite.line,
-									targetFunctionId
+									targetFunctionId,
 								});
-							
+
 								// Validate the calling function ID format
 								if (!callingFunctionId.includes('::')) {
 									throw new Error(`Invalid calling function ID format: ${callSite.calling_function_id}. Expected format: path/to/file.py::function_name`);
 								}
 
-								const defaultCallArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
-								const callingArgsJson = JSON.stringify(defaultCallArgs);
-								const callingTracer = getOrCreateTracerManager(
-									context,
-									currentRepoRoot!,
-									callingFunctionId,
-									callingArgsJson,
-									flowPanel?.webview,
-								);
-								callingTracer.setSuppressWebviewEvents(false);
+								const storedCallingArgs =
+									getStoredCallArgs(callSite.calling_function_id) ??
+									getStoredCallArgs(callingFunctionId);
 
-								const callSiteEvent = await callingTracer.getTracerData(
-									currentRepoRoot!,
-									callingFunctionId,
-									callSite.line - 1, // displayLine is 0-indexed, callSite.line is 1-indexed
-									callSite.file,
-									callingArgsJson,
-									context.extensionPath,
-									pythonPath,
-									false, // suppressWebview
-									callSite.line,
-									undefined,
-								);
+								let callingCallArgs: NormalisedCallArgs | undefined;
+								if (storedCallingArgs) {
+									callingCallArgs = cloneCallArgs(storedCallingArgs);
+								} else {
+									const callingSignature = await getFunctionSignature(
+										pythonPath,
+										currentRepoRoot!,
+										callingFunctionId,
+										context.extensionPath,
+									);
+									const signatureParams = callingSignature?.params ?? [];
+									const requiresArgs = signatureParams.filter((param) => param !== 'self' && param !== 'cls').length > 0;
 
-								const callingArgsKey = getArgsContextKey(callingFunctionId, defaultCallArgs);
-								const previousLine = lastExecutedLineByContext.get(callingArgsKey) ?? 0;
-								lastExecutedLineByContext.set(callingArgsKey, Math.max(previousLine, callSite.line));
+									if (requiresArgs) {
+										const warningMessage = `Arguments for ${callSite.calling_function || callingFunctionId} are required. Run the calling function once with its inputs or provide them manually before selecting a call site.`;
+										console.warn('[extension] No stored arguments found for calling function; aborting call-site extraction.');
+										vscode.window.showWarningMessage(warningMessage);
+										if (flowPanel?.webview) {
+											flowPanel.webview.postMessage({
+												type: 'call-site-args-error',
+												functionId: targetFunctionId,
+												error: warningMessage,
+											});
+										}
+										return;
+									}
 
+									console.log('[extension] Calling function has no parameters; using default empty arguments.');
+									callingCallArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+								}
+
+								const callingArgsJson = JSON.stringify(callingCallArgs);
+								const callingArgsKey = getArgsContextKey(callingFunctionId, callingCallArgs);
 								const callingParentId = callSite.calling_function_id.startsWith('/')
 									? callSite.calling_function_id
 									: `/${callSite.calling_function_id}`;
-								const callingCacheKey = getCacheKey(callingParentId, callSite.line, defaultCallArgs);
-								parentExecutionContextCache.set(callingCacheKey, {
-									locals: callSiteEvent.locals || {},
-									globals: callSiteEvent.globals || {},
-									file: callSite.file,
-								});
-							
-							// Now extract the call arguments at that line
-							const extractedArgs = await extractCallArguments(
-								pythonPath,
-								currentRepoRoot!,
-								targetFunctionId.startsWith('/') ? targetFunctionId.slice(1) : targetFunctionId,
-								callSite.file,
-								callSite.line,
-								callSiteEvent.locals || {},
-								callSiteEvent.globals || {},
-								context.extensionPath,
-							);
+								const callingCacheKey = getCacheKey(callingParentId, callSite.line, callingCallArgs);
+								let callingContext = parentExecutionContextCache.get(callingCacheKey);
+
+								if (!callingContext) {
+									const callingTracer = getOrCreateTracerManager(
+										context,
+										currentRepoRoot!,
+										callingFunctionId,
+										callingArgsJson,
+										flowPanel?.webview,
+									);
+									callingTracer.setSuppressWebviewEvents(false);
+
+									const callSiteEvent = await callingTracer.getTracerData(
+										currentRepoRoot!,
+										callingFunctionId,
+										callSite.line - 1, // displayLine is 0-indexed, callSite.line is 1-indexed
+										callSite.file,
+										callingArgsJson,
+										context.extensionPath,
+										pythonPath,
+										false, // suppressWebview
+										callSite.line,
+										undefined,
+									);
+
+									callingContext = {
+										locals: callSiteEvent.locals || {},
+										globals: callSiteEvent.globals || {},
+										file: callSite.file,
+									};
+
+									parentExecutionContextCache.set(callingCacheKey, callingContext);
+								} else {
+									console.log('[extension] Using cached execution context for call site extraction', {
+										parent: callingParentId,
+										line: callSite.line,
+									});
+								}
+
+								const previousLine = lastExecutedLineByContext.get(callingArgsKey) ?? 0;
+								lastExecutedLineByContext.set(callingArgsKey, Math.max(previousLine, callSite.line));
+
+								if (!callingContext) {
+									throw new Error('Unable to determine calling context for call site argument extraction.');
+								}
+
+								// Now extract the call arguments at that line
+								const extractedArgs = await extractCallArguments(
+									pythonPath,
+									currentRepoRoot!,
+									targetFunctionId.startsWith('/') ? targetFunctionId.slice(1) : targetFunctionId,
+									callSite.file,
+									callSite.line,
+									callingContext.locals || {},
+									callingContext.globals || {},
+									context.extensionPath,
+								);
 							
 							// Send extracted arguments to webview to display and allow editing
 							if (extractedArgs && !('error' in extractedArgs)) {
