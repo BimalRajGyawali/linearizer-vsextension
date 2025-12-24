@@ -322,28 +322,38 @@ def extract_functions_from_file(path: str, function_names: Optional[Set[str]], r
     current_body = []
     current_start_line = 0
     imports_map = parse_imports(path)
-    local_funcs = set()
     target_all = not function_names
+    tracked_local_funcs: Set[str] = (
+        {PY_FUNC_DEF.match(line).group(1) for line in text if PY_FUNC_DEF.match(line)}
+        if target_all
+        else set(function_names or [])
+    )
+    key_path = rel_path(repo_root, path) if repo_root else path
     for i, line in enumerate(text):
         lineno = i + 1
         m = PY_FUNC_DEF.match(line)
         if m:
             name = m.group(1)
             if current_name and current_body:
-                full_body = "\n".join([qualify_calls_in_line(l, imports_map, local_funcs, path, repo_root) for l in current_body])
-                key = make_full_id(path, current_name)
+                full_body = "\n".join([
+                    qualify_calls_in_line(l, imports_map, tracked_local_funcs, path, repo_root)
+                    for l in current_body
+                ])
+                key = make_full_id(key_path, current_name)
                 results[key] = full_body
                 save_function(path, current_name, full_body, current_start_line, repo_root)
             current_name = name if (target_all or (function_names and name in function_names)) else None
             if current_name:
-                local_funcs.add(current_name)
                 current_start_line = lineno
             current_body = [line] if current_name else []
         elif current_name:
             current_body.append(line)
     if current_name and current_body:
-        full_body = "\n".join([qualify_calls_in_line(l, imports_map, local_funcs, path, repo_root) for l in current_body])
-        key = make_full_id(path, current_name)
+        full_body = "\n".join([
+            qualify_calls_in_line(l, imports_map, tracked_local_funcs, path, repo_root)
+            for l in current_body
+        ])
+        key = make_full_id(key_path, current_name)
         results[key] = full_body
         save_function(path, current_name, full_body, current_start_line, repo_root)
     return results
@@ -502,8 +512,7 @@ def main(argv: Optional[List[str]] = None):
             abs_file = os.path.join(repo_root, rel_file)
             extracted = extract_functions_from_file(abs_file, funcs, repo_root=repo_root)
             for full_id, body in extracted.items():
-                key = "/"+ rel_path(repo_root, full_id)
-                all_func_bodies[key] = body
+                all_func_bodies[full_id] = body
         call_graph = build_call_graph(all_func_bodies)
         save_graph(call_graph)
         parents = find_parents(call_graph)
