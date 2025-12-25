@@ -13,6 +13,27 @@
 
   const INLINE_VAR_DISPLAY_LIMIT = 5;
 
+  const MESSAGE_TYPES = Object.freeze({
+    CALL_SITES_FOUND: 'call-sites-found',
+    CALL_SITES_ERROR: 'call-sites-error',
+    CALL_SITE_ARGS_EXTRACTED: 'call-site-args-extracted',
+    CALL_SITE_ARGS_ERROR: 'call-site-args-error',
+    TRACER_EVENT: 'tracer-event',
+    TRACER_ERROR: 'tracer-error',
+    FUNCTION_SIGNATURE: 'function-signature',
+    SHOW_ARGS_FORM: 'show-args-form',
+    TRACING_PARENT: 'tracing-parent',
+    TRACING_CHILD: 'tracing-child',
+    STORE_CALL_ARGS: 'store-call-args',
+    EXECUTE_FROM_CALL_SITE: 'execute-from-call-site',
+    RESET_TRACER: 'reset-tracer',
+    FIND_CALL_SITES: 'find-call-sites',
+    REQUEST_FUNCTION_SIGNATURE: 'request-function-signature',
+    OPEN_SOURCE: 'open-source',
+    REVEAL_FUNCTION_FILE: 'reveal-function-file',
+    TRACE_LINE: 'trace-line',
+  });
+
   const state = {
     expandedParents: new Set(),
     expandedCalls: new Set(),
@@ -34,6 +55,8 @@
     projectionView: null, // { functionId, line, file, code, variables: [{scope,name,value,type}]} or null
     pendingTraceRequest: null, // { functionId, line }
     callSiteStatuses: new Map(), // functionId -> Map(callSiteKey -> { state: 'success' | 'error', message?: string })
+    flowTimelines: new Map(), // flowKey -> { flow, entryFullId, argsKey, events, targetLocation, requestedLine }
+    activeFlowKey: null,
   };
   let pendingTraceTimer = null;
 
@@ -360,7 +383,7 @@
     state.callArgsByFunction.set(functionId, cloned);
     if (shouldSync && typeof vscode !== 'undefined') {
       vscode.postMessage({
-        type: 'store-call-args',
+        type: MESSAGE_TYPES.STORE_CALL_ARGS,
         functionId,
         args: cloned,
       });
@@ -421,6 +444,76 @@
     return merged;
   }
 
+  function buildFlowKeyFromEvent(event) {
+    if (!event || typeof event !== 'object') {
+      return null;
+    }
+    const flowName = typeof event.flow === 'string' && event.flow.length > 0
+      ? event.flow
+      : (typeof event.entry_full_id === 'string' ? event.entry_full_id : '');
+    const argsKey = typeof event.args_key === 'string' && event.args_key.length > 0 ? event.args_key : '';
+    if (!flowName && !argsKey) {
+      return null;
+    }
+    return flowName + '::' + argsKey;
+  }
+
+  function normaliseFlowEventPayload(flowEvent) {
+    if (!flowEvent || typeof flowEvent !== 'object') {
+      return null;
+    }
+    return {
+      event: 'line',
+      line: typeof flowEvent.line === 'number' ? flowEvent.line : undefined,
+      filename: flowEvent.file || flowEvent.filename,
+      function: flowEvent.function,
+      locals: flowEvent.locals,
+      globals: flowEvent.globals,
+      flow: flowEvent.flow,
+      entry_full_id: flowEvent.entry_full_id,
+      args_key: flowEvent.args_key,
+      target_location: flowEvent.location,
+      linear_index: flowEvent.linear_index,
+    };
+  }
+
+  function upsertTracerEvent(eventData) {
+    if (!eventData) {
+      return;
+    }
+    const eventLine = typeof eventData.line === 'number' ? eventData.line : undefined;
+    const eventFile = eventData.filename ? normalisePath(eventData.filename) : '';
+    let mergedIntoExisting = false;
+
+    if (eventLine !== undefined) {
+      for (let i = 0; i < state.tracerEvents.length; i += 1) {
+        const existing = state.tracerEvents[i];
+        const existingLine = typeof existing.line === 'number' ? existing.line : undefined;
+        if (existingLine !== eventLine) {
+          continue;
+        }
+
+        const existingFile = existing.filename ? normalisePath(existing.filename) : '';
+        const filesMatch = (!eventFile || !existingFile)
+          ? true
+          : (existingFile === eventFile || existingFile.endsWith(eventFile) || eventFile.endsWith(existingFile));
+
+        if (!filesMatch) {
+          continue;
+        }
+
+        const merged = mergeTraceEvents(existing, eventData);
+        state.tracerEvents[i] = merged;
+        mergedIntoExisting = true;
+        break;
+      }
+    }
+
+    if (!mergedIntoExisting) {
+      state.tracerEvents.push(eventData);
+    }
+  }
+
   const flowMap = buildFlowMap(flows);
   const parents = computeParents(flows, functions, changed);
   const nameIndex = buildNameIndex(functions);
@@ -442,17 +535,17 @@
   // Listen for messages from extension
   window.addEventListener('message', (event) => {
     const message = event.data;
-    if (message.type === 'call-sites-found' && typeof message.functionId === 'string' && Array.isArray(message.callSites)) {
+    if (message.type === MESSAGE_TYPES.CALL_SITES_FOUND && typeof message.functionId === 'string' && Array.isArray(message.callSites)) {
       state.loadingCallSites.delete(message.functionId);
       state.callSitesByFunction.set(message.functionId, message.callSites);
       console.log('[flowPanel] Received call sites for', message.functionId, ':', message.callSites.length, 'sites');
       render();
-    } else if (message.type === 'call-sites-error' && typeof message.functionId === 'string') {
+    } else if (message.type === MESSAGE_TYPES.CALL_SITES_ERROR && typeof message.functionId === 'string') {
       state.loadingCallSites.delete(message.functionId);
       console.error('[flowPanel] Error finding call sites:', message.error);
       // Still render to show error state
       render();
-    } else if (message.type === 'call-site-args-extracted' && typeof message.functionId === 'string' && message.args) {
+    } else if (message.type === MESSAGE_TYPES.CALL_SITE_ARGS_EXTRACTED && typeof message.functionId === 'string' && message.args) {
       // Arguments extracted from call site - store them and update UI
       console.log('[flowPanel] Received extracted args for', message.functionId, ':', message.args);
       setCallArgsForFunction(message.functionId, message.args);
@@ -463,7 +556,7 @@
         });
       }
       render();
-    } else if (message.type === 'call-site-args-error' && typeof message.functionId === 'string') {
+    } else if (message.type === MESSAGE_TYPES.CALL_SITE_ARGS_ERROR && typeof message.functionId === 'string') {
       console.error('[flowPanel] Error extracting args from call site:', message.error);
       if (message.callSite) {
         setCallSiteStatus(message.functionId, message.callSite, {
@@ -473,46 +566,39 @@
       }
       // Show error but don't prevent rendering
       render();
-    } else if (message.type === 'tracer-event') {
+    } else if (message.type === MESSAGE_TYPES.TRACER_EVENT) {
       if (message.event) {
         // Add or update event in the array
         const eventData = message.event;
-        
-        const eventLine = typeof eventData.line === 'number' ? eventData.line : undefined;
-        const eventFile = eventData.filename ? normalisePath(eventData.filename) : '';
-        let mergedIntoExisting = false;
+        const flowKey = buildFlowKeyFromEvent(eventData);
+        const hasFlowSlice = Array.isArray(eventData.events) && eventData.events.length > 0;
 
-        if (eventLine !== undefined) {
-          for (let i = 0; i < state.tracerEvents.length; i += 1) {
-            const existing = state.tracerEvents[i];
-            const existingLine = typeof existing.line === 'number' ? existing.line : undefined;
-            if (existingLine !== eventLine) {
-              continue;
+        if (hasFlowSlice) {
+          const normalisedEvents = eventData.events
+            .map(normaliseFlowEventPayload)
+            .filter(Boolean);
+          if (normalisedEvents.length > 0) {
+            normalisedEvents.forEach(function(flowEvt) {
+              upsertTracerEvent(flowEvt);
+            });
+            if (flowKey) {
+              state.flowTimelines.set(flowKey, {
+                flow: eventData.flow || eventData.entry_full_id || 'flow',
+                entryFullId: eventData.entry_full_id,
+                argsKey: eventData.args_key || '',
+                events: normalisedEvents,
+                targetLocation: eventData.target_location,
+                requestedLine: eventData.requested_line,
+                lastServedIndex: eventData.last_served_index,
+              });
+              state.activeFlowKey = flowKey;
             }
-
-            const existingFile = existing.filename ? normalisePath(existing.filename) : '';
-            const filesMatch = (!eventFile || !existingFile)
-              ? true
-              : (existingFile === eventFile || existingFile.endsWith(eventFile) || eventFile.endsWith(existingFile));
-
-            if (!filesMatch) {
-              continue;
-            }
-
-            const merged = mergeTraceEvents(existing, eventData);
-            state.tracerEvents[i] = merged;
-            mergedIntoExisting = true;
-            console.log('[flowPanel] Merged tracer event into existing line:', eventLine, 'file:', eventFile || '<unknown>');
-            break;
           }
         }
 
-        if (!mergedIntoExisting) {
-          console.log('[flowPanel] Adding event at line:', eventData.line, 'for file:', eventData.filename);
-          state.tracerEvents.push(eventData);
-        }
+        upsertTracerEvent(eventData);
 
-  clearPendingTraceLock({ render: false });
+			clearPendingTraceLock({ render: false });
 
         const functionIdForEvent = findFunctionIdForEvent(eventData);
         if (functionIdForEvent) {
@@ -529,7 +615,7 @@
         }
         render();
       }
-    } else if (message.type === 'tracer-error') {
+    } else if (message.type === MESSAGE_TYPES.TRACER_ERROR) {
       // Add error event
       const errorEvent = {
         event: 'error',
@@ -552,7 +638,7 @@
         state.tracerEvents.push(errorEvent);
         render();
       }
-    } else if (message.type === 'function-signature' && typeof message.functionId === 'string' && Array.isArray(message.params)) {
+    } else if (message.type === MESSAGE_TYPES.FUNCTION_SIGNATURE && typeof message.functionId === 'string' && Array.isArray(message.params)) {
       // Store function signature
       state.loadingSignatures.delete(message.functionId);
       state.functionSignatures.set(message.functionId, message.params);
@@ -563,7 +649,7 @@
         state.functionParamDefaults.set(message.functionId, message.paramDefaults);
       }
       render();
-    } else if (message.type === 'show-args-form' && typeof message.functionId === 'string') {
+    } else if (message.type === MESSAGE_TYPES.SHOW_ARGS_FORM && typeof message.functionId === 'string') {
       // Store function signature (we use inline args section instead of modal)
       if (Array.isArray(message.params)) {
         state.functionSignatures.set(message.functionId, message.params);
@@ -583,7 +669,7 @@
           firstInput.focus();
         }
       }, 100);
-    } else if (message.type === 'tracing-parent' && typeof message.parentId === 'string') {
+    } else if (message.type === MESSAGE_TYPES.TRACING_PARENT && typeof message.parentId === 'string') {
       // Update loading state for parent tracing
       if (message.show) {
         state.tracingParent.add(message.parentId);
@@ -591,7 +677,7 @@
         state.tracingParent.delete(message.parentId);
       }
       render();
-    } else if (message.type === 'tracing-child' && typeof message.childId === 'string') {
+    } else if (message.type === MESSAGE_TYPES.TRACING_CHILD && typeof message.childId === 'string') {
       // Update loading state for child tracing
       if (message.show) {
         state.tracingChild.add(message.childId);
@@ -664,7 +750,7 @@
           
           // Extract arguments from this call site (don't execute immediately)
           vscode.postMessage({
-            type: 'execute-from-call-site',
+            type: MESSAGE_TYPES.EXECUTE_FROM_CALL_SITE,
             functionId: parentId,
             callSite: callSite,
           });
@@ -753,7 +839,7 @@
           
           // Stop/reset the tracer so a new one will be created with the new arguments
           vscode.postMessage({
-            type: 'reset-tracer',
+            type: MESSAGE_TYPES.RESET_TRACER,
             functionId: parentId,
           });
           
@@ -783,7 +869,7 @@
           if (!state.callSitesByFunction.has(parentId) && !state.loadingCallSites.has(parentId)) {
             state.loadingCallSites.add(parentId);
             console.log('[flowPanel] Requesting call sites for parent:', parentId);
-            vscode.postMessage({ type: 'find-call-sites', functionId: parentId });
+            vscode.postMessage({ type: MESSAGE_TYPES.FIND_CALL_SITES, functionId: parentId });
           }
         }
         // Expand the args section
@@ -792,7 +878,7 @@
         if (!state.functionSignatures.has(parentId) && !state.loadingSignatures.has(parentId)) {
           state.loadingSignatures.add(parentId);
           vscode.postMessage({
-            type: 'request-function-signature',
+            type: MESSAGE_TYPES.REQUEST_FUNCTION_SIGNATURE,
             functionId: parentId,
           });
         }
@@ -829,7 +915,7 @@
     } else if (action === 'open-source') {
       const identifier = target.getAttribute('data-target');
       if (identifier) {
-        vscode.postMessage({ type: 'open-source', identifier });
+  vscode.postMessage({ type: MESSAGE_TYPES.OPEN_SOURCE, identifier });
       }
     } else if (action === 'open-projection') {
       const functionId = target.getAttribute('data-function');
@@ -842,6 +928,10 @@
       }
     } else if (action === 'close-projection') {
       closeProjection();
+    } else if (action === 'clear-flow-history') {
+      state.flowTimelines.clear();
+      state.activeFlowKey = null;
+      render();
     } else if (action === 'trace-line') {
       executeTraceLineFromTarget(target);
     }
@@ -895,7 +985,7 @@
       if (!state.loadingCallSites.has(parentId)) {
         state.loadingCallSites.add(parentId);
         console.log('[flowPanel] Requesting call sites for parent:', parentId);
-        vscode.postMessage({ type: 'find-call-sites', functionId: parentId });
+  vscode.postMessage({ type: MESSAGE_TYPES.FIND_CALL_SITES, functionId: parentId });
       }
     }
     render();
@@ -912,7 +1002,7 @@
       if (targetFunctionId) {
         console.log('[flowPanel] Expanding call, targetFunctionId:', targetFunctionId);
         // Send message to extension to reveal file in explorer
-        vscode.postMessage({ type: 'reveal-function-file', functionId: targetFunctionId });
+        vscode.postMessage({ type: MESSAGE_TYPES.REVEAL_FUNCTION_FILE, functionId: targetFunctionId });
       }
     }
     render();
@@ -999,7 +1089,7 @@
     state.lastClickedLine.set(functionId, { line: lineNumber, stopLine: stopLineNum });
 
     const payload = {
-      type: 'trace-line',
+      type: MESSAGE_TYPES.TRACE_LINE,
       functionId,
       line: lineNumber,
       stopLine: stopLineNum,
@@ -1046,10 +1136,14 @@
 
   function render() {
     let content = '';
+    const timelinePanel = renderFlowTimelinePanel();
+    if (timelinePanel) {
+      content += timelinePanel;
+    }
     if (!parents.length) {
-      content = '<p class="placeholder">No call flows available.</p>';
+      content += '<p class="placeholder">No call flows available.</p>';
     } else {
-      content = parents.map((parentId) => renderParentBlock(parentId)).join('');
+      content += parents.map((parentId) => renderParentBlock(parentId)).join('');
     }
     content += renderLoadingOverlay();
     content += renderProjectionPanel();
@@ -1080,6 +1174,75 @@
       '<div class="loading-spinner"></div>' +
       '<div class="loading-message">' + escapeHtml(message) + '</div>' +
       '</div>';
+  }
+
+  function summariseFlowVariables(flowEvent) {
+    if (!flowEvent || !flowEvent.locals || typeof flowEvent.locals !== 'object') {
+      return '<span class="flow-vars-empty">No locals captured</span>';
+    }
+    const entries = Object.entries(flowEvent.locals);
+    if (!entries.length) {
+      return '<span class="flow-vars-empty">No locals captured</span>';
+    }
+    const previewEntries = entries.slice(0, 3);
+    const previewHtml = previewEntries.map(function(entry) {
+      const [name, value] = entry;
+      const formatted = formatInlineValue(value, 40);
+      return '<span class="flow-var-pill">' +
+        '<span class="flow-var-name">' + escapeHtml(name) + '</span>' +
+        '<span class="flow-var-equals">=</span>' +
+        '<code class="flow-var-value">' + escapeHtml(formatted) + '</code>' +
+      '</span>';
+    }).join('');
+    const extraCount = entries.length - previewEntries.length;
+    const extraLabel = extraCount > 0
+      ? '<span class="flow-var-more">+' + extraCount + ' more</span>'
+      : '';
+    return previewHtml + extraLabel;
+  }
+
+  function renderFlowTimelinePanel() {
+    if (!state.activeFlowKey) {
+      return '';
+    }
+    const timeline = state.flowTimelines.get(state.activeFlowKey);
+    if (!timeline || !Array.isArray(timeline.events) || timeline.events.length === 0) {
+      return '';
+    }
+    const title = timeline.flow || extractDisplayName(timeline.entryFullId || timeline.flow || 'Flow');
+    const subtitle = timeline.targetLocation
+      ? 'Target: ' + timeline.targetLocation
+      : 'Steps: ' + timeline.events.length;
+
+    let html = '<section class="flow-timeline-panel" role="region" aria-label="Flow timeline">';
+    html += '<header class="flow-timeline-header">';
+    html += '<div class="flow-timeline-meta">';
+    html += '<div class="flow-timeline-title">' + escapeHtml(title) + '</div>';
+    html += '<div class="flow-timeline-subtitle">' + escapeHtml(subtitle) + '</div>';
+    html += '</div>';
+    html += '<div class="flow-timeline-actions">';
+    html += '<button type="button" class="flow-action-btn" data-action="clear-flow-history">Clear</button>';
+    html += '</div>';
+    html += '</header>';
+
+    html += '<ol class="flow-timeline-list">';
+    timeline.events.forEach(function(flowEvent, index) {
+      const locationLabel = flowEvent.target_location || flowEvent.location || ((flowEvent.function || '?') + ':' + (flowEvent.line ?? '?'));
+      const isTarget = timeline.targetLocation && locationLabel === timeline.targetLocation;
+      html += '<li class="flow-timeline-row' + (isTarget ? ' is-target' : '') + '">';
+      html += '<span class="flow-step-index">' + (index + 1) + '</span>';
+      html += '<div class="flow-step-details">';
+      html += '<div class="flow-step-head">';
+      html += '<span class="flow-step-function">' + escapeHtml(flowEvent.function || 'anonymous') + '</span>';
+      html += '<span class="flow-step-location">' + escapeHtml(locationLabel) + '</span>';
+      html += '</div>';
+      html += '<div class="flow-step-vars">' + summariseFlowVariables(flowEvent) + '</div>';
+      html += '</div>';
+      html += '</li>';
+    });
+    html += '</ol>';
+    html += '</section>';
+    return html;
   }
 
   function renderProjectionPanel() {
@@ -1201,7 +1364,7 @@
       // Request function signature
       state.loadingSignatures.add(parentId);
       vscode.postMessage({
-        type: 'request-function-signature',
+            type: MESSAGE_TYPES.REQUEST_FUNCTION_SIGNATURE,
         functionId: parentId,
       });
     }
@@ -1442,7 +1605,7 @@
         html += '<div class="call-sites-list">';
         callSites.forEach(function(callSite, index) {
           const isSelected = selected && selected.line === callSite.line && selected.file === callSite.file;
-          const callingFunctionName = callSite.calling_function || '&lt;top-level&gt;';
+          const callingFunctionName = callSite.calling_function || '<top-level>';
           const fileDisplay = callSite.file.split('/').pop() || callSite.file;
           const status = getCallSiteStatus(parentId, callSite);
           const statusClass = status ? (' ' + (status.state === 'success' ? 'success' : 'error')) : '';

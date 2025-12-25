@@ -219,9 +219,6 @@ def find_call_sites(repo_root: str, target_function_id: str) -> List[Dict[str, a
                 continue
             
             file_path = os.path.join(root, file)
-            # Skip the file containing the function itself (no point finding calls within itself)
-            if os.path.abspath(file_path) == target_file_abs:
-                continue
                 
             call_sites = find_function_calls_in_file(file_path, func_name, repo_root, target_file_rel_path)
             all_call_sites.extend(call_sites)

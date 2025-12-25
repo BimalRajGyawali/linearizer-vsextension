@@ -26,6 +26,36 @@ Linearizer surfaces the Python functions you have touched in your current Git di
 
 > Tip: Newly created Python files count as fully changed – every defined function appears in the results.
 
+## Flow-aware tracer (standalone)
+
+The bundled `python/tracer.py` script can now linearise an execution flow incrementally:
+
+- Cache every executed line (locals/globals included) under a flow name plus the argument payload, so later requests replay instantly without re-running code.
+- Address locations via `function:line` strings (e.g. `collect_commit_history:16`) instead of relying on raw file-relative line numbers.
+- Return slices of the cumulative flow via the `events` array in each response, making it easy to render entire histories on the UI side.
+
+### Quick start
+
+```bash
+python python/tracer.py \
+	--repo_root /path/to/linearizer \
+	--entry_full_id /python/sample_flow.py::analyze_git_repo \
+	--flow_name analyze_git_repo \
+	--args_json '{"args": [], "kwargs": {"branch": "demo"}}' \
+	--stop_location analyze_git_repo:8
+```
+
+You can keep the process alive and request deeper stops by piping JSON commands on stdin, for example:
+
+```bash
+{"location": "collect_commit_history:16"}
+{"location": "acquire_git_stream:23"}
+{"location": "build_git_log_command:28"}
+0
+```
+
+Each response includes the latest line information plus the cumulative `events` array so you can reconstruct the whole flow without re-executing earlier steps. The helper `python/sample_flow.py` file mirrors the MiniGit example discussed in the design notes and can be used as a sandbox target.
+
 ## Known limitations
 
 - Pure deletions (functions removed without any remaining lines) are not yet reported.

@@ -9,7 +9,10 @@ import threading
 import bdb
 import inspect
 import ast
+import copy
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # --------------------------
 # Logging Setup
@@ -82,6 +85,46 @@ def safe_json(value):
     except Exception:
         return f"<unserializable {type(value).__name__}>"
 
+TOP_LEVEL_SENTINELS = {"<top-level>", "<module>"}
+
+
+def is_top_level_entry_name(name: Optional[str]) -> bool:
+    if not name:
+        return False
+    return name.strip().lower() in TOP_LEVEL_SENTINELS
+
+
+def derive_module_name(rel_path: str) -> str:
+    trimmed = rel_path.lstrip("/")
+    if trimmed.endswith(".py"):
+        trimmed = trimmed[:-3]
+    return trimmed.replace("/", ".") or "__main__"
+
+
+def build_module_entry_callable(abs_path: str, module_name: str, repo_root: Optional[str] = None) -> Callable[[], None]:
+    with open(abs_path, 'r', encoding='utf-8') as f:
+        source = f.read()
+    code_obj = compile(source, abs_path, 'exec')
+    package_name = '.'.join(module_name.split('.')[:-1]) or None
+
+    def module_entry():
+        if repo_root and repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        module_globals = {
+            "__name__": module_name,
+            "__file__": abs_path,
+            "__package__": package_name,
+            "__cached__": None,
+            "__spec__": None,
+            "__doc__": None,
+            "__builtins__": __builtins__,
+        }
+        exec(code_obj, module_globals, module_globals)
+
+    module_entry.__name__ = "<module>"
+    module_entry.__qualname__ = "<module>"
+    return module_entry
+
 def get_function_signature(repo_root: str, entry_full_id: str):
     """Get the function signature (parameter names) for a given function using AST parsing."""
     try:
@@ -99,6 +142,15 @@ def get_function_signature(repo_root: str, entry_full_id: str):
         fn_path = parts[1:]  # Can be [function_name] or [ClassName, method_name] or [outer, inner]
         
         log(f"Parsing entry_full_id: rel_path={rel_path}, fn_path={fn_path}")
+
+        if len(fn_path) == 1 and is_top_level_entry_name(fn_path[0]):
+            return {
+                "params": [],
+                "param_count": 0,
+                "param_types": [],
+                "param_defaults": [],
+                "param_required": [],
+            }
         
         # Get absolute path to the file
         rel_path = rel_path.lstrip("/")
@@ -214,6 +266,9 @@ def get_function_signature(repo_root: str, entry_full_id: str):
         params = []
         param_types = []
         param_defaults = []
+        param_required = []
+        total_args = len(target_func.args.args)
+        defaults_count = len(target_func.args.defaults)
         is_method = len(fn_path) == 2  # Class method if path has 2 parts (ClassName::method_name)
         
         def unparse_annotation(annotation):
@@ -295,13 +350,15 @@ def get_function_signature(repo_root: str, entry_full_id: str):
             param_types.append(type_str)
             
             # Extract default value
-            default_index = i - (len(target_func.args.args) - len(target_func.args.defaults))
-            if default_index >= 0 and default_index < len(target_func.args.defaults):
+            default_index = i - (total_args - defaults_count)
+            if default_index >= 0 and default_index < defaults_count:
                 default_node = target_func.args.defaults[default_index]
                 default_value = unparse_default(default_node)
                 param_defaults.append(default_value)
+                param_required.append(False)
             else:
                 param_defaults.append(None)
+                param_required.append(True)
         
         log(f"Function signature (via AST): params={params}, param_types={param_types}, param_count={len(params)}")
         
@@ -309,7 +366,8 @@ def get_function_signature(repo_root: str, entry_full_id: str):
             "params": params,
             "param_count": len(params),
             "param_types": param_types,
-            "param_defaults": param_defaults
+            "param_defaults": param_defaults,
+            "param_required": param_required,
         }
     except Exception as e:
         log_exception(e, "get_function_signature")
@@ -504,11 +562,235 @@ def extract_call_arguments(repo_root: str, entry_full_id: str, call_line: int, l
         log_exception(e, "extract_call_arguments")
         return {"error": str(e)}
 
+
+def extract_call_arguments_runtime(
+    repo_root: str,
+    callee_entry_full_id: str,
+    calling_entry_full_id: str,
+    call_line: int,
+    parent_file: Optional[str],
+    calling_args_json: Optional[str],
+):
+    try:
+        normalized_calling_entry = calling_entry_full_id.lstrip("/")
+        if "::" not in normalized_calling_entry:
+            return {"error": "invalid calling entry id"}
+        rel_path, fn_name = normalized_calling_entry.split("::", 1)
+        abs_path = os.path.join(repo_root, rel_path.lstrip("/"))
+        if not os.path.isfile(abs_path):
+            return {"error": f"file not found: {abs_path}"}
+
+        args_list, kwargs_dict = parse_args_json(calling_args_json)
+        top_level_entry = is_top_level_entry_name(fn_name)
+        module_name = derive_module_name(rel_path)
+
+        if top_level_entry:
+            fn = build_module_entry_callable(abs_path, module_name, repo_root)
+            effective_fn_name = "<module>"
+        else:
+            mod = import_module_from_path(repo_root, rel_path)
+            if not hasattr(mod, fn_name):
+                return {"error": f"function not found: {fn_name}"}
+            fn = getattr(mod, fn_name)
+            effective_fn_name = fn_name
+
+        dbg = PersistentDebugger()
+        stop_file = ensure_abs_path(repo_root, parent_file) or abs_path
+        dbg.target_file = stop_file
+        dbg.pinned_target_file = True
+        dbg.run_function_once(fn, args_list, kwargs_dict)
+        dbg.continue_until(call_line, effective_fn_name)
+        if not dbg.wait_for_event(timeout=30.0):
+            return {"error": f"Timed out executing {calling_entry_full_id} to line {call_line}"}
+        raw_locals = dbg.last_raw_locals or {}
+        raw_globals = dbg.last_raw_globals or {}
+        dbg.step_event.set()
+        return extract_call_arguments(repo_root, callee_entry_full_id, call_line, raw_locals, raw_globals, parent_file)
+    except Exception as e:
+        log_exception(e, "extract_call_arguments_runtime")
+        return {"error": str(e)}
+
+# --------------------------
+# Linear Flow Cache Helpers
+# --------------------------
+
+def normalize_args_key(args_json: str) -> str:
+    """Return a stable string representation of args_json for cache keys."""
+    if not args_json:
+        return "{}"
+    try:
+        parsed = json.loads(args_json)
+        return json.dumps(parsed, sort_keys=True)
+    except Exception:
+        return args_json
+
+
+def parse_location_spec(value: str, default_function: Optional[str]) -> Tuple[str, int]:
+    """Parse strings like 'function_name:42' into (function, line)."""
+    if not value:
+        raise ValueError("location must be non-empty")
+    if ":" in value:
+        func, line_text = value.rsplit(":", 1)
+        func = func or default_function
+    else:
+        if default_function is None:
+            raise ValueError("function name is required when location has no ':'")
+        func = default_function
+        line_text = value
+    if func is None:
+        raise ValueError("function name could not be determined for location")
+    try:
+        line = int(line_text)
+    except ValueError as exc:
+        raise ValueError(f"invalid line number in location '{value}'") from exc
+    return func, line
+
+
+def ensure_abs_path(repo_root: str, file_value: Optional[str]) -> Optional[str]:
+    if not file_value:
+        return None
+    if os.path.isabs(file_value):
+        return os.path.abspath(file_value)
+    normalized = file_value.lstrip("/")
+    return os.path.abspath(os.path.join(repo_root, normalized))
+
+
+def parse_args_json(args_json: Optional[str]) -> Tuple[List[Any], Dict[str, Any]]:
+    args_list: List[Any] = []
+    kwargs_dict: Dict[str, Any] = {}
+    if not args_json:
+        return args_list, kwargs_dict
+    try:
+        parsed = json.loads(args_json)
+        args_list = parsed.get("args", []) or []
+        kwargs_dict = parsed.get("kwargs", {}) or {}
+    except Exception as e:
+        log(f"WARNING: Failed to parse args_json: {e}", "WARNING")
+    return args_list, kwargs_dict
+
+
+@dataclass
+class FlowTarget:
+    function: str
+    line: int
+    raw_location: str
+    file: Optional[str] = None
+
+    @property
+    def label(self) -> str:
+        return self.raw_location or f"{self.function}:{self.line}"
+
+
+class LinearFlowRecorder:
+    """Maintain a linearized list of execution events for a flow."""
+
+    def __init__(self, flow_name: str, entry_full_id: str, args_key: str):
+        self.flow_name = flow_name
+        self.entry_full_id = entry_full_id
+        self.args_key = args_key
+        self._events: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._last_served_index = -1
+
+    def record(self, raw_event: Dict[str, Any]):
+        if not raw_event:
+            return
+        with self._lock:
+            linear_index = len(self._events)
+            function_name = raw_event.get("function")
+            line_no = raw_event.get("line")
+            flow_event = {
+                "flow": self.flow_name,
+                "entry_full_id": self.entry_full_id,
+                "args_key": self.args_key,
+                "linear_index": linear_index,
+                "function": function_name,
+                "line": line_no,
+                "file": raw_event.get("filename"),
+                "location": f"{function_name}:{line_no}",
+                "locals": copy.deepcopy(raw_event.get("locals", {})),
+                "globals": copy.deepcopy(raw_event.get("globals", {})),
+                "event": raw_event.get("event"),
+            }
+            self._events.append(flow_event)
+
+    def _match_event(self, event: Dict[str, Any], function_name: str, line: int, file_path: Optional[str]) -> bool:
+        if function_name and event.get("function") != function_name:
+            return False
+        if file_path and event.get("file") != file_path:
+            return False
+        if line is not None and event.get("line") is not None and event.get("line") < line:
+            return False
+        return True
+
+    def find_index(self, function_name: str, line: int, *, after_index: Optional[int] = None, file_path: Optional[str] = None, allow_wrap: bool = False) -> Optional[int]:
+        with self._lock:
+            if not self._events:
+                return None
+            start = after_index + 1 if after_index is not None else 0
+            if start < 0:
+                start = 0
+            search_order = list(range(start, len(self._events)))
+            if allow_wrap and start > 0:
+                search_order.extend(range(0, start))
+            for idx in search_order:
+                event = self._events[idx]
+                if self._match_event(event, function_name, line, file_path):
+                    return idx
+            return None
+
+    def slice_to_index(self, index: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            if index < 0 or index >= len(self._events):
+                return []
+            return [copy.deepcopy(evt) for evt in self._events[: index + 1]]
+
+    def mark_served(self, index: int):
+        with self._lock:
+            if index > self._last_served_index:
+                self._last_served_index = index
+
+    @property
+    def last_served_index(self) -> int:
+        with self._lock:
+            return self._last_served_index
+
+    def latest_index(self) -> Optional[int]:
+        with self._lock:
+            if not self._events:
+                return None
+            return len(self._events) - 1
+
+
+def build_flow_payload(flow_state: LinearFlowRecorder, target_index: int, target: FlowTarget) -> Dict[str, Any]:
+    events_slice = flow_state.slice_to_index(target_index)
+    if not events_slice:
+        return {}
+    last_event = events_slice[-1]
+    payload = {
+        "event": "line",
+        "flow": flow_state.flow_name,
+        "entry_full_id": flow_state.entry_full_id,
+        "args_key": flow_state.args_key,
+        "target_location": target.label,
+        "requested_line": target.line,
+        "requested_function": target.function,
+        "linear_index": target_index,
+        "line": last_event.get("line"),
+        "filename": last_event.get("file"),
+        "function": last_event.get("function"),
+        "locals": last_event.get("locals"),
+        "globals": last_event.get("globals"),
+        "events": events_slice,
+        "last_served_index": flow_state.last_served_index,
+    }
+    return payload
+
 # --------------------------
 # Persistent Debugger
 # --------------------------
 class PersistentDebugger(bdb.Bdb):
-    def __init__(self):
+    def __init__(self, event_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
         super().__init__()
         self.step_event = threading.Event()  # allows debugger thread to proceed
         self.ready_event = threading.Event()  # signals main that last_event is ready
@@ -517,7 +799,11 @@ class PersistentDebugger(bdb.Bdb):
         self.last_event = None
         self.running_thread = None
         self.target_file = None
+        self.pinned_target_file = False
         self.thread_exception = None  # Store exceptions from the debugger thread
+        self.event_callback = event_callback
+    self.last_raw_locals: Optional[Dict[str, Any]] = None
+    self.last_raw_globals: Optional[Dict[str, Any]] = None
 
     def user_line(self, frame):
         try:
@@ -537,6 +823,9 @@ class PersistentDebugger(bdb.Bdb):
             # Only accept lines from the target file, OR if we're in the target function
             # (this allows stepping through nested functions in different files)
             elif fname != self.target_file:
+                if self.pinned_target_file:
+                    log(f"Skipping line {lineno} in {fname} (pinned to {self.target_file})")
+                    return
                 # If we're in the target function but in a different file, update target_file
                 # to allow stepping through this nested function
                 if in_target_function and self.target_function is not None:
@@ -546,6 +835,7 @@ class PersistentDebugger(bdb.Bdb):
                     log(f"Skipping line {lineno} (not in target file {self.target_file}, not in target function {self.target_function})")
                     return
             locals_snapshot = {k: safe_json(v) for k, v in frame.f_locals.items()}
+            self.last_raw_locals = dict(frame.f_locals)
             
             # Capture only user-declared globals from the current file
             globals_snapshot = {}
@@ -580,6 +870,7 @@ class PersistentDebugger(bdb.Bdb):
                 # Only include simple variable types: int, str, float, bool, None, list, dict, tuple, set
                 # These are the actual variable values the user declared
                 globals_snapshot[k] = safe_json(v)
+            self.last_raw_globals = dict(frame.f_globals)
             self.last_event = {
                 "event": "line",
                 "filename": fname,
@@ -588,6 +879,11 @@ class PersistentDebugger(bdb.Bdb):
                 "locals": locals_snapshot,
                 "globals": globals_snapshot
             }
+            if self.event_callback:
+                try:
+                    self.event_callback(copy.deepcopy(self.last_event))
+                except Exception as callback_error:
+                    log_exception(callback_error, "event_callback")
             log(f"Created line event: {funcname}:{lineno}, target_line={self.target_line}, target_function={self.target_function}")
             # Stop if we've reached the target line AND we're in the target function
             # This ensures we stop in the correct function, not in nested function calls
@@ -633,6 +929,8 @@ class PersistentDebugger(bdb.Bdb):
                     "locals": {k: safe_json(v) for k, v in frame.f_locals.items()},
                     "return_value": safe_json(return_value)
                 }
+                self.last_raw_locals = dict(frame.f_locals)
+                self.last_raw_globals = dict(frame.f_globals)
                 self.ready_event.set()
 
     def run_function_once(self, fn, args=None, kwargs=None):
@@ -671,6 +969,11 @@ class PersistentDebugger(bdb.Bdb):
         # let the debugger start paused until the first continue_until
         self.step_event.clear()
         log("Cleared step_event (debugger paused)")
+    self.last_raw_locals = None
+    self.last_raw_globals = None
+
+    def set_event_callback(self, callback: Optional[Callable[[Dict[str, Any]], None]]):
+        self.event_callback = callback
 
 # --------------------------
 # Main CLI
@@ -683,12 +986,12 @@ def main():
     parser.add_argument(
         "--repo_root",
         required=False,
-        default="/home/bimal/Documents/ucsd/research/code/trap"
+        default="/home/bimal/Documents/ucsd/research/code/git-visualizer"
     )
     parser.add_argument(
         "--entry_full_id",
         required=False,
-        default="backend/services/analytics.py::get_metric_period_analytics"
+        default="/analyzer.py::analyze_git_repo"
     )
     parser.add_argument(
         "--args_json",
@@ -700,6 +1003,21 @@ def main():
         "--stop_line",
         required=False,
         type=int
+    )
+    parser.add_argument(
+        "--stop_location",
+        required=False,
+        help="Stop target in the format function_name:line_number"
+    )
+    parser.add_argument(
+        "--stop_file",
+        required=False,
+        help="Restrict the initial stop target to a specific file path"
+    )
+    parser.add_argument(
+        "--flow_name",
+        required=False,
+        help="Name of the logical flow being traced"
     )
     parser.add_argument(
         "--get_signature",
@@ -728,6 +1046,14 @@ def main():
         "--parent-file",
         help="File path where the call happens (for --extract-call-args)"
     )
+    parser.add_argument(
+        "--calling-entry-full-id",
+        help="Entry full id of the calling function when extracting call args"
+    )
+    parser.add_argument(
+        "--calling-args-json",
+        help="JSON string of arguments for the calling function when extracting call args"
+    )
     args = parser.parse_args()
     
     log(f"Command line arguments: repo_root={args.repo_root}, entry_full_id={args.entry_full_id}, stop_line={args.stop_line}, get_signature={args.get_signature}")
@@ -744,40 +1070,56 @@ def main():
     if args.extract_call_args:
         if args.call_line is None:
             parser.error("--call-line is required when using --extract-call-args")
-        locals_dict = {}
-        globals_dict = {}
-        if args.locals:
-            try:
-                locals_dict = json.loads(args.locals)
-            except Exception as e:
-                log(f"Error parsing --locals: {e}", "WARNING")
-        if args.globals:
-            try:
-                globals_dict = json.loads(args.globals)
-            except Exception as e:
-                log(f"Error parsing --globals: {e}", "WARNING")
-        log("Extracting call arguments")
-        result = extract_call_arguments(args.repo_root, args.entry_full_id, args.call_line, locals_dict, globals_dict, args.parent_file)
+        calling_entry = getattr(args, "calling_entry_full_id", None)
+        if calling_entry:
+            log("Extracting call arguments via runtime execution")
+            result = extract_call_arguments_runtime(
+                args.repo_root,
+                args.entry_full_id,
+                calling_entry,
+                args.call_line,
+                args.parent_file,
+                getattr(args, "calling_args_json", None),
+            )
+        else:
+            locals_dict = {}
+            globals_dict = {}
+            if args.locals:
+                try:
+                    locals_dict = json.loads(args.locals)
+                except Exception as e:
+                    log(f"Error parsing --locals: {e}", "WARNING")
+            if args.globals:
+                try:
+                    globals_dict = json.loads(args.globals)
+                except Exception as e:
+                    log(f"Error parsing --globals: {e}", "WARNING")
+            log("Extracting call arguments from provided context")
+            result = extract_call_arguments(args.repo_root, args.entry_full_id, args.call_line, locals_dict, globals_dict, args.parent_file)
         log(f"Extraction result: {result}")
         print(json.dumps(result), flush=True)
         sys.exit(0)
     
-    # Otherwise, require stop_line
-    if args.stop_line is None:
-        log("ERROR: --stop_line is required", "ERROR")
-        parser.error("--stop_line is required when not using --get_signature")
+    # Otherwise, require a stop target
+    if args.stop_line is None and not args.stop_location:
+        log("ERROR: --stop_line or --stop_location is required", "ERROR")
+        parser.error("--stop_line or --stop_location is required when not using --get_signature")
     repo_root = args.repo_root
     entry_full_id = args.entry_full_id
     args_json = args.args_json
-    stop_line = args.stop_line
+    stop_line_arg = args.stop_line
+    stop_location = args.stop_location
+    stop_file = ensure_abs_path(repo_root, args.stop_file)
+    flow_name = args.flow_name if hasattr(args, "flow_name") and args.flow_name else None
     
     log(f"Tracing configuration:")
     log(f"  repo_root: {repo_root}")
     log(f"  entry_full_id: {entry_full_id}")
-    log(f"  stop_line: {stop_line}")
+    log(f"  stop_line: {stop_line_arg}")
+    log(f"  stop_location: {stop_location}")
+    log(f"  stop_file: {stop_file}")
     log(f"  args_json: {args_json}")
-    with open("debugger_input.log", "a") as f:
-        f.write(f"{stop_line}\n")
+    normalized_args_key = normalize_args_key(args_json)
     args_list = []
     kwargs_dict = {}
     if args_json:
@@ -791,6 +1133,7 @@ def main():
         log("ERROR: Invalid entry_full_id format (missing '::')", "ERROR")
         sys.exit(1)
     rel_path, fn_name = entry_full_id.split("::", 1)
+    top_level_entry = is_top_level_entry_name(fn_name)
     abs_path = os.path.join(repo_root, rel_path.lstrip("/"))
     log(f"Parsed entry_full_id: rel_path={rel_path}, fn_name={fn_name}, abs_path={abs_path}")
     if not os.path.isfile(abs_path):
@@ -798,26 +1141,36 @@ def main():
         log(f"ERROR: {error_msg}", "ERROR")
         print(json.dumps(error_msg))
         sys.exit(1)
-    try:
-        log(f"Importing module from path: {rel_path}")
-        mod = import_module_from_path(repo_root, rel_path)
-        log(f"Module imported successfully: {mod}")
-    except Exception as e:
-        error_msg = {
-            "error": "module import failed",
-            "exception": str(e),
-            "traceback": traceback.format_exc()
-        }
-        log_exception(e, "import_module_from_path")
-        print(json.dumps(error_msg))
-        sys.exit(1)
-    if not hasattr(mod, fn_name):
-        error_msg = {"error": "function not found", "function": fn_name}
-        log(f"ERROR: {error_msg}", "ERROR")
-        print(json.dumps(error_msg))
-        sys.exit(1)
-    fn = getattr(mod, fn_name)
-    log(f"Found function: {fn_name}, callable={callable(fn)}")
+    mod = None
+    if not top_level_entry:
+        try:
+            log(f"Importing module from path: {rel_path}")
+            mod = import_module_from_path(repo_root, rel_path)
+            log(f"Module imported successfully: {mod}")
+        except Exception as e:
+            error_msg = {
+                "error": "module import failed",
+                "exception": str(e),
+                "traceback": traceback.format_exc()
+            }
+            log_exception(e, "import_module_from_path")
+            print(json.dumps(error_msg))
+            sys.exit(1)
+
+    module_name = derive_module_name(rel_path)
+    if top_level_entry:
+        log("Top-level entry detected; executing module scope via synthetic entry point")
+        fn = build_module_entry_callable(abs_path, module_name, repo_root)
+        effective_fn_name = "<module>"
+    else:
+        if not hasattr(mod, fn_name):
+            error_msg = {"error": "function not found", "function": fn_name}
+            log(f"ERROR: {error_msg}", "ERROR")
+            print(json.dumps(error_msg))
+            sys.exit(1)
+        fn = getattr(mod, fn_name)
+        log(f"Found function: {fn_name}, callable={callable(fn)}")
+        effective_fn_name = fn_name
     
     # Filter arguments to match function signature - this ensures we don't pass
     # arguments that the function doesn't accept (fixes issues like passing 'metric_name'
@@ -852,79 +1205,148 @@ def main():
         # Note: We continue with unfiltered arguments here because this is the main entry point
         # The user-provided args_json should already be correct, but nested calls will be filtered
     
-    dbg = PersistentDebugger()
-    dbg.target_file = abs_path  # Only this file counts for stop_line
-    dbg.target_function = fn_name  # Only stop in the target function
+    if flow_name is None:
+        flow_name = effective_fn_name
+
+    if stop_location and top_level_entry:
+        stop_location = stop_location.replace("<top-level>", effective_fn_name)
+
+    if stop_location:
+        initial_function, initial_line = parse_location_spec(stop_location, effective_fn_name)
+        initial_location_label = stop_location
+    else:
+        initial_function = effective_fn_name
+        initial_line = stop_line_arg
+        initial_location_label = f"{initial_function}:{initial_line}"
+
+    if initial_line is None:
+        log("ERROR: Initial line could not be determined", "ERROR")
+        sys.exit(1)
+
+    flow_state = LinearFlowRecorder(flow_name, entry_full_id, normalized_args_key)
+
+    dbg = PersistentDebugger(event_callback=flow_state.record)
+    dbg.target_file = abs_path  # Start within entry file
+    dbg.pinned_target_file = False
+    dbg.target_function = None
     dbg.repo_root = repo_root
-    log(f"Created PersistentDebugger, target_file={abs_path}, target_function={fn_name}")
-    log(f"Configuring initial stop_line={stop_line} for function {fn_name}")
-    dbg.continue_until(stop_line, fn_name)
+    log(f"Created PersistentDebugger, target_file={abs_path}, flow={flow_name}")
     log(f"Starting function execution with args={args_list}, kwargs={kwargs_dict}")
     dbg.run_function_once(fn, args_list, kwargs_dict)
-    # Run until initial stop_line in the target function
-    
-    # Wait for event with timeout to detect if thread died
-    log("Waiting for event (timeout=30.0s)")
-    if not dbg.wait_for_event(timeout=30.0):
-        log("wait_for_event timed out after 30 seconds", "WARNING")
-        # Check if thread is still alive
-        thread_alive = dbg.running_thread.is_alive()
-        log(f"Thread alive status: {thread_alive}")
-        if not thread_alive:
-            # Thread died, check if there's an exception stored
-            log("Thread died, checking for exception", "ERROR")
-            if dbg.thread_exception:
-                log_exception(dbg.thread_exception, "thread execution")
-                error_event = {
-                    "event": "error",
-                    "error": str(dbg.thread_exception),
-                    "traceback": traceback.format_exc()
-                }
+
+    def emit_error(message: str, trace: Optional[str] = None, target_label: Optional[str] = None):
+        error_event = {
+            "event": "error",
+            "error": message,
+            "traceback": trace,
+            "flow": flow_name,
+            "target_location": target_label,
+            "entry_full_id": entry_full_id,
+        }
+        log(f"Sending error event: {message}", "ERROR")
+        send_event(error_event)
+
+    def wait_for_debugger(target: FlowTarget) -> bool:
+        log(f"Waiting for debugger event for {target.label} (timeout=30.0s)")
+        if not dbg.wait_for_event(timeout=30.0):
+            log("wait_for_event timed out after 30 seconds", "WARNING")
+            thread_alive = dbg.running_thread.is_alive() if dbg.running_thread else False
+            log(f"Thread alive status: {thread_alive}")
+            if not thread_alive:
+                if dbg.thread_exception:
+                    log_exception(dbg.thread_exception, "thread execution")
+                    emit_error(str(dbg.thread_exception), traceback.format_exc(), target.label)
+                else:
+                    emit_error("Function execution thread died before reaching target location", target_label=target.label)
             else:
-                error_event = {
-                    "event": "error",
-                    "error": "Function execution thread died before reaching target line",
-                    "traceback": "The function may have raised an exception or exited unexpectedly."
-                }
-            log(f"Sending error event: {error_event['error']}", "ERROR")
-            send_event(error_event)
-            sys.exit(1)
+                emit_error(f"Timeout waiting for {target.label}", target_label=target.label)
+            return False
+        if dbg.thread_exception:
+            log_exception(dbg.thread_exception, "function execution")
+            emit_error(str(dbg.thread_exception), traceback.format_exc(), target.label)
+            return False
+        return True
+
+    current_target: Optional[FlowTarget] = None
+
+    def trace_to_target(target: FlowTarget) -> bool:
+        nonlocal current_target
+        current_target = target
+        log(f"trace_to_target requested: {target.label}, file_override={target.file}")
+        next_index = flow_state.find_index(target.function, target.line, after_index=flow_state.last_served_index, file_path=target.file, allow_wrap=False)
+        if next_index is None:
+            log(f"Target {target.label} not found after last index {flow_state.last_served_index}, searching earlier events")
+            earlier_index = flow_state.find_index(target.function, target.line, file_path=target.file, allow_wrap=True)
+            if earlier_index is not None and earlier_index <= flow_state.last_served_index:
+                next_index = earlier_index
+        if next_index is None:
+            log(f"Continuing debugger to reach new target {target.label}")
+            if target.file:
+                dbg.target_file = target.file
+            dbg.pinned_target_file = target.file is not None
+            dbg.continue_until(target.line, target.function)
+            if not wait_for_debugger(target):
+                return False
+            next_index = flow_state.find_index(target.function, target.line, after_index=flow_state.last_served_index, file_path=target.file, allow_wrap=False)
+            if next_index is None:
+                log("Target still not found after execution; using latest available index", "WARNING")
+                latest_index = flow_state.latest_index()
+                if latest_index is None:
+                    emit_error(f"No events recorded for target {target.label}", target_label=target.label)
+                    return False
+                next_index = latest_index
+        flow_state.mark_served(next_index)
+        payload = build_flow_payload(flow_state, next_index, target)
+        if not payload:
+            emit_error(f"Failed to build payload for {target.label}", target_label=target.label)
+            return False
+        send_event(payload)
+        return True
+
+    def parse_flow_target_from_input(raw_input: str) -> FlowTarget:
+        stripped = raw_input.strip()
+        command_data = None
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                command_data = json.loads(stripped)
+                log(f"Parsed JSON command: {command_data}")
+            except json.JSONDecodeError as decode_error:
+                log(f"Failed to decode JSON command: {decode_error}", "ERROR")
+                raise
+        if command_data is not None:
+            flow_value = command_data.get("flow")
+            if flow_value and flow_value != flow_name:
+                log(f"WARNING: Command targeted flow '{flow_value}' but tracer flow is '{flow_name}'", "WARNING")
+            location_value = command_data.get("location")
+            function_override = command_data.get("function") or effective_fn_name
+            file_override = ensure_abs_path(repo_root, command_data.get("file"))
+            if location_value:
+                function_name, requested_line = parse_location_spec(location_value, function_override)
+                location_label = location_value
+            else:
+                line_value = command_data.get("line")
+                if line_value is None:
+                    raise ValueError("command missing 'line' or 'location'")
+                requested_line = int(line_value)
+                function_name = function_override
+                location_label = f"{function_name}:{requested_line}"
+            return FlowTarget(function=function_name, line=requested_line, raw_location=location_label, file=file_override)
         else:
-            # Thread alive but no event - timeout
-            log("Thread alive but no event received - timeout", "ERROR")
-            error_event = {
-                "event": "error",
-                "error": f"Timeout waiting for function to reach line {stop_line}",
-                "traceback": "The function may be stuck in an infinite loop or waiting for input."
-            }
-            send_event(error_event)
-            sys.exit(1)
-    
-    log("Event received, checking for exception or event")
-    # Check if there's a stored exception
-    if dbg.thread_exception:
-        log_exception(dbg.thread_exception, "function execution")
-        error_event = {
-            "event": "error",
-            "error": str(dbg.thread_exception),
-            "traceback": traceback.format_exc()
-        }
-        log("Sending error event from thread_exception", "ERROR")
-        send_event(error_event)
-    elif dbg.last_event:
-        # Send the event (could be regular event or error event from exception handler)
-        log(f"Sending last_event: {dbg.last_event.get('event', 'unknown')} at line {dbg.last_event.get('line', 'unknown')}")
-        send_event(dbg.last_event)
-    else:
-        # No event was set - this shouldn't happen but send an error
-        log("WARNING: No event was generated", "WARNING")
-        error_event = {
-            "event": "error",
-            "error": f"No event was generated when reaching line {stop_line}",
-            "traceback": "The debugger may not have stopped at the expected line. The function may have completed before reaching the target line."
-        }
-        send_event(error_event)
-    # Interactive stepping
+            requested_line = int(stripped)
+            return FlowTarget(function=effective_fn_name, line=requested_line, raw_location=f"{effective_fn_name}:{requested_line}")
+
+    initial_target = FlowTarget(
+        function=initial_function,
+        line=initial_line,
+        raw_location=initial_location_label,
+        file=stop_file,
+    )
+    with open("debugger_input.log", "a") as f:
+        f.write(f"{initial_target.label}\n")
+    if not trace_to_target(initial_target):
+        sys.exit(1)
+
+    # Interactive stepping using flow-aware targets
     log("Entering interactive stepping loop")
     while True:
         try:
@@ -938,52 +1360,17 @@ def main():
                 log("User input is empty or '0', breaking loop")
                 break
 
-            command_data = None
-            if user_input.startswith("{") and user_input.endswith("}"):
-                try:
-                    command_data = json.loads(user_input)
-                    log(f"Parsed JSON command: {command_data}")
-                except json.JSONDecodeError as decode_error:
-                    log(f"Failed to decode JSON command: {decode_error}", "ERROR")
-                    command_data = None
+            try:
+                target = parse_flow_target_from_input(user_input)
+            except Exception as parse_error:
+                log(f"Failed to parse target from input '{user_input}': {parse_error}", "ERROR")
+                continue
 
-            if command_data is not None:
-                line_value = command_data.get("line")
-                if line_value is None:
-                    log("JSON command missing required 'line' field", "ERROR")
-                    continue
+            with open("debugger_input.log", "a") as f:
+                f.write(f"Target: {target.label}\n")
 
-                try:
-                    line = int(line_value)
-                except (TypeError, ValueError):
-                    log(f"Invalid line value in command: {line_value}", "ERROR")
-                    continue
-
-                function_override = command_data.get("function")
-                file_override = command_data.get("file")
-
-                if file_override:
-                    if not os.path.isabs(file_override):
-                        file_override = os.path.join(repo_root, file_override.lstrip("/"))
-                    dbg.target_file = os.path.abspath(file_override)
-                    log(f"Updated target_file to {dbg.target_file}")
-
-                # Allow explicit null to reset to default behaviour
-                if function_override is not None and function_override != "":
-                    dbg.target_function = str(function_override)
-                    log(f"Updated target_function to {dbg.target_function}")
-                    dbg.continue_until(line, dbg.target_function)
-                else:
-                    dbg.continue_until(line)
-            else:
-                line = int(user_input)
-                log(f"Parsed line number: {line}")
-                dbg.continue_until(line)
-
-            log("Waiting for event after continue_until")
-            dbg.wait_for_event()
-            log(f"Sending event: {dbg.last_event.get('event', 'unknown') if dbg.last_event else 'None'}")
-            send_event(dbg.last_event)
+            if not trace_to_target(target):
+                break
         except Exception as e:
             log_exception(e, "interactive stepping loop")
             # Don't print to stderr, just log it
