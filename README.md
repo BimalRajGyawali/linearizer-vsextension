@@ -8,6 +8,7 @@ Linearizer surfaces the Python functions you have touched in your current Git di
 - 🧭 **Linearised call flows** – Builds a static call graph across the repository and emits a depth-first execution ordering for each changed entry-point so you can reason about value flow.
 - �️ **Webview dashboard** – Renders changed functions, warnings, and Python-produced call flows in a dedicated editor panel so you can stay in the main canvas.
 - 🚀 **Quick navigation** – Presents a quick pick so you can jump directly to any changed function definition with a single selection.
+- 🧪 **Line inspector & peeks** – Hover or click the inline variable marker on any traced line to see a compact popover, then pop out the collapsible inspector to pin values, copy them, or switch between compact/expanded/structured views.
 
 ## Requirements
 

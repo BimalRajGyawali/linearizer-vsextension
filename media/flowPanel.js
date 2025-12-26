@@ -57,6 +57,12 @@
     callSiteStatuses: new Map(), // functionId -> Map(callSiteKey -> { state: 'success' | 'error', message?: string })
     flowTimelines: new Map(), // flowKey -> { flow, entryFullId, argsKey, events, targetLocation, requestedLine }
     activeFlowKey: null,
+    inlinePopover: null, // { functionId, line }
+    inspectorViewMode: 'compact',
+    inspectorCollapsed: false,
+    pinnedVariables: new Map(), // lineKey -> Map(varKey -> entry)
+    expandedInspectorRows: new Set(), // Set of varKeys expanded in inspector
+    lineVariableSnapshots: new Map(), // lineKey -> Array of inline vars for popover/copy actions
   };
   let pendingTraceTimer = null;
 
@@ -162,6 +168,71 @@
       return formatted;
     }
     return formatted.slice(0, limit - 1) + '…';
+  }
+
+  function formatStructuredValue(value) {
+    if (value === null || value === undefined) {
+      return 'None';
+    }
+    if (typeof value === 'string') {
+      try {
+        const parsed = JSON.parse(value);
+        if (typeof parsed === 'object') {
+          return JSON.stringify(parsed, null, 2);
+        }
+      } catch {
+        return value;
+      }
+      return value;
+    }
+    if (typeof value === 'object') {
+      try {
+        return JSON.stringify(value, null, 2);
+      } catch {
+        return '[object]';
+      }
+    }
+    return String(value);
+  }
+
+  function formatRawValue(value) {
+    if (value === null || value === undefined) {
+      return 'None';
+    }
+    if (typeof value === 'string') {
+      return value;
+    }
+    if (typeof value === 'object') {
+      try {
+        return JSON.stringify(value, null, 2);
+      } catch {
+        return '[object]';
+      }
+    }
+    return String(value);
+  }
+
+  function formatInspectorValue(value, mode, expanded) {
+    const viewMode = mode || 'compact';
+    if (viewMode === 'structured') {
+      const structured = formatStructuredValue(value);
+      if (expanded) {
+        return structured;
+      }
+      return structured.length > 160 ? structured.slice(0, 157) + '…' : structured;
+    }
+    if (viewMode === 'expanded') {
+      const raw = formatRawValue(value);
+      if (expanded) {
+        return raw;
+      }
+      return raw.length > 200 ? raw.slice(0, 197) + '…' : raw;
+    }
+    if (viewMode === 'raw') {
+      return formatRawValue(value);
+    }
+    // Compact/default
+    return formatInlineValue(value, expanded ? 320 : 140);
   }
 
   function buildProjectionRows(event) {
@@ -392,6 +463,85 @@
 
   function makePendingKey(functionId, line) {
     return functionId + '::' + line;
+  }
+
+  function makeLineKey(functionId, lineNumber) {
+    if (!functionId || !Number.isFinite(lineNumber)) {
+      return '';
+    }
+    return functionId + '::' + lineNumber;
+  }
+
+  function makeVariableKey(functionId, lineNumber, scope, name) {
+    const lineKey = makeLineKey(functionId, lineNumber);
+    if (!lineKey || !name) {
+      return '';
+    }
+    const scopeLabel = scope || '';
+    return lineKey + '::' + scopeLabel + '::' + name;
+  }
+
+  function getPinnedLineMap(functionId, lineNumber, create) {
+    const lineKey = makeLineKey(functionId, lineNumber);
+    if (!lineKey) {
+      return null;
+    }
+    if (!state.pinnedVariables.has(lineKey) && create) {
+      state.pinnedVariables.set(lineKey, new Map());
+    }
+    return state.pinnedVariables.get(lineKey) || null;
+  }
+
+  function isVariablePinned(functionId, lineNumber, scope, name) {
+    const lineMap = getPinnedLineMap(functionId, lineNumber, false);
+    if (!lineMap) {
+      return false;
+    }
+    const key = makeVariableKey(functionId, lineNumber, scope, name);
+    return lineMap.has(key);
+  }
+
+  function rememberLineSnapshot(functionId, lineNumber, vars) {
+    const lineKey = makeLineKey(functionId, lineNumber);
+    if (!lineKey) {
+      return;
+    }
+    if (Array.isArray(vars) && vars.length > 0) {
+      state.lineVariableSnapshots.set(lineKey, vars);
+    } else {
+      state.lineVariableSnapshots.delete(lineKey);
+    }
+  }
+
+  function findSnapshotEntry(functionId, lineNumber, name) {
+    const lineKey = makeLineKey(functionId, lineNumber);
+    if (!lineKey) {
+      return null;
+    }
+    const vars = state.lineVariableSnapshots.get(lineKey);
+    if (!vars) {
+      return null;
+    }
+    const match = vars.find(function(entry) {
+      return entry && entry.key === name;
+    });
+    if (!match) {
+      return null;
+    }
+    return {
+      scope: match.isGlobal ? 'Global' : 'Local',
+      name: match.key,
+      value: match.value,
+      displayValue: formatValue(match.value),
+      type: getValueType(match.value),
+    };
+  }
+
+  function makeSafeDomId(value) {
+    if (!value) {
+      return 'var-peek';
+    }
+    return value.replace(/[^_A-Za-z0-9-]/g, '_');
   }
 
   function hasValues(record) {
@@ -746,7 +896,7 @@
         if (callSites && callSites[index]) {
           const callSite = callSites[index];
           state.selectedCallSite.set(parentId, callSite);
-          render();
+          updateCallSiteSelectionDom(parentId, index);
           
           // Extract arguments from this call site (don't execute immediately)
           vscode.postMessage({
@@ -919,6 +1069,58 @@
       if (identifier) {
   vscode.postMessage({ type: MESSAGE_TYPES.OPEN_SOURCE, identifier });
       }
+    } else if (action === 'toggle-inline-vars') {
+      const functionId = target.getAttribute('data-function');
+      const lineValue = target.getAttribute('data-line');
+      if (functionId && lineValue) {
+        const lineNumber = parseInt(lineValue, 10);
+        const previous = state.inlinePopover ? { functionId: state.inlinePopover.functionId, line: state.inlinePopover.line } : null;
+        if (previous && previous.functionId === functionId && previous.line === lineNumber) {
+          state.inlinePopover = null;
+        } else {
+          state.inlinePopover = { functionId, line: lineNumber };
+        }
+        refreshInlineVarPeekFor(functionId, lineNumber);
+        if (previous && (previous.functionId !== functionId || previous.line !== lineNumber)) {
+          refreshInlineVarPeekFor(previous.functionId, previous.line);
+        }
+      }
+    } else if (action === 'set-inspector-mode') {
+      const mode = target.getAttribute('data-mode');
+      if (mode && mode !== state.inspectorViewMode) {
+        state.inspectorViewMode = mode;
+        render();
+      }
+    } else if (action === 'toggle-inspector-collapse') {
+      state.inspectorCollapsed = !state.inspectorCollapsed;
+      render();
+    } else if (action === 'copy-variable') {
+      const functionId = target.getAttribute('data-function');
+      const lineValue = target.getAttribute('data-line');
+      const varName = target.getAttribute('data-var-name');
+      const scope = target.getAttribute('data-var-scope');
+      const source = target.getAttribute('data-source');
+      if (functionId && lineValue && varName) {
+        const lineNumber = parseInt(lineValue, 10);
+        const entry = resolveVariableEntry(functionId, lineNumber, varName, scope, source);
+        copyVariableEntry(entry);
+      }
+    } else if (action === 'pin-variable') {
+      const functionId = target.getAttribute('data-function');
+      const lineValue = target.getAttribute('data-line');
+      const varName = target.getAttribute('data-var-name');
+      const scope = target.getAttribute('data-var-scope');
+      const source = target.getAttribute('data-source');
+      if (functionId && lineValue && varName) {
+        const lineNumber = parseInt(lineValue, 10);
+        const entry = resolveVariableEntry(functionId, lineNumber, varName, scope, source);
+        togglePinnedEntry(functionId, lineNumber, entry);
+      }
+    } else if (action === 'toggle-variable-expand') {
+      const rowKey = target.getAttribute('data-row-key');
+      if (rowKey) {
+        toggleInspectorRow(rowKey);
+      }
     } else if (action === 'open-projection') {
       const functionId = target.getAttribute('data-function');
       const lineValue = target.getAttribute('data-line');
@@ -941,10 +1143,7 @@
 
   document.addEventListener('click', (event) => {
     const trigger = findActionTarget(event.target);
-    if (!trigger) {
-      return;
-    }
-    if (trigger.getAttribute('data-action') === 'scroll-parent') {
+    if (trigger && trigger.getAttribute('data-action') === 'scroll-parent') {
       const targetParent = trigger.getAttribute('data-target');
       if (targetParent) {
         expandParent(targetParent);
@@ -953,6 +1152,14 @@
           node.scrollIntoView({ behavior: 'smooth', block: 'center' });
         }
       }
+    }
+
+    const clickTarget = event.target instanceof Element ? event.target : null;
+    const insidePopover = clickTarget ? clickTarget.closest('.var-peek') : null;
+    if (!insidePopover && state.inlinePopover) {
+      const open = state.inlinePopover;
+      state.inlinePopover = null;
+      refreshInlineVarPeekFor(open.functionId, open.line);
     }
   });
 
@@ -966,7 +1173,16 @@
   });
 
   window.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && state.projectionView) {
+    if (event.key !== 'Escape') {
+      return;
+    }
+    if (state.inlinePopover) {
+      const open = state.inlinePopover;
+      state.inlinePopover = null;
+      refreshInlineVarPeekFor(open.functionId, open.line);
+      return;
+    }
+    if (state.projectionView) {
       closeProjection();
     }
   });
@@ -1039,6 +1255,9 @@
       return;
     }
 
+    state.inlinePopover = null;
+    state.inspectorCollapsed = false;
+    state.expandedInspectorRows.clear();
     state.projectionView = {
       functionId,
       file: targetFile,
@@ -1054,6 +1273,100 @@
       return;
     }
     state.projectionView = null;
+    state.expandedInspectorRows.clear();
+    render();
+  }
+
+  function resolveVariableEntry(functionId, lineNumber, varName, scope, source) {
+    if (!functionId || !Number.isFinite(lineNumber) || !varName) {
+      return null;
+    }
+    if (
+      source === 'inspector' &&
+      state.projectionView &&
+      state.projectionView.functionId === functionId &&
+      state.projectionView.line === lineNumber &&
+      Array.isArray(state.projectionView.variables)
+    ) {
+      return state.projectionView.variables.find(function(entry) {
+        if (!entry) {
+          return false;
+        }
+        if (entry.name !== varName) {
+          return false;
+        }
+        if (scope && entry.scope !== scope) {
+          return false;
+        }
+        return true;
+      }) || null;
+    }
+    return findSnapshotEntry(functionId, lineNumber, varName);
+  }
+
+  function togglePinnedEntry(functionId, lineNumber, variableEntry) {
+    if (!variableEntry) {
+      return;
+    }
+    const lineKey = makeLineKey(functionId, lineNumber);
+    if (!lineKey) {
+      return;
+    }
+    const map = getPinnedLineMap(functionId, lineNumber, true);
+    const varKey = makeVariableKey(functionId, lineNumber, variableEntry.scope, variableEntry.name);
+    if (!varKey || !map) {
+      return;
+    }
+    if (map.has(varKey)) {
+      map.delete(varKey);
+      if (map.size === 0) {
+        state.pinnedVariables.delete(lineKey);
+      }
+    } else {
+      map.set(varKey, {
+        scope: variableEntry.scope,
+        name: variableEntry.name,
+        value: variableEntry.value,
+        type: variableEntry.type || getValueType(variableEntry.value),
+      });
+    }
+    render();
+  }
+
+  function copyVariableEntry(variableEntry) {
+    if (!variableEntry) {
+      return;
+    }
+    const text = formatRawValue(variableEntry.value);
+    if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(text).catch(function(err) {
+        console.warn('[flowPanel] Clipboard copy failed:', err);
+      });
+      return;
+    }
+    const temp = document.createElement('textarea');
+    temp.value = text;
+    temp.style.position = 'fixed';
+    temp.style.opacity = '0';
+    document.body.appendChild(temp);
+    temp.select();
+    try {
+      document.execCommand('copy');
+    } catch (err) {
+      console.warn('[flowPanel] execCommand copy failed:', err);
+    }
+    document.body.removeChild(temp);
+  }
+
+  function toggleInspectorRow(rowKey) {
+    if (!rowKey) {
+      return;
+    }
+    if (state.expandedInspectorRows.has(rowKey)) {
+      state.expandedInspectorRows.delete(rowKey);
+    } else {
+      state.expandedInspectorRows.add(rowKey);
+    }
     render();
   }
 
@@ -1247,32 +1560,217 @@
     return html;
   }
 
+  function renderInlineVarPeek(options) {
+    const functionId = options.functionId;
+    const lineNumber = options.lineNumber;
+    const vars = Array.isArray(options.vars) ? options.vars : [];
+    const file = options.file || '';
+    const isOpen = Boolean(state.inlinePopover && state.inlinePopover.functionId === functionId && state.inlinePopover.line === lineNumber);
+    const lineKey = makeLineKey(functionId, lineNumber);
+    const controlId = 'var-peek-' + makeSafeDomId(lineKey);
+    const lineMap = getPinnedLineMap(functionId, lineNumber, false);
+    const pinnedCount = lineMap ? lineMap.size : 0;
+
+    let html = '<div class="var-peek" data-line-key="' + escapeAttribute(lineKey) + '">';
+    html += '<button type="button" class="var-peek-trigger' + (isOpen ? ' is-active' : '') + '" data-action="toggle-inline-vars" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '" aria-expanded="' + (isOpen ? 'true' : 'false') + '" aria-controls="' + escapeAttribute(controlId) + '">';
+    html += '<span class="var-peek-dot"></span>';
+    html += '<span class="var-peek-label">' + vars.length + ' ' + (vars.length === 1 ? 'value' : 'values') + '</span>';
+    html += '</button>';
+    if (pinnedCount > 0) {
+      html += '<span class="var-peek-pin-count" title="Pinned values for this line">' + pinnedCount + '</span>';
+    }
+    if (isOpen) {
+      html += renderInlinePopover({
+        functionId,
+        lineNumber,
+        vars,
+        file,
+        controlId,
+        code: options.lineText || '',
+      });
+    }
+    html += '</div>';
+    return html;
+  }
+
+  function renderInlinePopover(options) {
+    const vars = Array.isArray(options.vars) ? options.vars : [];
+    const displayVars = vars.slice(0, INLINE_VAR_DISPLAY_LIMIT);
+    const functionId = options.functionId;
+    const lineNumber = options.lineNumber;
+    const moreCount = vars.length - displayVars.length;
+    const file = options.file || '';
+    const code = options.code || '';
+
+    const rows = displayVars.map(function(entry) {
+      const valueType = getValueType(entry.value);
+      const preview = formatInlineValue(entry.value, 48);
+      const scope = entry.isGlobal ? 'Global' : 'Local';
+      const pinned = isVariablePinned(functionId, lineNumber, scope, entry.key);
+      const varAttrs = ' data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '" data-var-name="' + escapeAttribute(entry.key) + '" data-var-scope="' + scope + '"';
+      return '<li class="var-popover-row">' +
+        '<div class="var-popover-label">' +
+          '<span class="var-popover-name">' + escapeHtml(entry.key) + '</span>' +
+          (entry.isGlobal ? '<span class="var-popover-scope" title="Global">G</span>' : '') +
+        '</div>' +
+        '<code class="var-popover-value tracer-var-value-' + valueType + '">' + escapeHtml(preview) + '</code>' +
+        '<div class="var-popover-actions">' +
+          '<button type="button" class="var-popover-btn" data-action="copy-variable" data-source="popover"' + varAttrs + ' aria-label="Copy ' + escapeAttribute(entry.key) + '">Copy</button>' +
+          '<button type="button" class="var-popover-btn" data-action="pin-variable" data-source="popover" data-pin-state="' + (pinned ? 'pinned' : 'unpinned') + '"' + varAttrs + '>' + (pinned ? 'Unpin' : 'Pin') + '</button>' +
+        '</div>' +
+      '</li>';
+    }).join('');
+
+    const moreHtml = moreCount > 0
+      ? '<div class="var-popover-more">+' + moreCount + ' more captured for this line</div>'
+      : '';
+
+    return '<div class="var-popover" id="' + escapeAttribute(options.controlId) + '" role="dialog" aria-label="Line variables">' +
+      '<ul class="var-popover-list">' + rows + '</ul>' +
+      moreHtml +
+      '<div class="var-popover-footer">' +
+        '<button type="button" class="var-popover-inspect" data-action="open-projection" data-function="' + escapeAttribute(functionId) + '" data-file="' + escapeAttribute(file) + '" data-line="' + lineNumber + '" data-code="' + escapeAttribute(code.trim()) + '">Open inspector</button>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function refreshInlineVarPeekFor(functionId, lineNumber) {
+    if (!functionId || !Number.isFinite(lineNumber)) {
+      return;
+    }
+    const selector = '.code-line[data-function="' + escapeCss(functionId) + '"][data-line="' + lineNumber + '"]';
+    const lineNode = root.querySelector(selector);
+    if (!lineNode) {
+      return;
+    }
+    const wrapper = lineNode.querySelector('.code-snippet-wrapper');
+    if (!wrapper) {
+      return;
+    }
+    const existing = wrapper.querySelector('.var-peek');
+    if (existing) {
+      existing.remove();
+    }
+    const lineKey = makeLineKey(functionId, lineNumber);
+    const vars = state.lineVariableSnapshots.get(lineKey);
+    if (!Array.isArray(vars) || !vars.length) {
+      return;
+    }
+    const filePath = lineNode.getAttribute('data-file') || '';
+    const codeSnippet = lineNode.querySelector('.code-snippet');
+    const lineText = codeSnippet ? (codeSnippet.textContent || '') : '';
+    const html = renderInlineVarPeek({
+      functionId,
+      lineNumber,
+      vars,
+      file: filePath,
+      lineText,
+    });
+    const temp = document.createElement('div');
+    temp.innerHTML = html;
+    const node = temp.firstElementChild;
+    if (node) {
+      wrapper.appendChild(node);
+    }
+  }
+
+  function updateCallSiteSelectionDom(parentId, selectedIndex) {
+    if (!parentId) {
+      return;
+    }
+  const section = root.querySelector('.call-sites-section[data-call-sites-parent="' + escapeCss(parentId) + '"]');
+    if (!section) {
+      return;
+    }
+    const items = section.querySelectorAll('.call-site-item');
+    items.forEach(function(item, idx) {
+      if (!(item instanceof HTMLElement)) {
+        return;
+      }
+      item.classList.toggle('selected', idx === selectedIndex);
+    });
+  }
+
   function renderProjectionPanel() {
     const projection = state.projectionView;
     if (!projection) {
       return '';
     }
 
+    const mode = state.inspectorViewMode || 'compact';
+    const collapsed = Boolean(state.inspectorCollapsed);
+    const lineKey = makeLineKey(projection.functionId, projection.line);
+    const pinnedValues = (() => {
+      const map = lineKey ? state.pinnedVariables.get(lineKey) : null;
+      return map ? Array.from(map.values()) : [];
+    })();
+
     const rows = projection.variables.length
       ? projection.variables.map(function(entry) {
-          return '<div class="projection-row">' +
-            '<span class="projection-cell projection-scope">' + escapeHtml(entry.scope) + '</span>' +
-            '<span class="projection-cell projection-name">' + escapeHtml(entry.name) + '</span>' +
-            '<code class="projection-cell projection-value tracer-var-value-' + entry.type + '">' + escapeHtml(entry.displayValue) + '</code>' +
-            '</div>';
+          const rowKey = makeVariableKey(projection.functionId, projection.line, entry.scope, entry.name);
+          const isPinned = isVariablePinned(projection.functionId, projection.line, entry.scope, entry.name);
+          const isExpanded = state.expandedInspectorRows.has(rowKey);
+          const displayValue = formatInspectorValue(entry.value, mode, isExpanded);
+          const rawValue = formatInspectorValue(entry.value, 'raw', true);
+          const varAttrs = ' data-function="' + escapeAttribute(projection.functionId) + '" data-line="' + projection.line + '" data-var-name="' + escapeAttribute(entry.name) + '" data-var-scope="' + escapeAttribute(entry.scope) + '" data-row-key="' + escapeAttribute(rowKey) + '" data-source="inspector"';
+          return '<div class="inspector-row' + (isPinned ? ' is-pinned' : '') + (isExpanded ? ' is-expanded' : '') + '">' +
+            '<div class="inspector-row-head">' +
+              '<div class="inspector-row-label">' +
+                '<span class="projection-scope">' + escapeHtml(entry.scope) + '</span>' +
+                '<span class="projection-name">' + escapeHtml(entry.name) + '</span>' +
+              '</div>' +
+              '<div class="inspector-row-actions">' +
+                '<button type="button" class="inspector-action-btn" data-action="pin-variable"' + varAttrs + ' aria-pressed="' + (isPinned ? 'true' : 'false') + '">' + (isPinned ? 'Unpin' : 'Pin') + '</button>' +
+                '<button type="button" class="inspector-action-btn" data-action="copy-variable"' + varAttrs + ' aria-label="Copy ' + escapeAttribute(entry.name) + '">Copy</button>' +
+                '<button type="button" class="inspector-action-btn" data-action="toggle-variable-expand"' + varAttrs + ' aria-expanded="' + (isExpanded ? 'true' : 'false') + '">' + (isExpanded ? 'Collapse' : 'Expand') + '</button>' +
+              '</div>' +
+            '</div>' +
+            '<pre class="inspector-value tracer-var-value-' + entry.type + '">' + escapeHtml(displayValue) + '</pre>' +
+            (isExpanded ? '<details open class="inspector-raw"><summary>Raw</summary><pre>' + escapeHtml(rawValue) + '</pre></details>' : '') +
+          '</div>';
         }).join('')
       : '<div class="projection-empty">No variables captured for this line.</div>';
 
-    return '<section class="projection-dock" role="region" aria-label="Line values">' +
+    const pinnedSection = pinnedValues.length
+      ? '<div class="inspector-pinned">' +
+          '<div class="inspector-section-title">Pinned</div>' +
+          pinnedValues.map(function(entry) {
+            return '<div class="inspector-pinned-pill">' +
+              '<span class="inspector-pinned-name">' + escapeHtml(entry.name) + '</span>' +
+              '<span class="inspector-pinned-equals">=</span>' +
+              '<code class="inspector-pinned-value">' + escapeHtml(formatInlineValue(entry.value, 60)) + '</code>' +
+            '</div>';
+          }).join('') +
+        '</div>'
+      : '';
+
+    const viewModes = [
+      { key: 'compact', label: 'Compact' },
+      { key: 'expanded', label: 'Expanded' },
+      { key: 'structured', label: 'Structured' },
+    ];
+
+    const viewToggles = viewModes.map(function(modeEntry) {
+      return '<button type="button" class="inspector-view-btn' + (mode === modeEntry.key ? ' is-active' : '') + '" data-action="set-inspector-mode" data-mode="' + modeEntry.key + '">' + modeEntry.label + '</button>';
+    }).join('');
+
+    return '<section class="projection-dock' + (collapsed ? ' is-collapsed' : '') + '" role="region" aria-label="Line inspector">' +
       '<header class="projection-header">' +
         '<div>' +
           '<div class="projection-title">' + escapeHtml(extractDisplayName(projection.functionId)) + '</div>' +
           '<div class="projection-subtitle">Line ' + projection.line + ' · ' + escapeHtml(projection.file || '') + '</div>' +
         '</div>' +
-        '<button type="button" class="projection-close" data-action="close-projection" aria-label="Close">×</button>' +
+        '<div class="projection-controls">' +
+          '<button type="button" class="projection-collapse" data-action="toggle-inspector-collapse" aria-expanded="' + (!collapsed) + '">' + (collapsed ? 'Expand' : 'Collapse') + '</button>' +
+          '<div class="inspector-view-group" role="group" aria-label="Inspector view mode">' + viewToggles + '</div>' +
+          '<button type="button" class="projection-close" data-action="close-projection" aria-label="Close">×</button>' +
+        '</div>' +
       '</header>' +
-      '<pre class="projection-code"><code>' + escapeHtml(projection.code || '') + '</code></pre>' +
-      '<div class="projection-grid">' + rows + '</div>' +
+      '<div class="projection-body">' +
+        '<pre class="projection-code"><code>' + escapeHtml(projection.code || '') + '</code></pre>' +
+        pinnedSection +
+        '<div class="projection-grid">' + rows + '</div>' +
+      '</div>' +
     '</section>';
   }
 
@@ -1603,7 +2101,7 @@
     const selected = state.selectedCallSite.get(parentId);
     const isExpanded = state.expandedCallSites.has(parentId);
 
-    let html = '<div class="call-sites-section">';
+  let html = '<div class="call-sites-section" data-call-sites-parent="' + escapeAttribute(parentId) + '">';
     html += '<button type="button" class="section-toggle" data-action="toggle-call-sites" data-parent-id="' + escapeAttribute(parentId) + '">';
     html += '<span class="chevron ' + (isExpanded ? 'open' : '') + '"></span>';
     
@@ -1755,7 +2253,8 @@
 
       const wrapperAttrList = [
         'data-function="' + escapeAttribute(functionId) + '"',
-        'data-line="' + lineNumber + '"'
+        'data-line="' + lineNumber + '"',
+        'data-file="' + escapeAttribute(fn.file || '') + '"'
       ];
       if (callTargetValue) {
         wrapperAttrList.push('data-call-target="' + escapeAttribute(callTargetValue) + '"');
@@ -1763,36 +2262,23 @@
       const allLineAttrs = wrapperAttrList.concat(parentAttrList);
       const wrapperAttrs = allLineAttrs.length ? ' ' + allLineAttrs.join(' ') : '';
       
-      // Inline variable display (code-like execution view)
+      // Inline variable indicator & popover
       let inlineVarsHtml = '';
       if (regularEvents.length > 0 && !hasError) {
         const latestEvent = regularEvents[regularEvents.length - 1];
         const vars = pickVarsForLine(line, latestEvent.locals, latestEvent.globals);
+        rememberLineSnapshot(functionId, lineNumber, vars);
         if (vars && vars.length > 0) {
-          const visibleVars = vars.slice(0, INLINE_VAR_DISPLAY_LIMIT);
-          inlineVarsHtml = '<div class="tracer-inline-vars">';
-          visibleVars.forEach(function(v) {
-            const valueStr = formatInlineValue(v.value, 56);
-            const fullValue = formatValue(v.value);
-            const valueType = getValueType(v.value);
-            const tooltip = `${v.isGlobal ? 'global ' : ''}${v.key} = ${fullValue}`;
-            inlineVarsHtml += '<div class="tracer-var-pill" title="' + escapeAttribute(tooltip) + '">' +
-              (v.isGlobal ? '<span class="tracer-var-badge" title="Global value">GLOBAL</span>' : '') +
-              '<span class="tracer-var-name">' + escapeHtml(v.key) + '</span>' +
-              '<span class="tracer-var-equals">=</span>' +
-              '<code class="tracer-var-value tracer-var-value-' + valueType + '">' + escapeHtml(valueStr) + '</code>' +
-              '</div>';
+          inlineVarsHtml = renderInlineVarPeek({
+            functionId,
+            lineNumber,
+            vars,
+            file: fn.file || '',
+            lineText: line,
           });
-
-          if (vars.length > visibleVars.length) {
-            const hiddenPreview = vars.slice(visibleVars.length)
-              .map(function(v) { return `${v.key} = ${formatValue(v.value)}`; })
-              .join('\n');
-            inlineVarsHtml += '<span class="tracer-var-more" title="' + escapeAttribute(hiddenPreview) + '">+' + (vars.length - visibleVars.length) + ' more</span>';
-          }
-          inlineVarsHtml += '<button type="button" class="tracer-project-btn" data-action="open-projection" data-function="' + escapeAttribute(functionId) + '" data-file="' + escapeAttribute(fn.file || '') + '" data-line="' + lineNumber + '" data-code="' + escapeAttribute(line.trim()) + '">Projection view</button>';
-          inlineVarsHtml += '</div>';
         }
+      } else {
+        rememberLineSnapshot(functionId, lineNumber, null);
       }
       
       html += '<div class="' + lineClass + '"' + wrapperAttrs + '>' +
