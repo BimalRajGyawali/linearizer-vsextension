@@ -9,6 +9,87 @@ import { getRepoRoot } from '../state/runtime';
 
 const execFileAsync = promisify(execFile);
 
+type ExecFileException = NodeJS.ErrnoException & {
+  stdout?: string | Buffer;
+  stderr?: string | Buffer;
+};
+
+function normaliseOutput(value?: string | Buffer | null): string {
+  if (!value) {
+    return '';
+  }
+  return typeof value === 'string' ? value : value.toString('utf8');
+}
+
+function summariseOutput(value?: string | Buffer | null): string | null {
+  const text = normaliseOutput(value).trim();
+  if (!text) {
+    return null;
+  }
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (!lines.length) {
+    return null;
+  }
+  return lines.slice(0, 3).join('\n');
+}
+
+function parseCallArgsOutput(output?: string | Buffer | null): ExtractCallArgsResult | null {
+  const text = normaliseOutput(output);
+  if (!text.trim()) {
+    return null;
+  }
+
+  const attemptParse = (candidate: string): ExtractCallArgsResult | null => {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === 'object') {
+        if ('error' in parsed && parsed.error) {
+          return { error: String(parsed.error) };
+        }
+        if ('args' in parsed && parsed.args) {
+          return parsed.args as TraceCallArgs;
+        }
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  };
+
+  const direct = attemptParse(text.trim());
+  if (direct) {
+    return direct;
+  }
+
+  const lines = text.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const candidate = lines[i].trim();
+    if (!candidate) {
+      continue;
+    }
+    const parsed = attemptParse(candidate);
+    if (parsed) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function buildParseFailureMessage(output?: string | Buffer | null): string {
+  const snippet = summariseOutput(output);
+  if (snippet) {
+    return `Tracer output was not valid JSON:\n${snippet}`;
+  }
+  return 'Tracer did not emit any JSON while extracting call arguments.';
+}
+
+function isExecFileException(error: unknown): error is ExecFileException {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+  return 'stdout' in error || 'stderr' in error;
+}
+
 export async function getPythonPath(): Promise<string> {
   const config = vscode.workspace.getConfiguration('linearizer');
   const configured = config.get<string>('pythonPath');
@@ -67,16 +148,25 @@ export async function extractCallArguments(
       timeout: 30000,
       cwd: repoRoot,
     });
-
-    const parsed = JSON.parse(result.stdout);
-    if (parsed.error) {
-      return { error: String(parsed.error) };
+    const parsed = parseCallArgsOutput(result.stdout);
+    if (parsed) {
+      return parsed;
     }
-    if (parsed.args) {
-      return parsed.args as TraceCallArgs;
-    }
-    return { error: 'Tracer did not return arguments for the selected call site' };
+    return { error: buildParseFailureMessage(result.stdout) };
   } catch (error) {
+    if (isExecFileException(error)) {
+      const parsed = parseCallArgsOutput(error.stdout);
+      if (parsed) {
+        return parsed;
+      }
+      const snippet = summariseOutput(error.stderr) ?? summariseOutput(error.stdout);
+      const fallbackMessage = snippet
+        ? `Call-site argument extraction failed:\n${snippet}`
+        : error instanceof Error
+          ? error.message
+          : String(error);
+      return { error: fallbackMessage };
+    }
     const errorMessage = error instanceof Error ? error.message : String(error);
     return { error: errorMessage };
   }
