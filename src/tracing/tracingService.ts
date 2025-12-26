@@ -249,7 +249,7 @@ export class TracerManager {
     pythonPath: string,
   ): void {
     const tracerPath = path.join(extensionPath, 'python', 'tracer.py');
-
+    console.log('Spawning tracer with path:', tracerPath);
     this.outputChannel.appendLine(
       `[Rust-like] Spawning tracer for ${entryFullId} at location ${initialRequest.location}`,
     );
@@ -299,6 +299,7 @@ export class TracerManager {
 
       const lines = this.stderrBuffer.split('\n');
       this.stderrBuffer = lines.pop() || '';
+      console.log('Tracer stderr line data:', lines);
 
       for (const line of lines) {
         if (line.trim()) {
@@ -317,6 +318,7 @@ export class TracerManager {
     });
 
     this.process.on('error', (error) => {
+      console.log('Tracer process error:', error);
       this.outputChannel.appendLine(`[Tracer error] ${error.message}`);
       if (this.pendingReadReject) {
         this.pendingReadReject(new Error(error.message));
@@ -425,6 +427,7 @@ export class TracerManager {
     if (firstTime) {
       this.outputChannel.appendLine(`[Rust-like] First call - spawning tracer for ${entryFullId}`);
       this.currentFlow = entryFullId;
+      console.log('Spawning tracer with request:', resolvedRequest);
       this.spawnTracer(repoRoot, entryFullId, resolvedRequest, argsJson, extensionPath, pythonPath);
     }
 

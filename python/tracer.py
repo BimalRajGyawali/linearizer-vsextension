@@ -802,8 +802,8 @@ class PersistentDebugger(bdb.Bdb):
         self.pinned_target_file = False
         self.thread_exception = None  # Store exceptions from the debugger thread
         self.event_callback = event_callback
-    self.last_raw_locals: Optional[Dict[str, Any]] = None
-    self.last_raw_globals: Optional[Dict[str, Any]] = None
+        self.last_raw_locals: Optional[Dict[str, Any]] = None
+        self.last_raw_globals: Optional[Dict[str, Any]] = None
 
     def user_line(self, frame):
         try:
@@ -969,8 +969,8 @@ class PersistentDebugger(bdb.Bdb):
         # let the debugger start paused until the first continue_until
         self.step_event.clear()
         log("Cleared step_event (debugger paused)")
-    self.last_raw_locals = None
-    self.last_raw_globals = None
+        self.last_raw_locals = None
+        self.last_raw_globals = None
 
     def set_event_callback(self, callback: Optional[Callable[[Dict[str, Any]], None]]):
         self.event_callback = callback

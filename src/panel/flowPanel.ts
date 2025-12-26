@@ -39,6 +39,7 @@ import {
   buildFlowTraceRequest,
   lastExecutedLineByContext,
 } from '../tracing/tracingService';
+import { log } from 'node:console';
 
 export async function showFlowPanel(
   context: vscode.ExtensionContext,
@@ -321,19 +322,12 @@ async function executeFromCallSite(
       !callSite.calling_function_id && callSite.file ? ensureTopLevelFunctionIdentifier(callSite.file) : undefined;
     const resolvedCallingFunctionId = callSite.calling_function_id ?? derivedTopLevelId;
 
-    console.log('Executing from call site:', callSite, {
+    console.log('Executing from call site from TS:', callSite, {
       functionId,
       resolvedCallingFunctionId,
     });
-    
 
-    const executeTargetWithArgs = async (argsToUse: NormalisedCallArgs) => {
-      setStoredCallArgs(functionId, argsToUse);
-      const targetBody = resolveFunctionBody(functionId);
-      const startLine = targetBody?.line ?? 1;
-      await handleTraceLine(functionId, startLine, startLine, context, argsToUse);
-    };
-
+   
     if (resolvedCallingFunctionId) {
       const callingFunctionId = resolvedCallingFunctionId.startsWith('/')
         ? resolvedCallingFunctionId.slice(1)
@@ -344,11 +338,15 @@ async function executeFromCallSite(
           `Invalid calling function ID format: ${resolvedCallingFunctionId}. Expected format: path/to/file.py::function_name`,
         );
       }
+      console.log('Resolved calling function ID:', resolvedCallingFunctionId, { callingIsTopLevel });
       const storedCallingArgs =
         getStoredCallArgs(resolvedCallingFunctionId) ?? getStoredCallArgs(callingFunctionId);
+
+        console.log('Stored calling args:', storedCallingArgs);
       let callingCallArgs: NormalisedCallArgs | undefined;
       if (storedCallingArgs) {
         callingCallArgs = cloneCallArgs(storedCallingArgs);
+        console.log('Using stored calling args:', callingCallArgs);
       } else if (!callingIsTopLevel) {
         const callingSignature = await getFunctionSignature(
           pythonPath,
@@ -357,6 +355,7 @@ async function executeFromCallSite(
           context.extensionPath,
         );
         const requiredParams = getRequiredParameterNames(callingSignature);
+        console.log('Required parameters:', requiredParams);
         if (requiredParams.length > 0) {
           const requiredList = requiredParams.join(', ');
           const warningMessage = `Arguments for ${callSite.calling_function || callingFunctionId} require ${requiredList}. Run the calling function once with its inputs or provide them manually before selecting a call site.`;
@@ -378,15 +377,26 @@ async function executeFromCallSite(
         callingCallArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
       }
 
+      
       const callingArgsJson = JSON.stringify(callingCallArgs);
+      console.log('Final calling call args to use:', callingCallArgs);
       const callingArgsKey = getArgsContextKey(callingFunctionId, callingCallArgs);
+      console.log('Calling args key:', callingArgsKey);
+
       const callingParentId = resolvedCallingFunctionId.startsWith('/')
         ? resolvedCallingFunctionId
         : `/${resolvedCallingFunctionId}`;
+
+      console.log('Resolved calling parent ID:', callingParentId);
       const callingCacheKey = getCacheKey(callingParentId, callSite.line, callingCallArgs);
       let callingContext = parentExecutionContextCache.get(callingCacheKey);
 
+      
+      console.log('Calling context cache key:', callingCacheKey);
+      console.log('Calling context cache value:', callingContext);
+
       if (!callingContext) {
+        console.log('Creating new calling context');
         const callingTracer = getOrCreateTracerManager(
           context,
           repoRoot,
@@ -396,11 +406,14 @@ async function executeFromCallSite(
         );
         callingTracer.setSuppressWebviewEvents(false);
 
+        console.log('Calling tracer created:', callingTracer);
         const callSiteFilePath = callSite.file
           ? path.isAbsolute(callSite.file)
             ? callSite.file
             : path.join(repoRoot, callSite.file.startsWith('/') ? callSite.file.slice(1) : callSite.file)
           : undefined;
+
+          console.log('Call site file path:', callSiteFilePath);
 
         const callSiteRequest = buildFlowTraceRequest({
           entryFullId: callingFunctionId,
@@ -409,6 +422,16 @@ async function executeFromCallSite(
           filePath: callSiteFilePath,
         });
 
+        console.log('Call site request:', callSiteRequest);
+        console.log('Fetching tracer data for call site execution...');
+        console.log('Repo root:', repoRoot);
+        console.log('Calling function ID:', callingFunctionId);
+        console.log('Call site line:', callSite.line - 1);
+        console.log('Call site file:', callSite.file);
+        console.log('Calling args JSON:', callingArgsJson);
+        console.log('Extension path:', context.extensionPath);
+        console.log('Python path:', pythonPath);
+        console.log('Suppressing webview events:', false);
         const callSiteEvent = await callingTracer.getTracerData(
           repoRoot,
           callingFunctionId,
@@ -421,6 +444,9 @@ async function executeFromCallSite(
           callSiteRequest,
           callingParentId,
         );
+
+        console.log('Call site execution event:', callSiteEvent);
+        
 
         callingContext = {
           locals: callSiteEvent.locals || {},
@@ -449,6 +475,8 @@ async function executeFromCallSite(
         },
       );
 
+      console.log('Extracted call arguments at call site:', extractedArgs);
+
       if (extractedArgs && !('error' in extractedArgs)) {
         const normalisedArgs = normaliseCallArgs(extractedArgs);
         panel.webview.postMessage({
@@ -457,7 +485,22 @@ async function executeFromCallSite(
           callSite,
           args: normalisedArgs,
         });
-        await executeTargetWithArgs(normalisedArgs);
+
+        // Store callee args (for later) and then execute the caller at the call line
+        setStoredCallArgs(functionId, normalisedArgs);
+        // ensure calling function stored args are set
+        setStoredCallArgs(resolvedCallingFunctionId, callingCallArgs);
+        setStoredCallArgs(callingFunctionId, callingCallArgs);
+
+        // Execute the calling function at the call line (so the call actually occurs in the caller),
+        // rather than executing the callee body directly.
+        await handleTraceLine(
+          resolvedCallingFunctionId,
+          callSite.line,
+          callSite.line,
+          context,
+          callingCallArgs,
+        );
       } else {
         const errorMsg = extractedArgs && 'error' in extractedArgs ? extractedArgs.error : 'Failed to extract call arguments';
         panel.webview.postMessage({
@@ -471,6 +514,8 @@ async function executeFromCallSite(
     }
 
     if (callSite.call_line) {
+      console.log('No calling function ID - extracting args directly from call line', callSite.call_line);
+      
       const extractedArgs = await extractCallArguments(
         await getPythonPath(),
         repoRoot,
@@ -489,6 +534,13 @@ async function executeFromCallSite(
           callSite,
           args: normalisedArgs,
         });
+      const executeTargetWithArgs = async (argsToUse: NormalisedCallArgs) => {
+      setStoredCallArgs(functionId, argsToUse);
+      const targetBody = resolveFunctionBody(functionId);
+      const startLine = targetBody?.line ?? 1;
+      await handleTraceLine(functionId, startLine, startLine, context, argsToUse);
+    };
+
         await executeTargetWithArgs(normalisedArgs);
       } else {
         const errorMsg = extractedArgs && 'error' in extractedArgs ? extractedArgs.error : 'Failed to extract call arguments from call line';
@@ -509,6 +561,7 @@ async function executeFromCallSite(
       error: 'The calling function could not be determined and the call line is not available.',
     });
   } catch (error) {
+    console.error('Error executing from call site:  TS', error);
     vscode.window.showErrorMessage(`Error executing from call site: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
