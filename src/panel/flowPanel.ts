@@ -318,6 +318,14 @@ async function executeFromCallSite(
 
   try {
     const pythonPath = await getPythonPath();
+    const targetEntryFullId = functionId.startsWith('/') ? functionId.slice(1) : functionId;
+    const targetSignature = await getFunctionSignature(
+      pythonPath,
+      repoRoot,
+      targetEntryFullId,
+      context.extensionPath,
+    );
+    const functionTakesNoArgs = Array.isArray(targetSignature?.params) && targetSignature.params.length === 0;
     const derivedTopLevelId =
       !callSite.calling_function_id && callSite.file ? ensureTopLevelFunctionIdentifier(callSite.file) : undefined;
     const resolvedCallingFunctionId = callSite.calling_function_id ?? derivedTopLevelId;
@@ -460,10 +468,32 @@ async function executeFromCallSite(
       const previousLine = lastExecutedLineByContext.get(callingArgsKey) ?? 0;
       lastExecutedLineByContext.set(callingArgsKey, Math.max(previousLine, callSite.line));
 
+      if (functionTakesNoArgs) {
+        const voidArgs: NormalisedCallArgs = { args: [], kwargs: {} };
+        panel.webview.postMessage({
+          type: 'call-site-args-extracted',
+          functionId,
+          callSite,
+          args: voidArgs,
+          statusMessage: 'Function takes no arguments',
+        });
+        setStoredCallArgs(functionId, voidArgs);
+        setStoredCallArgs(resolvedCallingFunctionId, callingCallArgs);
+        setStoredCallArgs(callingFunctionId, callingCallArgs);
+        await handleTraceLine(
+          resolvedCallingFunctionId,
+          callSite.line,
+          callSite.line,
+          context,
+          callingCallArgs,
+        );
+        return;
+      }
+
       const extractedArgs = await extractCallArguments(
         pythonPath,
         repoRoot,
-        functionId.startsWith('/') ? functionId.slice(1) : functionId,
+        targetEntryFullId,
         callSite.file,
         callSite.line,
         callingContext.locals || {},
@@ -516,10 +546,30 @@ async function executeFromCallSite(
     if (callSite.call_line) {
       console.log('No calling function ID - extracting args directly from call line', callSite.call_line);
       
+      const executeTargetWithArgs = async (argsToUse: NormalisedCallArgs) => {
+        setStoredCallArgs(functionId, argsToUse);
+        const targetBody = resolveFunctionBody(functionId);
+        const startLine = targetBody?.line ?? 1;
+        await handleTraceLine(functionId, startLine, startLine, context, argsToUse);
+      };
+
+      if (functionTakesNoArgs) {
+        const voidArgs: NormalisedCallArgs = { args: [], kwargs: {} };
+        panel.webview.postMessage({
+          type: 'call-site-args-extracted',
+          functionId,
+          callSite,
+          args: voidArgs,
+          statusMessage: 'Function takes no arguments',
+        });
+        await executeTargetWithArgs(voidArgs);
+        return;
+      }
+
       const extractedArgs = await extractCallArguments(
         await getPythonPath(),
         repoRoot,
-        functionId.startsWith('/') ? functionId.slice(1) : functionId,
+        targetEntryFullId,
         callSite.file,
         callSite.line,
         {},
@@ -534,13 +584,6 @@ async function executeFromCallSite(
           callSite,
           args: normalisedArgs,
         });
-      const executeTargetWithArgs = async (argsToUse: NormalisedCallArgs) => {
-      setStoredCallArgs(functionId, argsToUse);
-      const targetBody = resolveFunctionBody(functionId);
-      const startLine = targetBody?.line ?? 1;
-      await handleTraceLine(functionId, startLine, startLine, context, argsToUse);
-    };
-
         await executeTargetWithArgs(normalisedArgs);
       } else {
         const errorMsg = extractedArgs && 'error' in extractedArgs ? extractedArgs.error : 'Failed to extract call arguments from call line';

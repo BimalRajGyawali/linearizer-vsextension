@@ -552,7 +552,7 @@
       if (message.callSite) {
         setCallSiteStatus(message.functionId, message.callSite, {
           state: 'success',
-          message: 'Arguments captured from call site',
+          message: message.statusMessage || 'Arguments captured from call site',
         });
       }
       render();
@@ -1359,7 +1359,7 @@
   function renderParentArgsSection(parentId) {
     console.log('[flowPanel] Rendering parent args section for:', parentId);
     // Get function signature to map parameter names
-    const params = state.functionSignatures.get(parentId);
+  const params = state.functionSignatures.get(parentId);
     const paramTypes = state.functionParamTypes.get(parentId);
     const paramDefaults = state.functionParamDefaults.get(parentId);
     console.log('[flowPanel] Function signature for', parentId, ':', params, paramTypes, paramDefaults);
@@ -1374,6 +1374,13 @@
       });
     }
 
+    const userParamCount = Array.isArray(params)
+      ? params.filter(function(paramName) {
+          return paramName !== 'self' && paramName !== 'cls';
+        }).length
+      : null;
+    const requiresArgs = userParamCount === null ? true : userParamCount > 0;
+
     const storedArgs = getCallArgsForFunction(parentId);
     const hasArgs = storedArgs && (storedArgs.args.length > 0 || Object.keys(storedArgs.kwargs || {}).length > 0);
     const isExpanded = state.expandedArgs.has(parentId);
@@ -1386,6 +1393,8 @@
     if (hasArgs) {
       const argsCount = (storedArgs.args ? storedArgs.args.length : 0) + (storedArgs.kwargs ? Object.keys(storedArgs.kwargs).length : 0);
       html += '<span class="section-title">Arguments <span class="section-badge">' + argsCount + ' set</span></span>';
+    } else if (requiresArgs === false && Array.isArray(params)) {
+      html += '<span class="section-title">Arguments <span class="section-badge success">No inputs required</span></span>';
     } else if (params && params.length > 0) {
       html += '<span class="section-title">Arguments <span class="section-badge empty">Not set</span></span>';
     } else {
@@ -1394,8 +1403,13 @@
     html += '</button>';
     
     if (isExpanded) {
-      html += '<div class="section-content">';
-      html += '<div class="parent-args-content">';
+      if (requiresArgs === false && Array.isArray(params)) {
+        html += '<div class="section-content no-args-required">';
+        html += '<div class="placeholder mini">This function takes no arguments.</div>';
+        html += '</div>';
+      } else {
+        html += '<div class="section-content">';
+        html += '<div class="parent-args-content">';
       
       // Build a map of param names to indices (excluding self/cls)
       const paramIndexMap = new Map(); // paramName -> displayIndex (for args array)
@@ -1573,9 +1587,10 @@
         html += '<div class="placeholder mini">Loading function signature...</div>';
       }
       
-      html += '<button type="button" class="compact-btn save-args-btn" data-action="save-parent-args" data-parent-id="' + escapeAttribute(parentId) + '">Save Arguments</button>';
-      html += '</div>';
-      html += '</div>';
+        html += '<button type="button" class="compact-btn save-args-btn" data-action="save-parent-args" data-parent-id="' + escapeAttribute(parentId) + '">Save Arguments</button>';
+        html += '</div>';
+        html += '</div>';
+      }
     }
     html += '</div>';
     
