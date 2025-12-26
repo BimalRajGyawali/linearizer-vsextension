@@ -861,6 +861,7 @@
       }
     } else if (action === 'execute-with-args') {
       const parentId = target.getAttribute('data-parent-id');
+      console.log('[flowPanel] Execute with args clicked for parent:', parentId);
       if (parentId) {
         // Expand the parent if not already expanded to show the args section
         if (!state.expandedParents.has(parentId)) {
@@ -876,6 +877,7 @@
         state.expandedArgs.add(parentId);
         // Request function signature if not already loaded
         if (!state.functionSignatures.has(parentId) && !state.loadingSignatures.has(parentId)) {
+          console.log('[flowPanel] Requesting function signature for parent:', parentId, state.functionSignatures);
           state.loadingSignatures.add(parentId);
           vscode.postMessage({
             type: MESSAGE_TYPES.REQUEST_FUNCTION_SIGNATURE,
@@ -1355,12 +1357,15 @@
   }
 
   function renderParentArgsSection(parentId) {
+    console.log('[flowPanel] Rendering parent args section for:', parentId);
     // Get function signature to map parameter names
     const params = state.functionSignatures.get(parentId);
     const paramTypes = state.functionParamTypes.get(parentId);
     const paramDefaults = state.functionParamDefaults.get(parentId);
-    
+    console.log('[flowPanel] Function signature for', parentId, ':', params, paramTypes, paramDefaults);
+
     if (!params && !state.loadingSignatures.has(parentId)) {
+      console.log('[flowPanel] Requesting function signature for parent (args section):', parentId, state);
       // Request function signature
       state.loadingSignatures.add(parentId);
       vscode.postMessage({
@@ -1373,6 +1378,7 @@
     const hasArgs = storedArgs && (storedArgs.args.length > 0 || Object.keys(storedArgs.kwargs || {}).length > 0);
     const isExpanded = state.expandedArgs.has(parentId);
 
+    console.log('[flowPanel] Stored args for', parentId, ':', storedArgs, 'hasArgs:', hasArgs, 'isExpanded:', isExpanded);
     let html = '<div class="parent-args-section">';
     html += '<button type="button" class="section-toggle" data-action="toggle-args" data-parent-id="' + escapeAttribute(parentId) + '">';
     html += '<span class="chevron ' + (isExpanded ? 'open' : '') + '"></span>';
