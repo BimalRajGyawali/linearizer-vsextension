@@ -67,6 +67,7 @@
     lineVariableSnapshots: new Map(), // lineKey -> Array of inline vars for popover/copy actions
     inspectorPosition: null, // { top, left } when user undocks the inspector
     inspectorSize: null, // { width, height } when user resizes the inspector
+    pendingTraceTrigger: null, // { type: 'line' | 'call-site', ... }
     lastTracerLocation: null, // { line, filename, functionId } for most recent executed line
   };
   let pendingTraceTimer = null;
@@ -120,6 +121,7 @@
     }
     if (state.pendingTraceRequest) {
       state.pendingTraceRequest = null;
+      state.pendingTraceTrigger = null;
       if (options && options.render !== false) {
         render();
       }
@@ -138,10 +140,15 @@
       source: meta.source || 'trace-line',
       label: typeof meta.label === 'string' ? meta.label : null,
     };
+    state.pendingTraceTrigger = meta.trigger || null;
+    if (meta.render !== false) {
+      render();
+    }
     pendingTraceTimer = setTimeout(function() {
       console.warn('[flowPanel] Trace request auto-cleared after timeout');
       pendingTraceTimer = null;
       state.pendingTraceRequest = null;
+      state.pendingTraceTrigger = null;
       render();
     }, 35000);
   }
@@ -946,6 +953,13 @@
       event.stopPropagation();
       event.preventDefault();
     }
+
+    if (state.pendingTraceRequest) {
+      console.warn('[flowPanel] Ignoring action while execution pending:', action);
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     
     if (action === 'toggle-parent') {
       const parent = target.getAttribute('data-parent');
@@ -999,6 +1013,13 @@
           markPendingTrace(parentId, callSite && typeof callSite.line === 'number' ? callSite.line : null, {
             source: 'call-site',
             label: 'Executing call site…',
+            trigger: {
+              type: 'call-site',
+              parentId,
+              index,
+              line: callSite ? callSite.line : null,
+              file: callSite ? callSite.file : null,
+            },
           });
           vscode.postMessage({
             type: MESSAGE_TYPES.EXECUTE_FROM_CALL_SITE,
@@ -1268,6 +1289,10 @@
     if (!state.projectionView || event.button !== 0) {
       return;
     }
+    if (state.pendingTraceRequest) {
+      event.preventDefault();
+      return;
+    }
     const target = event.target instanceof Element ? event.target : null;
     if (!target) {
       return;
@@ -1497,6 +1522,8 @@
     const parentFunctionId = target.getAttribute('data-parent-function');
     const parentLine = target.getAttribute('data-parent-line');
     const callLine = target.getAttribute('data-call-line');
+  const parentLineNumber = parentLine ? parseInt(parentLine, 10) : null;
+  const callLineNumber = callLine ? parseInt(callLine, 10) : null;
 
     if (!functionId || !line) {
       console.error('[flowPanel] Missing functionId or line:', { functionId, line });
@@ -1526,10 +1553,10 @@
       stopLine: stopLineNum,
     };
 
-    if (parentFunctionId && parentLine && callLine) {
+    if (parentFunctionId && Number.isFinite(parentLineNumber) && Number.isFinite(callLineNumber)) {
       payload.parentFunctionId = parentFunctionId;
-      payload.parentLine = parseInt(parentLine, 10);
-      payload.callLine = parseInt(callLine, 10);
+      payload.parentLine = parentLineNumber;
+      payload.callLine = callLineNumber;
       payload.isNested = true;
 
       const parentStoredArgs = getCallArgsForFunction(parentFunctionId);
@@ -1564,6 +1591,15 @@
     markPendingTrace(functionId, lineNumber, {
       source: 'trace-line',
       label: 'Executing line ' + lineNumber + '…',
+      trigger: {
+        type: 'line',
+        functionId,
+        line: lineNumber,
+        file: functions[functionId] ? functions[functionId].file : null,
+        parentFunctionId: parentFunctionId || null,
+        parentLine: Number.isFinite(parentLineNumber) ? parentLineNumber : null,
+        callLine: Number.isFinite(callLineNumber) ? callLineNumber : null,
+      },
     });
     vscode.postMessage(payload);
   }
@@ -1590,24 +1626,13 @@
   function renderLoadingOverlay() {
     const isTracingParent = state.tracingParent.size > 0;
     const isTracingChild = state.tracingChild.size > 0;
-    const isPendingTrace = Boolean(state.pendingTraceRequest);
     
-    if (!isTracingParent && !isTracingChild && !isPendingTrace) {
+    if (!isTracingParent && !isTracingChild) {
       return '';
     }
 
     let message = '';
-    if (isPendingTrace) {
-      const pending = state.pendingTraceRequest;
-      if (pending && typeof pending.label === 'string' && pending.label.length > 0) {
-        message = pending.label;
-      } else if (pending && pending.source === 'call-site') {
-        message = 'Executing call site…';
-      } else {
-        const pendingLine = pending && typeof pending.line === 'number' ? pending.line : null;
-        message = pendingLine ? ('Executing line ' + pendingLine + '…') : 'Executing selection…';
-      }
-    } else if (isTracingParent && isTracingChild) {
+    if (isTracingParent && isTracingChild) {
       message = 'Preparing execution context...';
     } else if (isTracingParent) {
       message = 'Tracing parent function...';
@@ -2446,6 +2471,7 @@
     const loading = state.loadingCallSites.has(parentId);
     const selected = state.selectedCallSite.get(parentId);
     const isExpanded = state.expandedCallSites.has(parentId);
+    const pendingTrigger = state.pendingTraceTrigger;
 
   let html = '<div class="call-sites-section" data-call-sites-parent="' + escapeAttribute(parentId) + '">';
     html += '<button type="button" class="section-toggle" data-action="toggle-call-sites" data-parent-id="' + escapeAttribute(parentId) + '">';
@@ -2479,14 +2505,24 @@
             : (status && status.state === 'success'
               ? 'Arguments captured'
               : '');
+          const isPendingCallSite = Boolean(
+            pendingTrigger &&
+            pendingTrigger.type === 'call-site' &&
+            pendingTrigger.parentId === parentId &&
+            pendingTrigger.index === index
+          );
+          const pendingClass = isPendingCallSite ? ' is-pending' : '';
           
-          html += '<div class="call-site-item ' + (isSelected ? 'selected' : '') + statusClass + '" data-call-site-index="' + index + '" data-action="select-call-site" data-parent-id="' + escapeAttribute(parentId) + '">';
+          html += '<div class="call-site-item ' + (isSelected ? 'selected' : '') + statusClass + pendingClass + '" data-call-site-index="' + index + '" data-action="select-call-site" data-parent-id="' + escapeAttribute(parentId) + '">';
           html += '<div class="call-site-header">';
           html += '<span class="call-site-file">' + escapeHtml(fileDisplay) + '</span>';
           html += '<span class="call-site-line">:' + callSite.line + '</span>';
           html += '<span class="call-site-function"> in ' + escapeHtml(callingFunctionName) + '()</span>';
           html += '</div>';
           html += '<div class="call-site-code">' + escapeHtml(callSite.call_line) + '</div>';
+          if (isPendingCallSite) {
+            html += '<div class="call-site-loading" role="status" aria-label="Executing"></div>';
+          }
           if (statusLabel) {
             html += '<div class="call-site-status call-site-status-' + status.state + '">' + statusLabel + '</div>';
           }
@@ -2546,6 +2582,7 @@
     const lines = fn.body.split(/\r?\n/);
     const normalisedFnFile = normalisePath(fn.file || '');
     const lastTracerLocation = state.lastTracerLocation;
+    const pendingTrigger = state.pendingTraceTrigger;
     let html = '<div class="code-block" data-function="' + escapeAttribute(functionId) + '"' +
       (parentContext ? ' data-parent-function="' + escapeAttribute(parentContext.parentFunctionId) + '" data-parent-line="' + parentContext.parentLineNumber + '" data-call-line="' + parentContext.callLineInParent + '"' : '') +
       '>';
@@ -2582,10 +2619,18 @@
       const regularEvents = lineEvents.filter(function(e) { return e.event !== 'error'; });
       const errorEvents = lineEvents.filter(function(e) { return e.event === 'error'; });
       
-  const matchesByFunction = Boolean(lastTracerLocation && lastTracerLocation.functionId && lastTracerLocation.functionId === functionId);
-  const matchesByFile = Boolean(lastTracerLocation && !lastTracerLocation.functionId && lastTracerLocation.filename && normalisedFnFile && filesRoughlyMatch(lastTracerLocation.filename, normalisedFnFile));
-  const isLatestTracerLine = Boolean(lastTracerLocation) && lastTracerLocation.line === lineNumber && (matchesByFunction || matchesByFile);
-  const lineClass = isLatestTracerLine ? 'code-line tracer-active' : 'code-line';
+    const matchesByFunction = Boolean(lastTracerLocation && lastTracerLocation.functionId && lastTracerLocation.functionId === functionId);
+    const matchesByFile = Boolean(lastTracerLocation && !lastTracerLocation.functionId && lastTracerLocation.filename && normalisedFnFile && filesRoughlyMatch(lastTracerLocation.filename, normalisedFnFile));
+    const isLatestTracerLine = Boolean(lastTracerLocation) && lastTracerLocation.line === lineNumber && (matchesByFunction || matchesByFile);
+      const isPendingLine = Boolean(pendingTrigger && pendingTrigger.type === 'line' && pendingTrigger.functionId === functionId && pendingTrigger.line === lineNumber);
+      const lineClassList = ['code-line'];
+      if (isLatestTracerLine) {
+        lineClassList.push('tracer-active');
+      }
+      if (isPendingLine) {
+        lineClassList.push('is-pending');
+      }
+      const lineClass = lineClassList.join(' ');
       const callTargetValue = formatted.calls.length === 1 ? formatted.calls[0].targetId : '';
       const callTargetAttr = callTargetValue ? ' data-call-target="' + escapeAttribute(callTargetValue) + '"' : '';
       
@@ -2632,14 +2677,17 @@
       }
       
       const traceDisabled = hasInlineIndicator || isLatestTracerLine;
-      const lineNumberDisabled = traceDisabled ? ' disabled aria-disabled="true"' : '';
-      const lineNumberTitle = traceDisabled ? 'Already executed' : 'Click to execute up to this line';
+      const isButtonDisabled = traceDisabled || isPendingLine;
+      const lineNumberDisabled = isButtonDisabled ? ' disabled aria-disabled="true"' : '';
+      const lineNumberTitle = isPendingLine
+        ? 'Executing…'
+        : (traceDisabled ? 'Already executed' : 'Click to execute up to this line');
 
       const inlineIndicatorHtml = inlineVarsHtml || '<span class="var-peek var-peek-empty" aria-hidden="true"></span>';
 
       html += '<div class="' + lineClass + '"' + wrapperAttrs + '>' +
         inlineIndicatorHtml +
-        '<button type="button" class="line-number" data-action="trace-line" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '"' + callTargetAttr + parentAttrs + lineNumberDisabled + ' title="' + lineNumberTitle + '">' + lineNumber + '</button>' +
+  '<button type="button" class="line-number" data-action="trace-line" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '"' + callTargetAttr + parentAttrs + lineNumberDisabled + ' title="' + lineNumberTitle + '">' + lineNumber + '</button>' +
         '<div class="code-snippet-wrapper">' +
         '<span class="code-snippet">' + codeHtml + '</span>' +
         '</div>' +
