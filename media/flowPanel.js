@@ -1074,16 +1074,20 @@
       const lineValue = target.getAttribute('data-line');
       if (functionId && lineValue) {
         const lineNumber = parseInt(lineValue, 10);
-        const previous = state.inlinePopover ? { functionId: state.inlinePopover.functionId, line: state.inlinePopover.line } : null;
-        if (previous && previous.functionId === functionId && previous.line === lineNumber) {
-          state.inlinePopover = null;
-        } else {
-          state.inlinePopover = { functionId, line: lineNumber };
+        if (!Number.isFinite(lineNumber)) {
+          return;
         }
-        refreshInlineVarPeekFor(functionId, lineNumber);
-        if (previous && (previous.functionId !== functionId || previous.line !== lineNumber)) {
-          refreshInlineVarPeekFor(previous.functionId, previous.line);
+        let filePath = target.getAttribute('data-file') || '';
+        let codeSnippet = target.getAttribute('data-code') || '';
+        const codeLineNode = typeof target.closest === 'function' ? target.closest('.code-line') : null;
+        if (!filePath && codeLineNode) {
+          filePath = codeLineNode.getAttribute('data-file') || '';
         }
+        if (!codeSnippet && codeLineNode) {
+          const snippetNode = codeLineNode.querySelector('.code-snippet');
+          codeSnippet = snippetNode ? (snippetNode.textContent || '') : '';
+        }
+        toggleProjection(functionId, filePath, lineNumber, (codeSnippet || '').trim());
       }
     } else if (action === 'set-inspector-mode') {
       const mode = target.getAttribute('data-mode');
@@ -1565,29 +1569,23 @@
     const lineNumber = options.lineNumber;
     const vars = Array.isArray(options.vars) ? options.vars : [];
     const file = options.file || '';
-    const isOpen = Boolean(state.inlinePopover && state.inlinePopover.functionId === functionId && state.inlinePopover.line === lineNumber);
+    const inspectorActive = Boolean(
+      state.projectionView &&
+      state.projectionView.functionId === functionId &&
+      state.projectionView.line === lineNumber
+    );
     const lineKey = makeLineKey(functionId, lineNumber);
-    const controlId = 'var-peek-' + makeSafeDomId(lineKey);
     const lineMap = getPinnedLineMap(functionId, lineNumber, false);
     const pinnedCount = lineMap ? lineMap.size : 0;
+    const codeSnippet = typeof options.lineText === 'string' ? options.lineText.trim() : '';
 
     let html = '<div class="var-peek" data-line-key="' + escapeAttribute(lineKey) + '">';
-    html += '<button type="button" class="var-peek-trigger' + (isOpen ? ' is-active' : '') + '" data-action="toggle-inline-vars" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '" aria-expanded="' + (isOpen ? 'true' : 'false') + '" aria-controls="' + escapeAttribute(controlId) + '">';
+    html += '<button type="button" class="var-peek-trigger' + (inspectorActive ? ' is-active' : '') + '" data-action="toggle-inline-vars" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '" data-file="' + escapeAttribute(file) + '" data-code="' + escapeAttribute(codeSnippet) + '" aria-pressed="' + (inspectorActive ? 'true' : 'false') + '">';
     html += '<span class="var-peek-dot"></span>';
     html += '<span class="var-peek-label">' + vars.length + ' ' + (vars.length === 1 ? 'value' : 'values') + '</span>';
     html += '</button>';
     if (pinnedCount > 0) {
       html += '<span class="var-peek-pin-count" title="Pinned values for this line">' + pinnedCount + '</span>';
-    }
-    if (isOpen) {
-      html += renderInlinePopover({
-        functionId,
-        lineNumber,
-        vars,
-        file,
-        controlId,
-        code: options.lineText || '',
-      });
     }
     html += '</div>';
     return html;
