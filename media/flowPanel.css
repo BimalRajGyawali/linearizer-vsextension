@@ -1121,6 +1121,20 @@ h2 {
   transition: transform 0.18s ease, opacity 0.18s ease;
 }
 
+.projection-dock.is-floating {
+  right: auto;
+  bottom: auto;
+}
+
+.projection-dock.is-dragging {
+  opacity: 0.95;
+}
+
+body.is-dragging-inspector {
+  cursor: grabbing;
+  user-select: none;
+}
+
 .projection-dock.is-collapsed {
   width: auto;
   max-width: 260px;
@@ -1140,6 +1154,15 @@ h2 {
   border-bottom: 1px solid var(--vscode-editorWidget-border);
 }
 
+.projection-info {
+  flex: 1;
+  cursor: grab;
+}
+
+body.is-dragging-inspector .projection-info {
+  cursor: grabbing;
+}
+
 .projection-controls {
   display: flex;
   align-items: center;
@@ -1154,6 +1177,21 @@ h2 {
   padding: 4px 8px;
   cursor: pointer;
   font-size: 0.75rem;
+}
+
+.projection-reset {
+  border: 1px solid var(--vscode-editorWidget-border);
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.projection-reset:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .projection-subtitle {

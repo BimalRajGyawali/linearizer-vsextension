@@ -12,6 +12,7 @@
   };
 
   const INLINE_VAR_DISPLAY_LIMIT = 5;
+  const INSPECTOR_BOUNDARY_PADDING = 16;
 
   const MESSAGE_TYPES = Object.freeze({
     CALL_SITES_FOUND: 'call-sites-found',
@@ -63,8 +64,10 @@
     pinnedVariables: new Map(), // lineKey -> Map(varKey -> entry)
     expandedInspectorRows: new Set(), // Set of varKeys expanded in inspector
     lineVariableSnapshots: new Map(), // lineKey -> Array of inline vars for popover/copy actions
+    inspectorPosition: null, // { top, left } when user undocks the inspector
   };
   let pendingTraceTimer = null;
+  let inspectorDragState = null;
 
   function makeCallSiteKey(callSite) {
     if (!callSite || typeof callSite !== 'object') {
@@ -168,6 +171,18 @@
       return formatted;
     }
     return formatted.slice(0, limit - 1) + '…';
+  }
+
+  function clampValue(value, minimum, maximum) {
+    const min = Number.isFinite(minimum) ? minimum : 0;
+    const max = Number.isFinite(maximum) ? maximum : min;
+    if (!Number.isFinite(value)) {
+      return min;
+    }
+    if (max <= min) {
+      return min;
+    }
+    return Math.min(Math.max(value, min), max);
   }
 
   function formatStructuredValue(value) {
@@ -1136,6 +1151,9 @@
       }
     } else if (action === 'close-projection') {
       closeProjection();
+    } else if (action === 'reset-inspector-position') {
+      state.inspectorPosition = null;
+      render();
     } else if (action === 'clear-flow-history') {
       state.flowTimelines.clear();
       state.activeFlowKey = null;
@@ -1167,6 +1185,24 @@
     }
   });
 
+  root.addEventListener('pointerdown', (event) => {
+    if (!state.projectionView || event.button !== 0) {
+      return;
+    }
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) {
+      return;
+    }
+    const header = target.closest('.projection-header');
+    if (!header) {
+      return;
+    }
+    if (target.closest('.projection-controls')) {
+      return;
+    }
+    beginInspectorDrag(event);
+  });
+
   root.addEventListener('dblclick', (event) => {
     const codeLine = event.target.closest('.code-line');
     if (!codeLine) {
@@ -1190,6 +1226,8 @@
       closeProjection();
     }
   });
+
+  window.addEventListener('resize', handleInspectorViewportResize);
 
   function expandParent(parentId) {
     if (!state.expandedParents.has(parentId)) {
@@ -1262,6 +1300,7 @@
     state.inlinePopover = null;
     state.inspectorCollapsed = false;
     state.expandedInspectorRows.clear();
+    cancelInspectorDrag();
     state.projectionView = {
       functionId,
       file: targetFile,
@@ -1276,6 +1315,7 @@
     if (!state.projectionView) {
       return;
     }
+    cancelInspectorDrag();
     state.projectionView = null;
     state.expandedInspectorRows.clear();
     render();
@@ -1672,6 +1712,138 @@
     }
   }
 
+  function updateInspectorDockPositionDom() {
+    const dock = root.querySelector('.projection-dock');
+    if (!dock) {
+      return;
+    }
+    const hasPosition = Boolean(
+      state.inspectorPosition &&
+      Number.isFinite(state.inspectorPosition.top) &&
+      Number.isFinite(state.inspectorPosition.left)
+    );
+    if (hasPosition) {
+      dock.style.top = state.inspectorPosition.top + 'px';
+      dock.style.left = state.inspectorPosition.left + 'px';
+      dock.style.right = 'auto';
+      dock.style.bottom = 'auto';
+      dock.classList.add('is-floating');
+    } else {
+      dock.style.top = '';
+      dock.style.left = '';
+      dock.style.right = '';
+      dock.style.bottom = '';
+      dock.classList.remove('is-floating');
+    }
+  }
+
+  function beginInspectorDrag(event) {
+    if (!state.projectionView) {
+      return;
+    }
+    const dock = root.querySelector('.projection-dock');
+    if (!dock) {
+      return;
+    }
+    const rect = dock.getBoundingClientRect();
+    inspectorDragState = {
+      pointerId: event.pointerId,
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top,
+      width: rect.width,
+      height: rect.height,
+    };
+    state.inspectorPosition = {
+      top: rect.top,
+      left: rect.left,
+    };
+    updateInspectorDockPositionDom();
+    dock.classList.add('is-dragging');
+    if (typeof dock.setPointerCapture === 'function') {
+      try {
+        dock.setPointerCapture(event.pointerId);
+      } catch (err) {
+        console.warn('[flowPanel] Failed to capture inspector pointer', err);
+      }
+    }
+    document.body.classList.add('is-dragging-inspector');
+    window.addEventListener('pointermove', handleInspectorDragMove);
+    window.addEventListener('pointerup', endInspectorDrag);
+    window.addEventListener('pointercancel', endInspectorDrag);
+    event.preventDefault();
+  }
+
+  function handleInspectorDragMove(event) {
+    if (!inspectorDragState || event.pointerId !== inspectorDragState.pointerId) {
+      return;
+    }
+    const margin = INSPECTOR_BOUNDARY_PADDING;
+    const maxLeft = Math.max(margin, window.innerWidth - inspectorDragState.width - margin);
+    const maxTop = Math.max(margin, window.innerHeight - inspectorDragState.height - margin);
+    const left = clampValue(event.clientX - inspectorDragState.offsetX, margin, maxLeft);
+    const top = clampValue(event.clientY - inspectorDragState.offsetY, margin, maxTop);
+    state.inspectorPosition = { top, left };
+    updateInspectorDockPositionDom();
+  }
+
+  function endInspectorDrag(event) {
+    if (!inspectorDragState) {
+      return;
+    }
+    if (event && event.pointerId !== inspectorDragState.pointerId) {
+      return;
+    }
+    const dock = root.querySelector('.projection-dock');
+    if (dock) {
+      dock.classList.remove('is-dragging');
+      if (typeof dock.releasePointerCapture === 'function') {
+        try {
+          dock.releasePointerCapture(inspectorDragState.pointerId);
+        } catch (err) {
+          // ignore
+        }
+      }
+    }
+    inspectorDragState = null;
+    document.body.classList.remove('is-dragging-inspector');
+    window.removeEventListener('pointermove', handleInspectorDragMove);
+    window.removeEventListener('pointerup', endInspectorDrag);
+    window.removeEventListener('pointercancel', endInspectorDrag);
+  }
+
+  function cancelInspectorDrag() {
+    if (!inspectorDragState) {
+      return;
+    }
+    endInspectorDrag({ pointerId: inspectorDragState.pointerId });
+  }
+
+  function handleInspectorViewportResize() {
+    if (!state.inspectorPosition) {
+      return;
+    }
+    const dock = root.querySelector('.projection-dock');
+    if (!dock) {
+      return;
+    }
+    const previousWidth = inspectorDragState && inspectorDragState.width ? inspectorDragState.width : 0;
+    const previousHeight = inspectorDragState && inspectorDragState.height ? inspectorDragState.height : 0;
+    const width = dock.offsetWidth || previousWidth;
+    const height = dock.offsetHeight || previousHeight;
+    if (!width || !height) {
+      return;
+    }
+    const margin = INSPECTOR_BOUNDARY_PADDING;
+    const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+    const maxTop = Math.max(margin, window.innerHeight - height - margin);
+    const left = clampValue(state.inspectorPosition.left, margin, maxLeft);
+    const top = clampValue(state.inspectorPosition.top, margin, maxTop);
+    if (left !== state.inspectorPosition.left || top !== state.inspectorPosition.top) {
+      state.inspectorPosition = { top, left };
+      updateInspectorDockPositionDom();
+    }
+  }
+
   function updateCallSiteSelectionDom(parentId, selectedIndex) {
     if (!parentId) {
       return;
@@ -1752,14 +1924,31 @@
       return '<button type="button" class="inspector-view-btn' + (mode === modeEntry.key ? ' is-active' : '') + '" data-action="set-inspector-mode" data-mode="' + modeEntry.key + '">' + modeEntry.label + '</button>';
     }).join('');
 
-    return '<section class="projection-dock' + (collapsed ? ' is-collapsed' : '') + '" role="region" aria-label="Line inspector">' +
-      '<header class="projection-header">' +
-        '<div>' +
+    const hasFloatingPosition = Boolean(
+      state.inspectorPosition &&
+      Number.isFinite(state.inspectorPosition.top) &&
+      Number.isFinite(state.inspectorPosition.left)
+    );
+    const dockClasses = ['projection-dock'];
+    if (collapsed) {
+      dockClasses.push('is-collapsed');
+    }
+    if (hasFloatingPosition) {
+      dockClasses.push('is-floating');
+    }
+    const dockStyle = hasFloatingPosition
+      ? ' style="top: ' + state.inspectorPosition.top + 'px; left: ' + state.inspectorPosition.left + 'px; right: auto; bottom: auto;"'
+      : '';
+
+    return '<section class="' + dockClasses.join(' ') + '" role="region" aria-label="Line inspector"' + dockStyle + '>' +
+      '<header class="projection-header" title="Drag to move the inspector">' +
+        '<div class="projection-info">' +
           '<div class="projection-title">' + escapeHtml(extractDisplayName(projection.functionId)) + '</div>' +
           '<div class="projection-subtitle">Line ' + projection.line + ' · ' + escapeHtml(projection.file || '') + '</div>' +
         '</div>' +
         '<div class="projection-controls">' +
           '<button type="button" class="projection-collapse" data-action="toggle-inspector-collapse" aria-expanded="' + (!collapsed) + '">' + (collapsed ? 'Expand' : 'Collapse') + '</button>' +
+          '<button type="button" class="projection-reset" data-action="reset-inspector-position"' + (hasFloatingPosition ? '' : ' disabled') + '>Dock</button>' +
           '<div class="inspector-view-group" role="group" aria-label="Inspector view mode">' + viewToggles + '</div>' +
           '<button type="button" class="projection-close" data-action="close-projection" aria-label="Close">×</button>' +
         '</div>' +
