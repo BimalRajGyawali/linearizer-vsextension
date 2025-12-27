@@ -57,9 +57,7 @@
     tracingChild: new Set(), // Set of child functionIds currently being traced
     projectionView: null, // { functionId, line, file, code, variables: [{scope,name,value,type}]} or null
     pendingTraceRequest: null, // { functionId, line }
-    callSiteStatuses: new Map(), // functionId -> Map(callSiteKey -> { state: 'success' | 'error', message?: string })
-    flowTimelines: new Map(), // flowKey -> { flow, entryFullId, argsKey, events, targetLocation, requestedLine }
-    activeFlowKey: null,
+  callSiteStatuses: new Map(), // functionId -> Map(callSiteKey -> { state: 'success' | 'error', message?: string })
     inlinePopover: null, // { functionId, line }
     inspectorViewMode: 'compact',
     inspectorCollapsed: false,
@@ -662,20 +660,6 @@
     return merged;
   }
 
-  function buildFlowKeyFromEvent(event) {
-    if (!event || typeof event !== 'object') {
-      return null;
-    }
-    const flowName = typeof event.flow === 'string' && event.flow.length > 0
-      ? event.flow
-      : (typeof event.entry_full_id === 'string' ? event.entry_full_id : '');
-    const argsKey = typeof event.args_key === 'string' && event.args_key.length > 0 ? event.args_key : '';
-    if (!flowName && !argsKey) {
-      return null;
-    }
-    return flowName + '::' + argsKey;
-  }
-
   function normaliseFlowEventPayload(flowEvent) {
     if (!flowEvent || typeof flowEvent !== 'object') {
       return null;
@@ -801,7 +785,6 @@
       if (message.event) {
         // Add or update event in the array
         const eventData = message.event;
-        const flowKey = buildFlowKeyFromEvent(eventData);
         const hasFlowSlice = Array.isArray(eventData.events) && eventData.events.length > 0;
         let lastEventFromSlice = null;
 
@@ -814,18 +797,6 @@
               upsertTracerEvent(flowEvt);
             });
             lastEventFromSlice = normalisedEvents[normalisedEvents.length - 1];
-            if (flowKey) {
-              state.flowTimelines.set(flowKey, {
-                flow: eventData.flow || eventData.entry_full_id || 'flow',
-                entryFullId: eventData.entry_full_id,
-                argsKey: eventData.args_key || '',
-                events: normalisedEvents,
-                targetLocation: eventData.target_location,
-                requestedLine: eventData.requested_line,
-                lastServedIndex: eventData.last_served_index,
-              });
-              state.activeFlowKey = flowKey;
-            }
           }
         }
 
@@ -1220,10 +1191,6 @@
     } else if (action === 'reset-inspector-position') {
       state.inspectorPosition = null;
       render();
-    } else if (action === 'clear-flow-history') {
-      state.flowTimelines.clear();
-      state.activeFlowKey = null;
-      render();
     } else if (action === 'trace-line') {
       executeTraceLineFromTarget(target);
     }
@@ -1547,10 +1514,6 @@
 
   function render() {
     let content = '';
-    const timelinePanel = renderFlowTimelinePanel();
-    if (timelinePanel) {
-      content += timelinePanel;
-    }
     if (!parents.length) {
       content += '<p class="placeholder">No call flows available.</p>';
     } else {
@@ -1588,75 +1551,6 @@
       '<div class="loading-spinner"></div>' +
       '<div class="loading-message">' + escapeHtml(message) + '</div>' +
       '</div>';
-  }
-
-  function summariseFlowVariables(flowEvent) {
-    if (!flowEvent || !flowEvent.locals || typeof flowEvent.locals !== 'object') {
-      return '<span class="flow-vars-empty">No locals captured</span>';
-    }
-    const entries = Object.entries(flowEvent.locals);
-    if (!entries.length) {
-      return '<span class="flow-vars-empty">No locals captured</span>';
-    }
-    const previewEntries = entries.slice(0, 3);
-    const previewHtml = previewEntries.map(function(entry) {
-      const [name, value] = entry;
-      const formatted = formatInlineValue(value, 40);
-      return '<span class="flow-var-pill">' +
-        '<span class="flow-var-name">' + escapeHtml(name) + '</span>' +
-        '<span class="flow-var-equals">=</span>' +
-        '<code class="flow-var-value">' + escapeHtml(formatted) + '</code>' +
-      '</span>';
-    }).join('');
-    const extraCount = entries.length - previewEntries.length;
-    const extraLabel = extraCount > 0
-      ? '<span class="flow-var-more">+' + extraCount + ' more</span>'
-      : '';
-    return previewHtml + extraLabel;
-  }
-
-  function renderFlowTimelinePanel() {
-    if (!state.activeFlowKey) {
-      return '';
-    }
-    const timeline = state.flowTimelines.get(state.activeFlowKey);
-    if (!timeline || !Array.isArray(timeline.events) || timeline.events.length === 0) {
-      return '';
-    }
-    const title = timeline.flow || extractDisplayName(timeline.entryFullId || timeline.flow || 'Flow');
-    const subtitle = timeline.targetLocation
-      ? 'Target: ' + timeline.targetLocation
-      : 'Steps: ' + timeline.events.length;
-
-    let html = '<section class="flow-timeline-panel" role="region" aria-label="Flow timeline">';
-    html += '<header class="flow-timeline-header">';
-    html += '<div class="flow-timeline-meta">';
-    html += '<div class="flow-timeline-title">' + escapeHtml(title) + '</div>';
-    html += '<div class="flow-timeline-subtitle">' + escapeHtml(subtitle) + '</div>';
-    html += '</div>';
-    html += '<div class="flow-timeline-actions">';
-    html += '<button type="button" class="flow-action-btn" data-action="clear-flow-history">Clear</button>';
-    html += '</div>';
-    html += '</header>';
-
-    html += '<ol class="flow-timeline-list">';
-    timeline.events.forEach(function(flowEvent, index) {
-      const locationLabel = flowEvent.target_location || flowEvent.location || ((flowEvent.function || '?') + ':' + (flowEvent.line ?? '?'));
-      const isTarget = timeline.targetLocation && locationLabel === timeline.targetLocation;
-      html += '<li class="flow-timeline-row' + (isTarget ? ' is-target' : '') + '">';
-      html += '<span class="flow-step-index">' + (index + 1) + '</span>';
-      html += '<div class="flow-step-details">';
-      html += '<div class="flow-step-head">';
-      html += '<span class="flow-step-function">' + escapeHtml(flowEvent.function || 'anonymous') + '</span>';
-      html += '<span class="flow-step-location">' + escapeHtml(locationLabel) + '</span>';
-      html += '</div>';
-      html += '<div class="flow-step-vars">' + summariseFlowVariables(flowEvent) + '</div>';
-      html += '</div>';
-      html += '</li>';
-    });
-    html += '</ol>';
-    html += '</section>';
-    return html;
   }
 
   function renderInlineVarPeek(options) {
