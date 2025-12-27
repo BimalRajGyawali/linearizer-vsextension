@@ -66,6 +66,7 @@
     pinnedVariables: new Map(), // lineKey -> Map(varKey -> entry)
     lineVariableSnapshots: new Map(), // lineKey -> Array of inline vars for popover/copy actions
     inspectorPosition: null, // { top, left } when user undocks the inspector
+    lastTracerLocation: null, // { line, filename, functionId } for most recent executed line
   };
   let pendingTraceTimer = null;
   let inspectorDragState = null;
@@ -731,6 +732,19 @@
     }
   }
 
+  function updateLastTracerLocation(eventData) {
+    if (!eventData || typeof eventData.line !== 'number') {
+      return;
+    }
+    const fileName = eventData.filename || eventData.file || '';
+    const functionId = findFunctionIdForEvent(eventData);
+    state.lastTracerLocation = {
+      line: eventData.line,
+      filename: normalisePath(fileName),
+      functionId: functionId || null,
+    };
+  }
+
   const flowMap = buildFlowMap(flows);
   const parents = computeParents(flows, functions, changed);
   const nameIndex = buildNameIndex(functions);
@@ -789,6 +803,7 @@
         const eventData = message.event;
         const flowKey = buildFlowKeyFromEvent(eventData);
         const hasFlowSlice = Array.isArray(eventData.events) && eventData.events.length > 0;
+        let lastEventFromSlice = null;
 
         if (hasFlowSlice) {
           const normalisedEvents = eventData.events
@@ -798,6 +813,7 @@
             normalisedEvents.forEach(function(flowEvt) {
               upsertTracerEvent(flowEvt);
             });
+            lastEventFromSlice = normalisedEvents[normalisedEvents.length - 1];
             if (flowKey) {
               state.flowTimelines.set(flowKey, {
                 flow: eventData.flow || eventData.entry_full_id || 'flow',
@@ -814,6 +830,7 @@
         }
 
         upsertTracerEvent(eventData);
+        updateLastTracerLocation(lastEventFromSlice || eventData);
 
 			clearPendingTraceLock({ render: false });
 
@@ -853,6 +870,7 @@
       if (existingIndex < 0) {
         clearPendingTraceLock({ render: false });
         state.tracerEvents.push(errorEvent);
+        updateLastTracerLocation(errorEvent);
         render();
       }
     } else if (message.type === MESSAGE_TYPES.FUNCTION_SIGNATURE && typeof message.functionId === 'string' && Array.isArray(message.params)) {
@@ -1071,6 +1089,7 @@
               const eFile = e.filename.replace(/\\/g, '/');
               return eFile !== fnFile && !fnFile.endsWith(eFile) && !eFile.endsWith(fnFile);
             });
+            state.lastTracerLocation = null;
           }
           
           render();
@@ -2422,6 +2441,8 @@
 
     const startLine = typeof fn.line === 'number' ? fn.line : (typeof fn.start_line === 'number' ? fn.start_line : 1);
     const lines = fn.body.split(/\r?\n/);
+    const normalisedFnFile = normalisePath(fn.file || '');
+    const lastTracerLocation = state.lastTracerLocation;
     let html = '<div class="code-block" data-function="' + escapeAttribute(functionId) + '"' +
       (parentContext ? ' data-parent-function="' + escapeAttribute(parentContext.parentFunctionId) + '" data-parent-line="' + parentContext.parentLineNumber + '" data-call-line="' + parentContext.callLineInParent + '"' : '') +
       '>';
@@ -2434,7 +2455,6 @@
       
       // Find events for this line
       // Only match events that EXACTLY match this line number - no tolerance
-      const fnFile = fn.file || '';
       const lineEvents = state.tracerEvents ? state.tracerEvents.filter(function(e) {
         // CRITICAL: Line must match EXACTLY - no tolerance for adjacent lines
         // Check line first before doing any other checks
@@ -2445,11 +2465,10 @@
           return false; // Not this line - reject immediately
         }
         // If filename is specified in event, it must match the function's file
-        if (e.filename && fnFile) {
+        if (e.filename && normalisedFnFile) {
           const eFile = e.filename.replace(/\\/g, '/');
-          const targetFile = fnFile.replace(/\\/g, '/');
           // Match if files are the same or one ends with the other (for relative paths)
-          if (eFile !== targetFile && !targetFile.endsWith(eFile) && !eFile.endsWith(targetFile)) {
+          if (!filesRoughlyMatch(eFile, normalisedFnFile)) {
             return false;
           }
         }
@@ -2460,8 +2479,10 @@
       const regularEvents = lineEvents.filter(function(e) { return e.event !== 'error'; });
       const errorEvents = lineEvents.filter(function(e) { return e.event === 'error'; });
       
-      const isTracerLine = lineEvents.length > 0;
-      const lineClass = isTracerLine ? 'code-line tracer-active' : 'code-line';
+  const matchesByFunction = Boolean(lastTracerLocation && lastTracerLocation.functionId && lastTracerLocation.functionId === functionId);
+  const matchesByFile = Boolean(lastTracerLocation && !lastTracerLocation.functionId && lastTracerLocation.filename && normalisedFnFile && filesRoughlyMatch(lastTracerLocation.filename, normalisedFnFile));
+  const isLatestTracerLine = Boolean(lastTracerLocation) && lastTracerLocation.line === lineNumber && (matchesByFunction || matchesByFile);
+  const lineClass = isLatestTracerLine ? 'code-line tracer-active' : 'code-line';
       const callTargetValue = formatted.calls.length === 1 ? formatted.calls[0].targetId : '';
       const callTargetAttr = callTargetValue ? ' data-call-target="' + escapeAttribute(callTargetValue) + '"' : '';
       

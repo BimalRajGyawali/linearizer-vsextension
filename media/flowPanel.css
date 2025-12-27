@@ -955,19 +955,28 @@ h2 {
 
 .code-line.tracer-active {
   position: relative;
-  background: var(--vscode-editor-lineHighlightBackground, rgba(255, 255, 255, 0.05));
+  background: rgba(78, 201, 176, 0.15);
+  box-shadow: inset 0 0 0 1px rgba(78, 201, 176, 0.2);
 }
 
 .code-line.tracer-active::after {
   content: '';
   position: absolute;
-  left: 60px;
-  top: 0;
-  bottom: 0;
-  width: 3px;
+  left: 52px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
   background: var(--vscode-textLink-foreground, #4ec9b0);
-  opacity: 0.8;
-  z-index: 1;
+  box-shadow: 0 0 10px rgba(78, 201, 176, 0.7);
+  opacity: 0.85;
+  pointer-events: none;
+}
+
+.code-line.tracer-active .line-number {
+  color: var(--vscode-textLink-foreground, var(--vscode-textLink-activeForeground));
+  font-weight: 600;
 }
 
 .tracer-inline-vars {
