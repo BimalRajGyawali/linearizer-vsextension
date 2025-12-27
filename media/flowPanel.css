@@ -98,6 +98,11 @@ h2 {
   cursor: progress;
 }
 
+#flow-root.is-tracing > :not(.loading-overlay) {
+  pointer-events: none;
+  user-select: none;
+}
+
 #flow-root.is-tracing .code-line,
 #flow-root.is-tracing .line-number,
 #flow-root.is-tracing button,
@@ -1030,6 +1035,7 @@ h2 {
   width: clamp(520px, 42vw, 760px);
   max-width: 95vw;
   min-width: 360px;
+  min-height: 280px;
   max-height: calc(100vh - 48px);
   background: var(--vscode-editorWidget-background);
   border: 1px solid var(--vscode-editorWidget-border);
@@ -1040,6 +1046,15 @@ h2 {
   overflow: hidden;
   z-index: 1000;
   transition: transform 0.18s ease, opacity 0.18s ease;
+}
+
+.projection-dock.is-resizing {
+  cursor: nwse-resize;
+}
+
+body.is-resizing-inspector {
+  cursor: nwse-resize;
+  user-select: none;
 }
 
 .projection-dock.is-floating {
@@ -1063,6 +1078,10 @@ body.is-dragging-inspector {
 }
 
 .projection-dock.is-collapsed .projection-body {
+  display: none;
+}
+
+.projection-dock.is-collapsed .projection-resize-handle {
   display: none;
 }
 
@@ -1130,9 +1149,12 @@ body.is-dragging-inspector .projection-info {
 .projection-body {
   display: flex;
   flex-direction: column;
+  flex: 1 1 auto;
   gap: 12px;
   padding: 12px 20px 20px;
-  overflow: visible;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-height: 0;
 }
 
 .projection-close {
@@ -1150,6 +1172,24 @@ body.is-dragging-inspector .projection-info {
   background: var(--vscode-list-hoverBackground);
 }
 
+.projection-resize-handle {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  bottom: 10px;
+  right: 10px;
+  border-radius: 4px;
+  border: 1px solid var(--vscode-editorWidget-border);
+  background: linear-gradient(135deg, transparent 40%, var(--vscode-textLink-foreground, #4ec9b0));
+  cursor: nwse-resize;
+  opacity: 0.7;
+}
+
+.projection-resize-handle:hover {
+  opacity: 1;
+  background: linear-gradient(135deg, transparent 35%, var(--vscode-textLink-foreground, #4ec9b0));
+}
+
 .projection-code {
   margin: 0;
   padding: 12px;
@@ -1158,7 +1198,7 @@ body.is-dragging-inspector .projection-info {
   border-radius: 8px;
   font-family: var(--vscode-editor-font-family, monospace);
   font-size: 0.85rem;
-  overflow: visible;
+  overflow: auto;
 }
 
 .projection-code code {
@@ -1169,6 +1209,7 @@ body.is-dragging-inspector .projection-info {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  min-height: 0;
 }
 
 .inspector-view-group {

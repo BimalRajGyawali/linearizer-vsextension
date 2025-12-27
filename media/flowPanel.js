@@ -15,6 +15,8 @@
   const INSPECTOR_BOUNDARY_PADDING = 32;
   const INSPECTOR_TREE_ENTRY_LIMIT = 50;
   const INSPECTOR_TREE_DEPTH_LIMIT = 6;
+  const INSPECTOR_MIN_WIDTH = 360;
+  const INSPECTOR_MIN_HEIGHT = 280;
 
   const MESSAGE_TYPES = Object.freeze({
     CALL_SITES_FOUND: 'call-sites-found',
@@ -56,7 +58,7 @@
     tracingParent: new Set(), // Set of parent functionIds currently being traced
     tracingChild: new Set(), // Set of child functionIds currently being traced
     projectionView: null, // { functionId, line, file, code, variables: [{scope,name,value,type}]} or null
-    pendingTraceRequest: null, // { functionId, line }
+  pendingTraceRequest: null, // { functionId, line, source, label }
   callSiteStatuses: new Map(), // functionId -> Map(callSiteKey -> { state: 'success' | 'error', message?: string })
     inlinePopover: null, // { functionId, line }
     inspectorViewMode: 'compact',
@@ -64,10 +66,12 @@
     pinnedVariables: new Map(), // lineKey -> Map(varKey -> entry)
     lineVariableSnapshots: new Map(), // lineKey -> Array of inline vars for popover/copy actions
     inspectorPosition: null, // { top, left } when user undocks the inspector
+    inspectorSize: null, // { width, height } when user resizes the inspector
     lastTracerLocation: null, // { line, filename, functionId } for most recent executed line
   };
   let pendingTraceTimer = null;
   let inspectorDragState = null;
+  let inspectorResizeState = null;
 
   function makeCallSiteKey(callSite) {
     if (!callSite || typeof callSite !== 'object') {
@@ -122,11 +126,18 @@
     }
   }
 
-  function markPendingTrace(functionId, lineNumber) {
+  function markPendingTrace(functionId, lineNumber, options) {
     if (pendingTraceTimer) {
       clearTimeout(pendingTraceTimer);
     }
-    state.pendingTraceRequest = { functionId, line: lineNumber };
+    const meta = options || {};
+    const pendingLine = Number.isFinite(lineNumber) ? lineNumber : null;
+    state.pendingTraceRequest = {
+      functionId: functionId || null,
+      line: pendingLine,
+      source: meta.source || 'trace-line',
+      label: typeof meta.label === 'string' ? meta.label : null,
+    };
     pendingTraceTimer = setTimeout(function() {
       console.warn('[flowPanel] Trace request auto-cleared after timeout');
       pendingTraceTimer = null;
@@ -183,6 +194,30 @@
       return min;
     }
     return Math.min(Math.max(value, min), max);
+  }
+
+  function getInspectorSizeBounds() {
+    const horizontalPadding = INSPECTOR_BOUNDARY_PADDING * 2;
+    const verticalPadding = INSPECTOR_BOUNDARY_PADDING * 2;
+    const maxWidth = Math.max(INSPECTOR_MIN_WIDTH, window.innerWidth - horizontalPadding);
+    const maxHeight = Math.max(INSPECTOR_MIN_HEIGHT, window.innerHeight - verticalPadding);
+    return {
+      minWidth: INSPECTOR_MIN_WIDTH,
+      maxWidth,
+      minHeight: INSPECTOR_MIN_HEIGHT,
+      maxHeight,
+    };
+  }
+
+  function normalizeInspectorSize(size) {
+    if (!size || !Number.isFinite(size.width) || !Number.isFinite(size.height)) {
+      return null;
+    }
+    const bounds = getInspectorSizeBounds();
+    return {
+      width: clampValue(size.width, bounds.minWidth, bounds.maxWidth),
+      height: clampValue(size.height, bounds.minHeight, bounds.maxHeight),
+    };
   }
 
   function formatStructuredValue(value) {
@@ -770,6 +805,7 @@
           message: message.statusMessage || 'Arguments captured from call site',
         });
       }
+      clearPendingTraceLock({ render: false });
       render();
     } else if (message.type === MESSAGE_TYPES.CALL_SITE_ARGS_ERROR && typeof message.functionId === 'string') {
       console.error('[flowPanel] Error extracting args from call site:', message.error);
@@ -780,6 +816,7 @@
         });
       }
       // Show error but don't prevent rendering
+      clearPendingTraceLock({ render: false });
       render();
     } else if (message.type === MESSAGE_TYPES.TRACER_EVENT) {
       if (message.event) {
@@ -946,6 +983,10 @@
     } else if (action === 'select-call-site') {
       const parentId = target.getAttribute('data-parent-id');
       const callSiteIndex = target.getAttribute('data-call-site-index');
+      if (state.pendingTraceRequest) {
+        console.warn('[flowPanel] Ignoring call site selection while execution is pending');
+        return;
+      }
       if (parentId && callSiteIndex !== null) {
         const index = parseInt(callSiteIndex, 10);
         const callSites = state.callSitesByFunction.get(parentId);
@@ -955,6 +996,10 @@
           updateCallSiteSelectionDom(parentId, index);
           
           // Extract arguments from this call site (don't execute immediately)
+          markPendingTrace(parentId, callSite && typeof callSite.line === 'number' ? callSite.line : null, {
+            source: 'call-site',
+            label: 'Executing call site…',
+          });
           vscode.postMessage({
             type: MESSAGE_TYPES.EXECUTE_FROM_CALL_SITE,
             functionId: parentId,
@@ -1190,6 +1235,7 @@
       closeProjection();
     } else if (action === 'reset-inspector-position') {
       state.inspectorPosition = null;
+      state.inspectorSize = null;
       render();
     } else if (action === 'trace-line') {
       executeTraceLineFromTarget(target);
@@ -1224,6 +1270,11 @@
     }
     const target = event.target instanceof Element ? event.target : null;
     if (!target) {
+      return;
+    }
+    const resizeHandle = target.closest('.projection-resize-handle');
+    if (resizeHandle) {
+      beginInspectorResize(event, resizeHandle);
       return;
     }
     const header = target.closest('.projection-header');
@@ -1332,6 +1383,7 @@
 
   state.inlinePopover = null;
   state.inspectorCollapsed = false;
+    cancelInspectorResize();
     cancelInspectorDrag();
     state.projectionView = {
       functionId,
@@ -1347,6 +1399,7 @@
     if (!state.projectionView) {
       return;
     }
+    cancelInspectorResize();
     cancelInspectorDrag();
     state.projectionView = null;
     render();
@@ -1508,7 +1561,10 @@
     }
 
     console.log('[flowPanel] Sending trace-line message', payload);
-    markPendingTrace(functionId, lineNumber);
+    markPendingTrace(functionId, lineNumber, {
+      source: 'trace-line',
+      label: 'Executing line ' + lineNumber + '…',
+    });
     vscode.postMessage(payload);
   }
 
@@ -1523,9 +1579,10 @@
     content += renderProjectionPanel();
     root.innerHTML = content;
 
-    const tracingActive = state.tracingParent.size > 0 || state.tracingChild.size > 0;
-    root.classList.toggle('is-tracing', tracingActive);
-    if (state.projectionView && state.inspectorPosition) {
+  const tracingActive = state.tracingParent.size > 0 || state.tracingChild.size > 0 || Boolean(state.pendingTraceRequest);
+  root.classList.toggle('is-tracing', tracingActive);
+  root.classList.toggle('is-executing', Boolean(state.pendingTraceRequest));
+    if (state.projectionView) {
       handleInspectorViewportResize();
     }
   }
@@ -1533,13 +1590,24 @@
   function renderLoadingOverlay() {
     const isTracingParent = state.tracingParent.size > 0;
     const isTracingChild = state.tracingChild.size > 0;
+    const isPendingTrace = Boolean(state.pendingTraceRequest);
     
-    if (!isTracingParent && !isTracingChild) {
+    if (!isTracingParent && !isTracingChild && !isPendingTrace) {
       return '';
     }
 
     let message = '';
-    if (isTracingParent && isTracingChild) {
+    if (isPendingTrace) {
+      const pending = state.pendingTraceRequest;
+      if (pending && typeof pending.label === 'string' && pending.label.length > 0) {
+        message = pending.label;
+      } else if (pending && pending.source === 'call-site') {
+        message = 'Executing call site…';
+      } else {
+        const pendingLine = pending && typeof pending.line === 'number' ? pending.line : null;
+        message = pendingLine ? ('Executing line ' + pendingLine + '…') : 'Executing selection…';
+      }
+    } else if (isTracingParent && isTracingChild) {
       message = 'Preparing execution context...';
     } else if (isTracingParent) {
       message = 'Tracing parent function...';
@@ -1676,8 +1744,40 @@
       dock.style.top = '';
       dock.style.left = '';
       dock.style.right = '';
-      dock.style.bottom = '';
+      if (!state.inspectorSize) {
+        dock.style.bottom = '';
+      }
       dock.classList.remove('is-floating');
+    }
+    updateInspectorDockSizeDom();
+  }
+
+  function updateInspectorDockSizeDom() {
+    const dock = root.querySelector('.projection-dock');
+    if (!dock) {
+      return;
+    }
+    const normalized = normalizeInspectorSize(state.inspectorSize);
+    if (state.inspectorSize && !normalized) {
+      state.inspectorSize = null;
+    } else if (normalized && state.inspectorSize) {
+      if (normalized.width !== state.inspectorSize.width || normalized.height !== state.inspectorSize.height) {
+        state.inspectorSize = normalized;
+      }
+    }
+
+    if (normalized) {
+      dock.style.width = normalized.width + 'px';
+      dock.style.height = normalized.height + 'px';
+      if (!state.inspectorPosition) {
+        dock.style.bottom = 'auto';
+      }
+    } else {
+      dock.style.width = '';
+      dock.style.height = '';
+      if (!state.inspectorPosition) {
+        dock.style.bottom = '';
+      }
     }
   }
 
@@ -1762,14 +1862,111 @@
     endInspectorDrag({ pointerId: inspectorDragState.pointerId });
   }
 
-  function handleInspectorViewportResize() {
-    if (!state.inspectorPosition) {
+  function beginInspectorResize(event, handleNode) {
+    if (!state.projectionView || event.button !== 0) {
       return;
     }
     const dock = root.querySelector('.projection-dock');
     if (!dock) {
       return;
     }
+    inspectorResizeState = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      width: dock.offsetWidth,
+      height: dock.offsetHeight,
+      captureTarget: handleNode && typeof handleNode.setPointerCapture === 'function' ? handleNode : dock,
+    };
+    dock.classList.add('is-resizing');
+    document.body.classList.add('is-resizing-inspector');
+    if (inspectorResizeState.captureTarget && typeof inspectorResizeState.captureTarget.setPointerCapture === 'function') {
+      try {
+        inspectorResizeState.captureTarget.setPointerCapture(event.pointerId);
+      } catch (err) {
+        console.warn('[flowPanel] Failed to capture inspector resize pointer', err);
+      }
+    }
+    window.addEventListener('pointermove', handleInspectorResizeMove);
+    window.addEventListener('pointerup', endInspectorResize);
+    window.addEventListener('pointercancel', endInspectorResize);
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  function handleInspectorResizeMove(event) {
+    if (!inspectorResizeState || event.pointerId !== inspectorResizeState.pointerId) {
+      return;
+    }
+    const deltaX = event.clientX - inspectorResizeState.startX;
+    const deltaY = event.clientY - inspectorResizeState.startY;
+    const nextSize = normalizeInspectorSize({
+      width: inspectorResizeState.width + deltaX,
+      height: inspectorResizeState.height + deltaY,
+    });
+    if (!nextSize) {
+      return;
+    }
+    state.inspectorSize = nextSize;
+    updateInspectorDockSizeDom();
+  }
+
+  function endInspectorResize(event) {
+    if (!inspectorResizeState || (event && event.pointerId !== inspectorResizeState.pointerId)) {
+      return;
+    }
+    const dock = root.querySelector('.projection-dock');
+    if (dock) {
+      dock.classList.remove('is-resizing');
+    }
+    document.body.classList.remove('is-resizing-inspector');
+    if (inspectorResizeState.captureTarget && typeof inspectorResizeState.captureTarget.releasePointerCapture === 'function') {
+      try {
+        inspectorResizeState.captureTarget.releasePointerCapture(inspectorResizeState.pointerId);
+      } catch (err) {
+        // ignore
+      }
+    }
+    window.removeEventListener('pointermove', handleInspectorResizeMove);
+    window.removeEventListener('pointerup', endInspectorResize);
+    window.removeEventListener('pointercancel', endInspectorResize);
+    inspectorResizeState = null;
+  }
+
+  function cancelInspectorResize() {
+    if (!inspectorResizeState) {
+      return;
+    }
+    endInspectorResize({ pointerId: inspectorResizeState.pointerId });
+  }
+
+  function handleInspectorViewportResize() {
+    if (!state.projectionView) {
+      return;
+    }
+    const dock = root.querySelector('.projection-dock');
+    if (!dock) {
+      return;
+    }
+
+    if (state.inspectorSize) {
+      const normalizedSize = normalizeInspectorSize(state.inspectorSize);
+      if (!normalizedSize) {
+        state.inspectorSize = null;
+        updateInspectorDockSizeDom();
+      } else if (
+        normalizedSize.width !== state.inspectorSize.width ||
+        normalizedSize.height !== state.inspectorSize.height
+      ) {
+        state.inspectorSize = normalizedSize;
+        updateInspectorDockSizeDom();
+      }
+    }
+
+    if (!state.inspectorPosition) {
+      return;
+    }
+
     const previousWidth = inspectorDragState && inspectorDragState.width ? inspectorDragState.width : 0;
     const previousHeight = inspectorDragState && inspectorDragState.height ? inspectorDragState.height : 0;
     const width = dock.offsetWidth || previousWidth;
@@ -1873,6 +2070,10 @@
       Number.isFinite(state.inspectorPosition.top) &&
       Number.isFinite(state.inspectorPosition.left)
     );
+    const dockSize = normalizeInspectorSize(state.inspectorSize);
+    if (dockSize && state.inspectorSize && (dockSize.width !== state.inspectorSize.width || dockSize.height !== state.inspectorSize.height)) {
+      state.inspectorSize = dockSize;
+    }
     const dockClasses = ['projection-dock'];
     if (collapsed) {
       dockClasses.push('is-collapsed');
@@ -1881,9 +2082,21 @@
       dockClasses.push('is-floating');
     }
     dockClasses.push('mode-' + mode);
-    const dockStyle = hasFloatingPosition
-      ? ' style="top: ' + state.inspectorPosition.top + 'px; left: ' + state.inspectorPosition.left + 'px; right: auto; bottom: auto;"'
-      : '';
+    const dockStyleParts = [];
+    if (hasFloatingPosition) {
+      dockStyleParts.push('top: ' + state.inspectorPosition.top + 'px');
+      dockStyleParts.push('left: ' + state.inspectorPosition.left + 'px');
+      dockStyleParts.push('right: auto');
+      dockStyleParts.push('bottom: auto');
+    }
+    if (dockSize) {
+      dockStyleParts.push('width: ' + dockSize.width + 'px');
+      dockStyleParts.push('height: ' + dockSize.height + 'px');
+      if (!hasFloatingPosition) {
+        dockStyleParts.push('bottom: auto');
+      }
+    }
+  const dockStyle = dockStyleParts.length ? ' style="' + dockStyleParts.join('; ') + '"' : '';
 
     return '<section class="' + dockClasses.join(' ') + '" role="region" aria-label="Line inspector"' + dockStyle + '>' +
       '<header class="projection-header" title="Drag to move the inspector">' +
@@ -1903,6 +2116,7 @@
         pinnedSection +
         '<div class="projection-grid">' + rows + '</div>' +
       '</div>' +
+      '<div class="projection-resize-handle" role="separator" aria-label="Resize inspector" title="Drag to resize"></div>' +
     '</section>';
   }
 
