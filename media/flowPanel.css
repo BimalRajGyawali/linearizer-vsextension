@@ -1110,6 +1110,7 @@ h2 {
   right: 24px;
   bottom: 24px;
   width: min(420px, 95vw);
+  max-height: calc(100vh - 48px);
   background: var(--vscode-editorWidget-background);
   border: 1px solid var(--vscode-editorWidget-border);
   border-radius: 12px;

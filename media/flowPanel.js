@@ -12,7 +12,7 @@
   };
 
   const INLINE_VAR_DISPLAY_LIMIT = 5;
-  const INSPECTOR_BOUNDARY_PADDING = 16;
+  const INSPECTOR_BOUNDARY_PADDING = 32;
 
   const MESSAGE_TYPES = Object.freeze({
     CALL_SITES_FOUND: 'call-sites-found',
@@ -1510,6 +1510,9 @@
 
     const tracingActive = state.tracingParent.size > 0 || state.tracingChild.size > 0;
     root.classList.toggle('is-tracing', tracingActive);
+    if (state.projectionView && state.inspectorPosition) {
+      handleInspectorViewportResize();
+    }
   }
 
   function renderLoadingOverlay() {
