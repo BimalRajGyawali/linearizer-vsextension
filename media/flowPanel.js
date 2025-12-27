@@ -13,6 +13,8 @@
 
   const INLINE_VAR_DISPLAY_LIMIT = 5;
   const INSPECTOR_BOUNDARY_PADDING = 32;
+  const INSPECTOR_TREE_ENTRY_LIMIT = 50;
+  const INSPECTOR_TREE_DEPTH_LIMIT = 6;
 
   const MESSAGE_TYPES = Object.freeze({
     CALL_SITES_FOUND: 'call-sites-found',
@@ -62,7 +64,6 @@
     inspectorViewMode: 'compact',
     inspectorCollapsed: false,
     pinnedVariables: new Map(), // lineKey -> Map(varKey -> entry)
-    expandedInspectorRows: new Set(), // Set of varKeys expanded in inspector
     lineVariableSnapshots: new Map(), // lineKey -> Array of inline vars for popover/copy actions
     inspectorPosition: null, // { top, left } when user undocks the inspector
   };
@@ -227,27 +228,78 @@
     return String(value);
   }
 
-  function formatInspectorValue(value, mode, expanded) {
+  function formatInspectorValue(value, mode) {
     const viewMode = mode || 'compact';
     if (viewMode === 'structured') {
-      const structured = formatStructuredValue(value);
-      if (expanded) {
-        return structured;
-      }
-      return structured.length > 160 ? structured.slice(0, 157) + '…' : structured;
+      return formatStructuredValue(value);
     }
     if (viewMode === 'expanded') {
       const raw = formatRawValue(value);
-      if (expanded) {
-        return raw;
+      return raw.length > 400 ? raw.slice(0, 397) + '…' : raw;
+    }
+    // Compact/default (slightly longer clip in relaxed modes)
+    const inlineLimit = viewMode === 'compact' ? 140 : 240;
+    return formatInlineValue(value, inlineLimit);
+  }
+
+  function getFoldableStructureSource(value) {
+    if (value && typeof value === 'object') {
+      return value;
+    }
+    if (typeof value === 'string') {
+      try {
+        const parsed = JSON.parse(value);
+        if (parsed && typeof parsed === 'object') {
+          return parsed;
+        }
+      } catch {
+        return null;
       }
-      return raw.length > 200 ? raw.slice(0, 197) + '…' : raw;
     }
-    if (viewMode === 'raw') {
-      return formatRawValue(value);
+    return null;
+  }
+
+  function renderInspectorValueContent(value, mode) {
+    if (mode === 'structured') {
+      const foldable = getFoldableStructureSource(value);
+      if (foldable) {
+        const parsedNote = typeof value === 'string' ? 'Parsed from string' : null;
+        return renderStructuredTree(foldable, 0, parsedNote);
+      }
     }
-    // Compact/default
-    return formatInlineValue(value, expanded ? 320 : 140);
+    const formatted = formatInspectorValue(value, mode);
+    return '<pre class="inspector-value tracer-var-value-' + getValueType(value) + '">' + escapeHtml(formatted) + '</pre>';
+  }
+
+  function renderStructuredTree(value, depth, note) {
+    if (!value || typeof value !== 'object' || depth >= INSPECTOR_TREE_DEPTH_LIMIT) {
+      return '<pre class="inspector-value">' + escapeHtml(formatStructuredValue(value)) + '</pre>';
+    }
+    const isArray = Array.isArray(value);
+    const entries = isArray ? value.map(function(entry, index) { return [index, entry]; }) : Object.entries(value);
+    const openAttr = depth < 2 ? ' open' : '';
+    const summaryLabel = (isArray ? 'Array' : 'Object') + ' (' + entries.length + ')';
+    const noteHtml = note && depth === 0 ? '<span class="inspector-tree-note">' + escapeHtml(note) + '</span>' : '';
+    const rows = entries.slice(0, INSPECTOR_TREE_ENTRY_LIMIT).map(function(entry) {
+      const key = String(entry[0]);
+      const child = entry[1];
+      const childHasStructure = child && typeof child === 'object';
+      const childHtml = childHasStructure
+        ? renderStructuredTree(child, depth + 1)
+        : '<code class="inspector-leaf tracer-var-value-' + getValueType(child) + '">' + escapeHtml(formatInlineValue(child, 160)) + '</code>';
+      return '<li class="inspector-tree-item">' +
+        '<span class="inspector-tree-key">' + escapeHtml(key) + '</span>' +
+        '<span class="inspector-tree-sep">:</span>' +
+        '<div class="inspector-tree-value">' + childHtml + '</div>' +
+      '</li>';
+    }).join('');
+    const overflow = entries.length > INSPECTOR_TREE_ENTRY_LIMIT
+      ? '<li class="inspector-tree-more">+' + (entries.length - INSPECTOR_TREE_ENTRY_LIMIT) + ' more</li>'
+      : '';
+    return '<details class="inspector-tree"' + openAttr + '>' +
+      '<summary><span class="inspector-tree-summary">' + escapeHtml(summaryLabel) + '</span>' + noteHtml + '</summary>' +
+      '<ul class="inspector-tree-list">' + rows + overflow + '</ul>' +
+    '</details>';
   }
 
   function buildProjectionRows(event) {
@@ -1135,11 +1187,6 @@
         const entry = resolveVariableEntry(functionId, lineNumber, varName, scope, source);
         togglePinnedEntry(functionId, lineNumber, entry);
       }
-    } else if (action === 'toggle-variable-expand') {
-      const rowKey = target.getAttribute('data-row-key');
-      if (rowKey) {
-        toggleInspectorRow(rowKey);
-      }
     } else if (action === 'open-projection') {
       const functionId = target.getAttribute('data-function');
       const lineValue = target.getAttribute('data-line');
@@ -1297,9 +1344,8 @@
       return;
     }
 
-    state.inlinePopover = null;
-    state.inspectorCollapsed = false;
-    state.expandedInspectorRows.clear();
+  state.inlinePopover = null;
+  state.inspectorCollapsed = false;
     cancelInspectorDrag();
     state.projectionView = {
       functionId,
@@ -1317,7 +1363,6 @@
     }
     cancelInspectorDrag();
     state.projectionView = null;
-    state.expandedInspectorRows.clear();
     render();
   }
 
@@ -1400,18 +1445,6 @@
       console.warn('[flowPanel] execCommand copy failed:', err);
     }
     document.body.removeChild(temp);
-  }
-
-  function toggleInspectorRow(rowKey) {
-    if (!rowKey) {
-      return;
-    }
-    if (state.expandedInspectorRows.has(rowKey)) {
-      state.expandedInspectorRows.delete(rowKey);
-    } else {
-      state.expandedInspectorRows.add(rowKey);
-    }
-    render();
   }
 
   function executeTraceLineFromTarget(target) {
@@ -1880,13 +1913,10 @@
 
     const rows = projection.variables.length
       ? projection.variables.map(function(entry) {
-          const rowKey = makeVariableKey(projection.functionId, projection.line, entry.scope, entry.name);
+          const varAttrs = ' data-function="' + escapeAttribute(projection.functionId) + '" data-line="' + projection.line + '" data-var-name="' + escapeAttribute(entry.name) + '" data-var-scope="' + escapeAttribute(entry.scope) + '" data-source="inspector"';
           const isPinned = isVariablePinned(projection.functionId, projection.line, entry.scope, entry.name);
-          const isExpanded = state.expandedInspectorRows.has(rowKey);
-          const displayValue = formatInspectorValue(entry.value, mode, isExpanded);
-          const rawValue = formatInspectorValue(entry.value, 'raw', true);
-          const varAttrs = ' data-function="' + escapeAttribute(projection.functionId) + '" data-line="' + projection.line + '" data-var-name="' + escapeAttribute(entry.name) + '" data-var-scope="' + escapeAttribute(entry.scope) + '" data-row-key="' + escapeAttribute(rowKey) + '" data-source="inspector"';
-          return '<div class="inspector-row' + (isPinned ? ' is-pinned' : '') + (isExpanded ? ' is-expanded' : '') + '">' +
+          const valueHtml = renderInspectorValueContent(entry.value, mode);
+          return '<div class="inspector-row' + (isPinned ? ' is-pinned' : '') + '">' +
             '<div class="inspector-row-head">' +
               '<div class="inspector-row-label">' +
                 '<span class="projection-scope">' + escapeHtml(entry.scope) + '</span>' +
@@ -1895,11 +1925,9 @@
               '<div class="inspector-row-actions">' +
                 '<button type="button" class="inspector-action-btn" data-action="pin-variable"' + varAttrs + ' aria-pressed="' + (isPinned ? 'true' : 'false') + '">' + (isPinned ? 'Unpin' : 'Pin') + '</button>' +
                 '<button type="button" class="inspector-action-btn" data-action="copy-variable"' + varAttrs + ' aria-label="Copy ' + escapeAttribute(entry.name) + '">Copy</button>' +
-                '<button type="button" class="inspector-action-btn" data-action="toggle-variable-expand"' + varAttrs + ' aria-expanded="' + (isExpanded ? 'true' : 'false') + '">' + (isExpanded ? 'Collapse' : 'Expand') + '</button>' +
               '</div>' +
             '</div>' +
-            '<pre class="inspector-value tracer-var-value-' + entry.type + '">' + escapeHtml(displayValue) + '</pre>' +
-            (isExpanded ? '<details open class="inspector-raw"><summary>Raw</summary><pre>' + escapeHtml(rawValue) + '</pre></details>' : '') +
+            '<div class="inspector-row-body">' + valueHtml + '</div>' +
           '</div>';
         }).join('')
       : '<div class="projection-empty">No variables captured for this line.</div>';
