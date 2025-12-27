@@ -520,7 +520,7 @@ h2 {
 .code-line {
   position: relative;
   display: grid;
-  grid-template-columns: 60px 1fr;
+  grid-template-columns: 32px 60px 1fr;
   align-items: stretch;
   min-height: var(--vscode-editor-line-height, 22px);
   margin: 0;
@@ -575,6 +575,18 @@ h2 {
   background: var(--vscode-list-activeSelectionBackground, rgba(128, 128, 128, 0.2));
 }
 
+.line-number:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+  background: var(--vscode-editorGutter-background, rgba(255, 255, 255, 0.02));
+  color: var(--vscode-editorLineNumber-foreground, var(--vscode-descriptionForeground));
+}
+
+.line-number:disabled:hover {
+  background: var(--vscode-editorGutter-background, rgba(255, 255, 255, 0.02));
+  color: var(--vscode-editorLineNumber-foreground, var(--vscode-descriptionForeground));
+}
+
 .code-snippet-wrapper {
   display: flex;
   align-items: baseline;
@@ -601,46 +613,74 @@ h2 {
 }
 
 .var-peek {
-  margin-left: auto;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  justify-content: center;
+  gap: 4px;
   position: relative;
 }
 
+.code-line > .var-peek,
+.code-line > .var-peek-empty {
+  justify-self: center;
+  align-self: center;
+}
+
+.var-peek-empty {
+  width: 28px;
+  height: 28px;
+  display: inline-block;
+}
+
 .var-peek-trigger {
-  border: 1px solid transparent;
+  border: none;
   background: transparent;
-  color: var(--vscode-descriptionForeground);
+  color: inherit;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  cursor: pointer;
+  padding: 0;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  cursor: pointer;
-  font-size: 0.8rem;
-  transition: background-color 0.15s ease, border-color 0.15s ease;
+  justify-content: center;
+  transition: transform 0.15s ease;
 }
 
 .var-peek-trigger:hover,
 .var-peek-trigger.is-active {
-  background: var(--vscode-editorWidget-background);
-  border-color: var(--vscode-editorWidget-border);
+  transform: scale(1.05);
 }
 
 .var-peek-dot {
-  width: 8px;
-  height: 8px;
+  width: 14px;
+  height: 14px;
   border-radius: 50%;
-  background: var(--vscode-textLink-foreground, #4ec9b0);
-  box-shadow: 0 0 6px rgba(78, 201, 176, 0.6);
+  border: 2px solid #6d8f6a;
+  background: rgba(109, 143, 106, 0.15);
+  box-shadow: 0 0 6px rgba(109, 143, 106, 0.35);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.var-peek-trigger:hover .var-peek-dot,
+.var-peek-trigger.is-active .var-peek-dot,
+.var-peek-trigger:focus-visible .var-peek-dot {
+  transform: scale(1.2);
+  box-shadow: 0 0 10px rgba(109, 143, 106, 0.55);
+  background: rgba(109, 143, 106, 0.85);
+  border-color: rgba(109, 143, 106, 0.95);
+}
+
+.var-peek-trigger:focus-visible {
+  outline: 2px solid rgba(109, 143, 106, 0.8);
+  outline-offset: 2px;
 }
 
 .var-peek-pin-count {
-  font-size: 0.7rem;
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: var(--vscode-badge-background, rgba(128, 128, 128, 0.25));
+  font-size: 0.65rem;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--vscode-badge-background, rgba(255, 255, 255, 0.12));
   color: var(--vscode-badge-foreground, var(--vscode-foreground));
 }
 
@@ -845,6 +885,7 @@ h2 {
 .code-line.tracer-active .line-number {
   color: var(--vscode-textLink-foreground, var(--vscode-textLink-activeForeground));
   font-weight: 600;
+  cursor: not-allowed;
 }
 
 .tracer-inline-vars {

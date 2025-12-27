@@ -1569,9 +1569,8 @@
     const codeSnippet = typeof options.lineText === 'string' ? options.lineText.trim() : '';
 
     let html = '<div class="var-peek" data-line-key="' + escapeAttribute(lineKey) + '">';
-    html += '<button type="button" class="var-peek-trigger' + (inspectorActive ? ' is-active' : '') + '" data-action="toggle-inline-vars" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '" data-file="' + escapeAttribute(file) + '" data-code="' + escapeAttribute(codeSnippet) + '" aria-pressed="' + (inspectorActive ? 'true' : 'false') + '">';
+    html += '<button type="button" class="var-peek-trigger' + (inspectorActive ? ' is-active' : '') + '" data-action="toggle-inline-vars" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '" data-file="' + escapeAttribute(file) + '" data-code="' + escapeAttribute(codeSnippet) + '" aria-label="View captured values" aria-pressed="' + (inspectorActive ? 'true' : 'false') + '">';
     html += '<span class="var-peek-dot"></span>';
-    html += '<span class="var-peek-label">' + vars.length + ' ' + (vars.length === 1 ? 'value' : 'values') + '</span>';
     html += '</button>';
     if (pinnedCount > 0) {
       html += '<span class="var-peek-pin-count" title="Pinned values for this line">' + pinnedCount + '</span>';
@@ -1630,11 +1629,7 @@
     if (!lineNode) {
       return;
     }
-    const wrapper = lineNode.querySelector('.code-snippet-wrapper');
-    if (!wrapper) {
-      return;
-    }
-    const existing = wrapper.querySelector('.var-peek');
+    const existing = lineNode.querySelector('.var-peek');
     if (existing) {
       existing.remove();
     }
@@ -1657,7 +1652,7 @@
     temp.innerHTML = html;
     const node = temp.firstElementChild;
     if (node) {
-      wrapper.appendChild(node);
+      lineNode.insertBefore(node, lineNode.firstChild);
     }
   }
 
@@ -2403,6 +2398,7 @@
       
       // Inline variable indicator & popover
       let inlineVarsHtml = '';
+      let hasInlineIndicator = false;
       if (regularEvents.length > 0 && !hasError) {
         const latestEvent = regularEvents[regularEvents.length - 1];
         const vars = pickVarsForLine(line, latestEvent.locals, latestEvent.globals);
@@ -2415,16 +2411,23 @@
             file: fn.file || '',
             lineText: line,
           });
+          hasInlineIndicator = true;
         }
       } else {
         rememberLineSnapshot(functionId, lineNumber, null);
       }
       
+      const traceDisabled = hasInlineIndicator || isLatestTracerLine;
+      const lineNumberDisabled = traceDisabled ? ' disabled aria-disabled="true"' : '';
+      const lineNumberTitle = traceDisabled ? 'Already executed' : 'Click to execute up to this line';
+
+      const inlineIndicatorHtml = inlineVarsHtml || '<span class="var-peek var-peek-empty" aria-hidden="true"></span>';
+
       html += '<div class="' + lineClass + '"' + wrapperAttrs + '>' +
-        '<button type="button" class="line-number" data-action="trace-line" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '"' + callTargetAttr + parentAttrs + ' title="Click to execute up to this line">' + lineNumber + '</button>' +
+        inlineIndicatorHtml +
+        '<button type="button" class="line-number" data-action="trace-line" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '"' + callTargetAttr + parentAttrs + lineNumberDisabled + ' title="' + lineNumberTitle + '">' + lineNumber + '</button>' +
         '<div class="code-snippet-wrapper">' +
         '<span class="code-snippet">' + codeHtml + '</span>' +
-        inlineVarsHtml +
         '</div>' +
         '</div>';
       
