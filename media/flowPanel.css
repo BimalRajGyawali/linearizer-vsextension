@@ -1109,7 +1109,9 @@ h2 {
   top: 72px;
   right: 24px;
   bottom: 24px;
-  width: min(420px, 95vw);
+  width: clamp(520px, 42vw, 760px);
+  max-width: 95vw;
+  min-width: 360px;
   max-height: calc(100vh - 48px);
   background: var(--vscode-editorWidget-background);
   border: 1px solid var(--vscode-editorWidget-border);
@@ -1168,6 +1170,12 @@ body.is-dragging-inspector .projection-info {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.projection-controls > * {
+  flex-shrink: 0;
 }
 
 .projection-collapse {
@@ -1242,25 +1250,32 @@ body.is-dragging-inspector .projection-info {
 .projection-grid {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 4px;
 }
 
 .inspector-view-group {
   display: inline-flex;
+  flex-wrap: wrap;
   background: var(--vscode-editor-background);
   border-radius: 999px;
   padding: 2px;
   border: 1px solid var(--vscode-editorWidget-border);
+  gap: 2px;
 }
 
 .inspector-view-btn {
   border: none;
   background: transparent;
   color: var(--vscode-descriptionForeground);
-  padding: 4px 10px;
+  width: 34px;
+  height: 28px;
   border-radius: 999px;
   font-size: 0.75rem;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
 }
 
 .inspector-view-btn.is-active {
@@ -1268,24 +1283,38 @@ body.is-dragging-inspector .projection-info {
   color: var(--vscode-textLink-foreground, #4ec9b0);
 }
 
+.inspector-view-icon {
+  font-size: 0.85rem;
+  line-height: 1;
+}
+
+
 .inspector-row {
-  border: 1px solid var(--vscode-editorWidget-border);
-  border-radius: 8px;
-  padding: 8px 10px;
-  background: rgba(255, 255, 255, 0.01);
+  padding: 10px 0;
+  border-bottom: 1px solid var(--vscode-editorWidget-border);
+}
+
+.inspector-row:first-child {
+  padding-top: 0;
+}
+
+.inspector-row:last-child {
+  padding-bottom: 0;
+  border-bottom: none;
 }
 
 .inspector-row.is-pinned {
-  border-color: var(--vscode-textLink-foreground, #4ec9b0);
-  box-shadow: 0 0 0 1px rgba(78, 201, 176, 0.35);
+  background: var(--vscode-editor-selectionBackground, rgba(78, 201, 176, 0.08));
+  border-bottom-color: var(--vscode-textLink-foreground, #4ec9b0);
 }
 
 .inspector-row-head {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px 12px;
   align-items: center;
-  margin-bottom: 6px;
+  margin-bottom: 4px;
 }
 
 .inspector-row-label {
@@ -1297,7 +1326,7 @@ body.is-dragging-inspector .projection-info {
 
 .inspector-row-actions {
   display: inline-flex;
-  gap: 6px;
+  gap: 4px;
 }
 
 .inspector-action-btn {
@@ -1316,14 +1345,20 @@ body.is-dragging-inspector .projection-info {
 
 .inspector-value {
   margin: 0;
-  max-height: 120px;
+  max-height: 280px;
   overflow: auto;
   font-family: var(--vscode-editor-font-family, monospace);
   font-size: 0.85rem;
   line-height: 1.5;
-  background: var(--vscode-editor-background);
-  padding: 8px;
-  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--vscode-editorWidget-border);
+}
+
+.projection-dock.mode-expanded .inspector-value,
+.inspector-value-mode-expanded {
+  max-height: none;
 }
 
 .inspector-row-body {

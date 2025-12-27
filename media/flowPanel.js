@@ -234,8 +234,7 @@
       return formatStructuredValue(value);
     }
     if (viewMode === 'expanded') {
-      const raw = formatRawValue(value);
-      return raw.length > 400 ? raw.slice(0, 397) + '…' : raw;
+      return formatRawValue(value);
     }
     // Compact/default (slightly longer clip in relaxed modes)
     const inlineLimit = viewMode === 'compact' ? 140 : 240;
@@ -268,7 +267,8 @@
       }
     }
     const formatted = formatInspectorValue(value, mode);
-    return '<pre class="inspector-value tracer-var-value-' + getValueType(value) + '">' + escapeHtml(formatted) + '</pre>';
+    const modeClass = 'inspector-value-mode-' + (mode || 'compact');
+    return '<pre class="inspector-value ' + modeClass + ' tracer-var-value-' + getValueType(value) + '">' + escapeHtml(formatted) + '</pre>';
   }
 
   function renderStructuredTree(value, depth, note) {
@@ -1946,13 +1946,18 @@
       : '';
 
     const viewModes = [
-      { key: 'compact', label: 'Compact' },
-      { key: 'expanded', label: 'Expanded' },
-      { key: 'structured', label: 'Structured' },
+      { key: 'compact', label: 'Compact view', icon: '≡' },
+      { key: 'expanded', label: 'Expanded view', icon: '↕' },
+      { key: 'structured', label: 'Structured view', icon: '{}' },
     ];
 
     const viewToggles = viewModes.map(function(modeEntry) {
-      return '<button type="button" class="inspector-view-btn' + (mode === modeEntry.key ? ' is-active' : '') + '" data-action="set-inspector-mode" data-mode="' + modeEntry.key + '">' + modeEntry.label + '</button>';
+      const isActive = mode === modeEntry.key;
+      const ariaLabel = escapeAttribute(modeEntry.label + (isActive ? ' (selected)' : ''));
+      return '' +
+        '<button type="button" class="inspector-view-btn' + (isActive ? ' is-active' : '') + '" data-action="set-inspector-mode" data-mode="' + modeEntry.key + '" aria-label="' + ariaLabel + '" title="' + escapeAttribute(modeEntry.label) + '">' +
+          '<span class="inspector-view-icon" aria-hidden="true">' + escapeHtml(modeEntry.icon) + '</span>' +
+        '</button>';
     }).join('');
 
     const hasFloatingPosition = Boolean(
@@ -1967,6 +1972,7 @@
     if (hasFloatingPosition) {
       dockClasses.push('is-floating');
     }
+    dockClasses.push('mode-' + mode);
     const dockStyle = hasFloatingPosition
       ? ' style="top: ' + state.inspectorPosition.top + 'px; left: ' + state.inspectorPosition.left + 'px; right: auto; bottom: auto;"'
       : '';
