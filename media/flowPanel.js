@@ -12,6 +12,11 @@
   };
 
   const INLINE_VAR_DISPLAY_LIMIT = 5;
+  const INSPECTOR_BOUNDARY_PADDING = 32;
+  const INSPECTOR_TREE_ENTRY_LIMIT = 50;
+  const INSPECTOR_TREE_DEPTH_LIMIT = 6;
+  const INSPECTOR_MIN_WIDTH = 360;
+  const INSPECTOR_MIN_HEIGHT = 280;
 
   const MESSAGE_TYPES = Object.freeze({
     CALL_SITES_FOUND: 'call-sites-found',
@@ -53,12 +58,21 @@
     tracingParent: new Set(), // Set of parent functionIds currently being traced
     tracingChild: new Set(), // Set of child functionIds currently being traced
     projectionView: null, // { functionId, line, file, code, variables: [{scope,name,value,type}]} or null
-    pendingTraceRequest: null, // { functionId, line }
-    callSiteStatuses: new Map(), // functionId -> Map(callSiteKey -> { state: 'success' | 'error', message?: string })
-    flowTimelines: new Map(), // flowKey -> { flow, entryFullId, argsKey, events, targetLocation, requestedLine }
-    activeFlowKey: null,
+  pendingTraceRequest: null, // { functionId, line, source, label }
+  callSiteStatuses: new Map(), // functionId -> Map(callSiteKey -> { state: 'success' | 'error', message?: string })
+    inlinePopover: null, // { functionId, line }
+    inspectorViewMode: 'compact',
+    inspectorCollapsed: false,
+    pinnedVariables: new Map(), // lineKey -> Map(varKey -> entry)
+    lineVariableSnapshots: new Map(), // lineKey -> Array of inline vars for popover/copy actions
+    inspectorPosition: null, // { top, left } when user undocks the inspector
+    inspectorSize: null, // { width, height } when user resizes the inspector
+    pendingTraceTrigger: null, // { type: 'line' | 'call-site', ... }
+    lastTracerLocation: null, // { line, filename, functionId } for most recent executed line
   };
   let pendingTraceTimer = null;
+  let inspectorDragState = null;
+  let inspectorResizeState = null;
 
   function makeCallSiteKey(callSite) {
     if (!callSite || typeof callSite !== 'object') {
@@ -107,21 +121,34 @@
     }
     if (state.pendingTraceRequest) {
       state.pendingTraceRequest = null;
+      state.pendingTraceTrigger = null;
       if (options && options.render !== false) {
         render();
       }
     }
   }
 
-  function markPendingTrace(functionId, lineNumber) {
+  function markPendingTrace(functionId, lineNumber, options) {
     if (pendingTraceTimer) {
       clearTimeout(pendingTraceTimer);
     }
-    state.pendingTraceRequest = { functionId, line: lineNumber };
+    const meta = options || {};
+    const pendingLine = Number.isFinite(lineNumber) ? lineNumber : null;
+    state.pendingTraceRequest = {
+      functionId: functionId || null,
+      line: pendingLine,
+      source: meta.source || 'trace-line',
+      label: typeof meta.label === 'string' ? meta.label : null,
+    };
+    state.pendingTraceTrigger = meta.trigger || null;
+    if (meta.render !== false) {
+      render();
+    }
     pendingTraceTimer = setTimeout(function() {
       console.warn('[flowPanel] Trace request auto-cleared after timeout');
       pendingTraceTimer = null;
       state.pendingTraceRequest = null;
+      state.pendingTraceTrigger = null;
       render();
     }, 35000);
   }
@@ -162,6 +189,158 @@
       return formatted;
     }
     return formatted.slice(0, limit - 1) + '…';
+  }
+
+  function clampValue(value, minimum, maximum) {
+    const min = Number.isFinite(minimum) ? minimum : 0;
+    const max = Number.isFinite(maximum) ? maximum : min;
+    if (!Number.isFinite(value)) {
+      return min;
+    }
+    if (max <= min) {
+      return min;
+    }
+    return Math.min(Math.max(value, min), max);
+  }
+
+  function getInspectorSizeBounds() {
+    const horizontalPadding = INSPECTOR_BOUNDARY_PADDING * 2;
+    const verticalPadding = INSPECTOR_BOUNDARY_PADDING * 2;
+    const maxWidth = Math.max(INSPECTOR_MIN_WIDTH, window.innerWidth - horizontalPadding);
+    const maxHeight = Math.max(INSPECTOR_MIN_HEIGHT, window.innerHeight - verticalPadding);
+    return {
+      minWidth: INSPECTOR_MIN_WIDTH,
+      maxWidth,
+      minHeight: INSPECTOR_MIN_HEIGHT,
+      maxHeight,
+    };
+  }
+
+  function normalizeInspectorSize(size) {
+    if (!size || !Number.isFinite(size.width) || !Number.isFinite(size.height)) {
+      return null;
+    }
+    const bounds = getInspectorSizeBounds();
+    return {
+      width: clampValue(size.width, bounds.minWidth, bounds.maxWidth),
+      height: clampValue(size.height, bounds.minHeight, bounds.maxHeight),
+    };
+  }
+
+  function formatStructuredValue(value) {
+    if (value === null || value === undefined) {
+      return 'None';
+    }
+    if (typeof value === 'string') {
+      try {
+        const parsed = JSON.parse(value);
+        if (typeof parsed === 'object') {
+          return JSON.stringify(parsed, null, 2);
+        }
+      } catch {
+        return value;
+      }
+      return value;
+    }
+    if (typeof value === 'object') {
+      try {
+        return JSON.stringify(value, null, 2);
+      } catch {
+        return '[object]';
+      }
+    }
+    return String(value);
+  }
+
+  function formatRawValue(value) {
+    if (value === null || value === undefined) {
+      return 'None';
+    }
+    if (typeof value === 'string') {
+      return value;
+    }
+    if (typeof value === 'object') {
+      try {
+        return JSON.stringify(value, null, 2);
+      } catch {
+        return '[object]';
+      }
+    }
+    return String(value);
+  }
+
+  function formatInspectorValue(value, mode) {
+    const viewMode = mode || 'compact';
+    if (viewMode === 'structured') {
+      return formatStructuredValue(value);
+    }
+    if (viewMode === 'expanded') {
+      return formatRawValue(value);
+    }
+    // Compact/default (slightly longer clip in relaxed modes)
+    const inlineLimit = viewMode === 'compact' ? 140 : 240;
+    return formatInlineValue(value, inlineLimit);
+  }
+
+  function getFoldableStructureSource(value) {
+    if (value && typeof value === 'object') {
+      return value;
+    }
+    if (typeof value === 'string') {
+      try {
+        const parsed = JSON.parse(value);
+        if (parsed && typeof parsed === 'object') {
+          return parsed;
+        }
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  function renderInspectorValueContent(value, mode) {
+    if (mode === 'structured') {
+      const foldable = getFoldableStructureSource(value);
+      if (foldable) {
+        const parsedNote = typeof value === 'string' ? 'Parsed from string' : null;
+        return renderStructuredTree(foldable, 0, parsedNote);
+      }
+    }
+    const formatted = formatInspectorValue(value, mode);
+    const modeClass = 'inspector-value-mode-' + (mode || 'compact');
+    return '<pre class="inspector-value ' + modeClass + ' tracer-var-value-' + getValueType(value) + '">' + escapeHtml(formatted) + '</pre>';
+  }
+
+  function renderStructuredTree(value, depth, note) {
+    if (!value || typeof value !== 'object' || depth >= INSPECTOR_TREE_DEPTH_LIMIT) {
+      return '<pre class="inspector-value">' + escapeHtml(formatStructuredValue(value)) + '</pre>';
+    }
+    const isArray = Array.isArray(value);
+    const entries = isArray ? value.map(function(entry, index) { return [index, entry]; }) : Object.entries(value);
+    const openAttr = depth < 2 ? ' open' : '';
+    const summaryLabel = (isArray ? 'Array' : 'Object') + ' (' + entries.length + ')';
+    const noteHtml = note && depth === 0 ? '<span class="inspector-tree-note">' + escapeHtml(note) + '</span>' : '';
+    const rows = entries.slice(0, INSPECTOR_TREE_ENTRY_LIMIT).map(function(entry) {
+      const key = String(entry[0]);
+      const child = entry[1];
+      const childHasStructure = child && typeof child === 'object';
+      const childHtml = childHasStructure
+        ? renderStructuredTree(child, depth + 1)
+        : '<code class="inspector-leaf tracer-var-value-' + getValueType(child) + '">' + escapeHtml(formatInlineValue(child, 160)) + '</code>';
+      return '<li class="inspector-tree-item">' +
+        '<span class="inspector-tree-key">' + escapeHtml(key) + '</span>' +
+        '<span class="inspector-tree-sep">:</span>' +
+        '<div class="inspector-tree-value">' + childHtml + '</div>' +
+      '</li>';
+    }).join('');
+    const overflow = entries.length > INSPECTOR_TREE_ENTRY_LIMIT
+      ? '<li class="inspector-tree-more">+' + (entries.length - INSPECTOR_TREE_ENTRY_LIMIT) + ' more</li>'
+      : '';
+    return '<details class="inspector-tree"' + openAttr + '>' +
+      '<summary><span class="inspector-tree-summary">' + escapeHtml(summaryLabel) + '</span>' + noteHtml + '</summary>' +
+      '<ul class="inspector-tree-list">' + rows + overflow + '</ul>' +
+    '</details>';
   }
 
   function buildProjectionRows(event) {
@@ -394,6 +573,85 @@
     return functionId + '::' + line;
   }
 
+  function makeLineKey(functionId, lineNumber) {
+    if (!functionId || !Number.isFinite(lineNumber)) {
+      return '';
+    }
+    return functionId + '::' + lineNumber;
+  }
+
+  function makeVariableKey(functionId, lineNumber, scope, name) {
+    const lineKey = makeLineKey(functionId, lineNumber);
+    if (!lineKey || !name) {
+      return '';
+    }
+    const scopeLabel = scope || '';
+    return lineKey + '::' + scopeLabel + '::' + name;
+  }
+
+  function getPinnedLineMap(functionId, lineNumber, create) {
+    const lineKey = makeLineKey(functionId, lineNumber);
+    if (!lineKey) {
+      return null;
+    }
+    if (!state.pinnedVariables.has(lineKey) && create) {
+      state.pinnedVariables.set(lineKey, new Map());
+    }
+    return state.pinnedVariables.get(lineKey) || null;
+  }
+
+  function isVariablePinned(functionId, lineNumber, scope, name) {
+    const lineMap = getPinnedLineMap(functionId, lineNumber, false);
+    if (!lineMap) {
+      return false;
+    }
+    const key = makeVariableKey(functionId, lineNumber, scope, name);
+    return lineMap.has(key);
+  }
+
+  function rememberLineSnapshot(functionId, lineNumber, vars) {
+    const lineKey = makeLineKey(functionId, lineNumber);
+    if (!lineKey) {
+      return;
+    }
+    if (Array.isArray(vars) && vars.length > 0) {
+      state.lineVariableSnapshots.set(lineKey, vars);
+    } else {
+      state.lineVariableSnapshots.delete(lineKey);
+    }
+  }
+
+  function findSnapshotEntry(functionId, lineNumber, name) {
+    const lineKey = makeLineKey(functionId, lineNumber);
+    if (!lineKey) {
+      return null;
+    }
+    const vars = state.lineVariableSnapshots.get(lineKey);
+    if (!vars) {
+      return null;
+    }
+    const match = vars.find(function(entry) {
+      return entry && entry.key === name;
+    });
+    if (!match) {
+      return null;
+    }
+    return {
+      scope: match.isGlobal ? 'Global' : 'Local',
+      name: match.key,
+      value: match.value,
+      displayValue: formatValue(match.value),
+      type: getValueType(match.value),
+    };
+  }
+
+  function makeSafeDomId(value) {
+    if (!value) {
+      return 'var-peek';
+    }
+    return value.replace(/[^_A-Za-z0-9-]/g, '_');
+  }
+
   function hasValues(record) {
     if (!record) {
       return false;
@@ -442,20 +700,6 @@
     }
 
     return merged;
-  }
-
-  function buildFlowKeyFromEvent(event) {
-    if (!event || typeof event !== 'object') {
-      return null;
-    }
-    const flowName = typeof event.flow === 'string' && event.flow.length > 0
-      ? event.flow
-      : (typeof event.entry_full_id === 'string' ? event.entry_full_id : '');
-    const argsKey = typeof event.args_key === 'string' && event.args_key.length > 0 ? event.args_key : '';
-    if (!flowName && !argsKey) {
-      return null;
-    }
-    return flowName + '::' + argsKey;
   }
 
   function normaliseFlowEventPayload(flowEvent) {
@@ -514,6 +758,19 @@
     }
   }
 
+  function updateLastTracerLocation(eventData) {
+    if (!eventData || typeof eventData.line !== 'number') {
+      return;
+    }
+    const fileName = eventData.filename || eventData.file || '';
+    const functionId = findFunctionIdForEvent(eventData);
+    state.lastTracerLocation = {
+      line: eventData.line,
+      filename: normalisePath(fileName),
+      functionId: functionId || null,
+    };
+  }
+
   const flowMap = buildFlowMap(flows);
   const parents = computeParents(flows, functions, changed);
   const nameIndex = buildNameIndex(functions);
@@ -555,6 +812,7 @@
           message: message.statusMessage || 'Arguments captured from call site',
         });
       }
+      clearPendingTraceLock({ render: false });
       render();
     } else if (message.type === MESSAGE_TYPES.CALL_SITE_ARGS_ERROR && typeof message.functionId === 'string') {
       console.error('[flowPanel] Error extracting args from call site:', message.error);
@@ -565,13 +823,14 @@
         });
       }
       // Show error but don't prevent rendering
+      clearPendingTraceLock({ render: false });
       render();
     } else if (message.type === MESSAGE_TYPES.TRACER_EVENT) {
       if (message.event) {
         // Add or update event in the array
         const eventData = message.event;
-        const flowKey = buildFlowKeyFromEvent(eventData);
         const hasFlowSlice = Array.isArray(eventData.events) && eventData.events.length > 0;
+        let lastEventFromSlice = null;
 
         if (hasFlowSlice) {
           const normalisedEvents = eventData.events
@@ -581,22 +840,12 @@
             normalisedEvents.forEach(function(flowEvt) {
               upsertTracerEvent(flowEvt);
             });
-            if (flowKey) {
-              state.flowTimelines.set(flowKey, {
-                flow: eventData.flow || eventData.entry_full_id || 'flow',
-                entryFullId: eventData.entry_full_id,
-                argsKey: eventData.args_key || '',
-                events: normalisedEvents,
-                targetLocation: eventData.target_location,
-                requestedLine: eventData.requested_line,
-                lastServedIndex: eventData.last_served_index,
-              });
-              state.activeFlowKey = flowKey;
-            }
+            lastEventFromSlice = normalisedEvents[normalisedEvents.length - 1];
           }
         }
 
         upsertTracerEvent(eventData);
+        updateLastTracerLocation(lastEventFromSlice || eventData);
 
 			clearPendingTraceLock({ render: false });
 
@@ -636,6 +885,7 @@
       if (existingIndex < 0) {
         clearPendingTraceLock({ render: false });
         state.tracerEvents.push(errorEvent);
+        updateLastTracerLocation(errorEvent);
         render();
       }
     } else if (message.type === MESSAGE_TYPES.FUNCTION_SIGNATURE && typeof message.functionId === 'string' && Array.isArray(message.params)) {
@@ -703,6 +953,13 @@
       event.stopPropagation();
       event.preventDefault();
     }
+
+    if (state.pendingTraceRequest) {
+      console.warn('[flowPanel] Ignoring action while execution pending:', action);
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     
     if (action === 'toggle-parent') {
       const parent = target.getAttribute('data-parent');
@@ -740,15 +997,30 @@
     } else if (action === 'select-call-site') {
       const parentId = target.getAttribute('data-parent-id');
       const callSiteIndex = target.getAttribute('data-call-site-index');
+      if (state.pendingTraceRequest) {
+        console.warn('[flowPanel] Ignoring call site selection while execution is pending');
+        return;
+      }
       if (parentId && callSiteIndex !== null) {
         const index = parseInt(callSiteIndex, 10);
         const callSites = state.callSitesByFunction.get(parentId);
         if (callSites && callSites[index]) {
           const callSite = callSites[index];
           state.selectedCallSite.set(parentId, callSite);
-          render();
+          updateCallSiteSelectionDom(parentId, index);
           
           // Extract arguments from this call site (don't execute immediately)
+          markPendingTrace(parentId, callSite && typeof callSite.line === 'number' ? callSite.line : null, {
+            source: 'call-site',
+            label: 'Executing call site…',
+            trigger: {
+              type: 'call-site',
+              parentId,
+              index,
+              line: callSite ? callSite.line : null,
+              file: callSite ? callSite.file : null,
+            },
+          });
           vscode.postMessage({
             type: MESSAGE_TYPES.EXECUTE_FROM_CALL_SITE,
             functionId: parentId,
@@ -854,6 +1126,7 @@
               const eFile = e.filename.replace(/\\/g, '/');
               return eFile !== fnFile && !fnFile.endsWith(eFile) && !eFile.endsWith(fnFile);
             });
+            state.lastTracerLocation = null;
           }
           
           render();
@@ -919,6 +1192,57 @@
       if (identifier) {
   vscode.postMessage({ type: MESSAGE_TYPES.OPEN_SOURCE, identifier });
       }
+    } else if (action === 'toggle-inline-vars') {
+      const functionId = target.getAttribute('data-function');
+      const lineValue = target.getAttribute('data-line');
+      if (functionId && lineValue) {
+        const lineNumber = parseInt(lineValue, 10);
+        if (!Number.isFinite(lineNumber)) {
+          return;
+        }
+        let filePath = target.getAttribute('data-file') || '';
+        let codeSnippet = target.getAttribute('data-code') || '';
+        const codeLineNode = typeof target.closest === 'function' ? target.closest('.code-line') : null;
+        if (!filePath && codeLineNode) {
+          filePath = codeLineNode.getAttribute('data-file') || '';
+        }
+        if (!codeSnippet && codeLineNode) {
+          const snippetNode = codeLineNode.querySelector('.code-snippet');
+          codeSnippet = snippetNode ? (snippetNode.textContent || '') : '';
+        }
+        toggleProjection(functionId, filePath, lineNumber, (codeSnippet || '').trim());
+      }
+    } else if (action === 'set-inspector-mode') {
+      const mode = target.getAttribute('data-mode');
+      if (mode && mode !== state.inspectorViewMode) {
+        state.inspectorViewMode = mode;
+        render();
+      }
+    } else if (action === 'toggle-inspector-collapse') {
+      state.inspectorCollapsed = !state.inspectorCollapsed;
+      render();
+    } else if (action === 'copy-variable') {
+      const functionId = target.getAttribute('data-function');
+      const lineValue = target.getAttribute('data-line');
+      const varName = target.getAttribute('data-var-name');
+      const scope = target.getAttribute('data-var-scope');
+      const source = target.getAttribute('data-source');
+      if (functionId && lineValue && varName) {
+        const lineNumber = parseInt(lineValue, 10);
+        const entry = resolveVariableEntry(functionId, lineNumber, varName, scope, source);
+        copyVariableEntry(entry);
+      }
+    } else if (action === 'pin-variable') {
+      const functionId = target.getAttribute('data-function');
+      const lineValue = target.getAttribute('data-line');
+      const varName = target.getAttribute('data-var-name');
+      const scope = target.getAttribute('data-var-scope');
+      const source = target.getAttribute('data-source');
+      if (functionId && lineValue && varName) {
+        const lineNumber = parseInt(lineValue, 10);
+        const entry = resolveVariableEntry(functionId, lineNumber, varName, scope, source);
+        togglePinnedEntry(functionId, lineNumber, entry);
+      }
     } else if (action === 'open-projection') {
       const functionId = target.getAttribute('data-function');
       const lineValue = target.getAttribute('data-line');
@@ -930,9 +1254,9 @@
       }
     } else if (action === 'close-projection') {
       closeProjection();
-    } else if (action === 'clear-flow-history') {
-      state.flowTimelines.clear();
-      state.activeFlowKey = null;
+    } else if (action === 'reset-inspector-position') {
+      state.inspectorPosition = null;
+      state.inspectorSize = null;
       render();
     } else if (action === 'trace-line') {
       executeTraceLineFromTarget(target);
@@ -941,10 +1265,7 @@
 
   document.addEventListener('click', (event) => {
     const trigger = findActionTarget(event.target);
-    if (!trigger) {
-      return;
-    }
-    if (trigger.getAttribute('data-action') === 'scroll-parent') {
+    if (trigger && trigger.getAttribute('data-action') === 'scroll-parent') {
       const targetParent = trigger.getAttribute('data-target');
       if (targetParent) {
         expandParent(targetParent);
@@ -954,6 +1275,41 @@
         }
       }
     }
+
+    const clickTarget = event.target instanceof Element ? event.target : null;
+    const insidePopover = clickTarget ? clickTarget.closest('.var-peek') : null;
+    if (!insidePopover && state.inlinePopover) {
+      const open = state.inlinePopover;
+      state.inlinePopover = null;
+      refreshInlineVarPeekFor(open.functionId, open.line);
+    }
+  });
+
+  root.addEventListener('pointerdown', (event) => {
+    if (!state.projectionView || event.button !== 0) {
+      return;
+    }
+    if (state.pendingTraceRequest) {
+      event.preventDefault();
+      return;
+    }
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) {
+      return;
+    }
+    const resizeHandle = target.closest('.projection-resize-handle');
+    if (resizeHandle) {
+      beginInspectorResize(event, resizeHandle);
+      return;
+    }
+    const header = target.closest('.projection-header');
+    if (!header) {
+      return;
+    }
+    if (target.closest('.projection-controls')) {
+      return;
+    }
+    beginInspectorDrag(event);
   });
 
   root.addEventListener('dblclick', (event) => {
@@ -966,10 +1322,21 @@
   });
 
   window.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && state.projectionView) {
+    if (event.key !== 'Escape') {
+      return;
+    }
+    if (state.inlinePopover) {
+      const open = state.inlinePopover;
+      state.inlinePopover = null;
+      refreshInlineVarPeekFor(open.functionId, open.line);
+      return;
+    }
+    if (state.projectionView) {
       closeProjection();
     }
   });
+
+  window.addEventListener('resize', handleInspectorViewportResize);
 
   function expandParent(parentId) {
     if (!state.expandedParents.has(parentId)) {
@@ -1039,6 +1406,10 @@
       return;
     }
 
+  state.inlinePopover = null;
+  state.inspectorCollapsed = false;
+    cancelInspectorResize();
+    cancelInspectorDrag();
     state.projectionView = {
       functionId,
       file: targetFile,
@@ -1053,8 +1424,91 @@
     if (!state.projectionView) {
       return;
     }
+    cancelInspectorResize();
+    cancelInspectorDrag();
     state.projectionView = null;
     render();
+  }
+
+  function resolveVariableEntry(functionId, lineNumber, varName, scope, source) {
+    if (!functionId || !Number.isFinite(lineNumber) || !varName) {
+      return null;
+    }
+    if (
+      source === 'inspector' &&
+      state.projectionView &&
+      state.projectionView.functionId === functionId &&
+      state.projectionView.line === lineNumber &&
+      Array.isArray(state.projectionView.variables)
+    ) {
+      return state.projectionView.variables.find(function(entry) {
+        if (!entry) {
+          return false;
+        }
+        if (entry.name !== varName) {
+          return false;
+        }
+        if (scope && entry.scope !== scope) {
+          return false;
+        }
+        return true;
+      }) || null;
+    }
+    return findSnapshotEntry(functionId, lineNumber, varName);
+  }
+
+  function togglePinnedEntry(functionId, lineNumber, variableEntry) {
+    if (!variableEntry) {
+      return;
+    }
+    const lineKey = makeLineKey(functionId, lineNumber);
+    if (!lineKey) {
+      return;
+    }
+    const map = getPinnedLineMap(functionId, lineNumber, true);
+    const varKey = makeVariableKey(functionId, lineNumber, variableEntry.scope, variableEntry.name);
+    if (!varKey || !map) {
+      return;
+    }
+    if (map.has(varKey)) {
+      map.delete(varKey);
+      if (map.size === 0) {
+        state.pinnedVariables.delete(lineKey);
+      }
+    } else {
+      map.set(varKey, {
+        scope: variableEntry.scope,
+        name: variableEntry.name,
+        value: variableEntry.value,
+        type: variableEntry.type || getValueType(variableEntry.value),
+      });
+    }
+    render();
+  }
+
+  function copyVariableEntry(variableEntry) {
+    if (!variableEntry) {
+      return;
+    }
+    const text = formatRawValue(variableEntry.value);
+    if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(text).catch(function(err) {
+        console.warn('[flowPanel] Clipboard copy failed:', err);
+      });
+      return;
+    }
+    const temp = document.createElement('textarea');
+    temp.value = text;
+    temp.style.position = 'fixed';
+    temp.style.opacity = '0';
+    document.body.appendChild(temp);
+    temp.select();
+    try {
+      document.execCommand('copy');
+    } catch (err) {
+      console.warn('[flowPanel] execCommand copy failed:', err);
+    }
+    document.body.removeChild(temp);
   }
 
   function executeTraceLineFromTarget(target) {
@@ -1068,6 +1522,8 @@
     const parentFunctionId = target.getAttribute('data-parent-function');
     const parentLine = target.getAttribute('data-parent-line');
     const callLine = target.getAttribute('data-call-line');
+  const parentLineNumber = parentLine ? parseInt(parentLine, 10) : null;
+  const callLineNumber = callLine ? parseInt(callLine, 10) : null;
 
     if (!functionId || !line) {
       console.error('[flowPanel] Missing functionId or line:', { functionId, line });
@@ -1097,10 +1553,10 @@
       stopLine: stopLineNum,
     };
 
-    if (parentFunctionId && parentLine && callLine) {
+    if (parentFunctionId && Number.isFinite(parentLineNumber) && Number.isFinite(callLineNumber)) {
       payload.parentFunctionId = parentFunctionId;
-      payload.parentLine = parseInt(parentLine, 10);
-      payload.callLine = parseInt(callLine, 10);
+      payload.parentLine = parentLineNumber;
+      payload.callLine = callLineNumber;
       payload.isNested = true;
 
       const parentStoredArgs = getCallArgsForFunction(parentFunctionId);
@@ -1132,16 +1588,24 @@
     }
 
     console.log('[flowPanel] Sending trace-line message', payload);
-    markPendingTrace(functionId, lineNumber);
+    markPendingTrace(functionId, lineNumber, {
+      source: 'trace-line',
+      label: 'Executing line ' + lineNumber + '…',
+      trigger: {
+        type: 'line',
+        functionId,
+        line: lineNumber,
+        file: functions[functionId] ? functions[functionId].file : null,
+        parentFunctionId: parentFunctionId || null,
+        parentLine: Number.isFinite(parentLineNumber) ? parentLineNumber : null,
+        callLine: Number.isFinite(callLineNumber) ? callLineNumber : null,
+      },
+    });
     vscode.postMessage(payload);
   }
 
   function render() {
     let content = '';
-    const timelinePanel = renderFlowTimelinePanel();
-    if (timelinePanel) {
-      content += timelinePanel;
-    }
     if (!parents.length) {
       content += '<p class="placeholder">No call flows available.</p>';
     } else {
@@ -1151,8 +1615,12 @@
     content += renderProjectionPanel();
     root.innerHTML = content;
 
-    const tracingActive = state.tracingParent.size > 0 || state.tracingChild.size > 0;
-    root.classList.toggle('is-tracing', tracingActive);
+  const tracingActive = state.tracingParent.size > 0 || state.tracingChild.size > 0 || Boolean(state.pendingTraceRequest);
+  root.classList.toggle('is-tracing', tracingActive);
+  root.classList.toggle('is-executing', Boolean(state.pendingTraceRequest));
+    if (state.projectionView) {
+      handleInspectorViewportResize();
+    }
   }
 
   function renderLoadingOverlay() {
@@ -1178,73 +1646,385 @@
       '</div>';
   }
 
-  function summariseFlowVariables(flowEvent) {
-    if (!flowEvent || !flowEvent.locals || typeof flowEvent.locals !== 'object') {
-      return '<span class="flow-vars-empty">No locals captured</span>';
+  function renderInlineVarPeek(options) {
+    const functionId = options.functionId;
+    const lineNumber = options.lineNumber;
+    const vars = Array.isArray(options.vars) ? options.vars : [];
+    const file = options.file || '';
+    const inspectorActive = Boolean(
+      state.projectionView &&
+      state.projectionView.functionId === functionId &&
+      state.projectionView.line === lineNumber
+    );
+    const lineKey = makeLineKey(functionId, lineNumber);
+    const lineMap = getPinnedLineMap(functionId, lineNumber, false);
+    const pinnedCount = lineMap ? lineMap.size : 0;
+    const codeSnippet = typeof options.lineText === 'string' ? options.lineText.trim() : '';
+
+    let html = '<div class="var-peek" data-line-key="' + escapeAttribute(lineKey) + '">';
+    html += '<button type="button" class="var-peek-trigger' + (inspectorActive ? ' is-active' : '') + '" data-action="toggle-inline-vars" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '" data-file="' + escapeAttribute(file) + '" data-code="' + escapeAttribute(codeSnippet) + '" aria-label="View captured values" aria-pressed="' + (inspectorActive ? 'true' : 'false') + '">';
+    html += '<span class="var-peek-dot"></span>';
+    html += '</button>';
+    if (pinnedCount > 0) {
+      html += '<span class="var-peek-pin-count" title="Pinned values for this line">' + pinnedCount + '</span>';
     }
-    const entries = Object.entries(flowEvent.locals);
-    if (!entries.length) {
-      return '<span class="flow-vars-empty">No locals captured</span>';
-    }
-    const previewEntries = entries.slice(0, 3);
-    const previewHtml = previewEntries.map(function(entry) {
-      const [name, value] = entry;
-      const formatted = formatInlineValue(value, 40);
-      return '<span class="flow-var-pill">' +
-        '<span class="flow-var-name">' + escapeHtml(name) + '</span>' +
-        '<span class="flow-var-equals">=</span>' +
-        '<code class="flow-var-value">' + escapeHtml(formatted) + '</code>' +
-      '</span>';
-    }).join('');
-    const extraCount = entries.length - previewEntries.length;
-    const extraLabel = extraCount > 0
-      ? '<span class="flow-var-more">+' + extraCount + ' more</span>'
-      : '';
-    return previewHtml + extraLabel;
+    html += '</div>';
+    return html;
   }
 
-  function renderFlowTimelinePanel() {
-    if (!state.activeFlowKey) {
-      return '';
-    }
-    const timeline = state.flowTimelines.get(state.activeFlowKey);
-    if (!timeline || !Array.isArray(timeline.events) || timeline.events.length === 0) {
-      return '';
-    }
-    const title = timeline.flow || extractDisplayName(timeline.entryFullId || timeline.flow || 'Flow');
-    const subtitle = timeline.targetLocation
-      ? 'Target: ' + timeline.targetLocation
-      : 'Steps: ' + timeline.events.length;
+  function renderInlinePopover(options) {
+    const vars = Array.isArray(options.vars) ? options.vars : [];
+    const displayVars = vars.slice(0, INLINE_VAR_DISPLAY_LIMIT);
+    const functionId = options.functionId;
+    const lineNumber = options.lineNumber;
+    const moreCount = vars.length - displayVars.length;
+    const file = options.file || '';
+    const code = options.code || '';
 
-    let html = '<section class="flow-timeline-panel" role="region" aria-label="Flow timeline">';
-    html += '<header class="flow-timeline-header">';
-    html += '<div class="flow-timeline-meta">';
-    html += '<div class="flow-timeline-title">' + escapeHtml(title) + '</div>';
-    html += '<div class="flow-timeline-subtitle">' + escapeHtml(subtitle) + '</div>';
-    html += '</div>';
-    html += '<div class="flow-timeline-actions">';
-    html += '<button type="button" class="flow-action-btn" data-action="clear-flow-history">Clear</button>';
-    html += '</div>';
-    html += '</header>';
+    const rows = displayVars.map(function(entry) {
+      const valueType = getValueType(entry.value);
+      const preview = formatInlineValue(entry.value, 48);
+      const scope = entry.isGlobal ? 'Global' : 'Local';
+      const pinned = isVariablePinned(functionId, lineNumber, scope, entry.key);
+      const varAttrs = ' data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '" data-var-name="' + escapeAttribute(entry.key) + '" data-var-scope="' + scope + '"';
+      return '<li class="var-popover-row">' +
+        '<div class="var-popover-label">' +
+          '<span class="var-popover-name">' + escapeHtml(entry.key) + '</span>' +
+          (entry.isGlobal ? '<span class="var-popover-scope" title="Global">G</span>' : '') +
+        '</div>' +
+        '<code class="var-popover-value tracer-var-value-' + valueType + '">' + escapeHtml(preview) + '</code>' +
+        '<div class="var-popover-actions">' +
+          '<button type="button" class="var-popover-btn" data-action="copy-variable" data-source="popover"' + varAttrs + ' aria-label="Copy ' + escapeAttribute(entry.key) + '">Copy</button>' +
+          '<button type="button" class="var-popover-btn" data-action="pin-variable" data-source="popover" data-pin-state="' + (pinned ? 'pinned' : 'unpinned') + '"' + varAttrs + '>' + (pinned ? 'Unpin' : 'Pin') + '</button>' +
+        '</div>' +
+      '</li>';
+    }).join('');
 
-    html += '<ol class="flow-timeline-list">';
-    timeline.events.forEach(function(flowEvent, index) {
-      const locationLabel = flowEvent.target_location || flowEvent.location || ((flowEvent.function || '?') + ':' + (flowEvent.line ?? '?'));
-      const isTarget = timeline.targetLocation && locationLabel === timeline.targetLocation;
-      html += '<li class="flow-timeline-row' + (isTarget ? ' is-target' : '') + '">';
-      html += '<span class="flow-step-index">' + (index + 1) + '</span>';
-      html += '<div class="flow-step-details">';
-      html += '<div class="flow-step-head">';
-      html += '<span class="flow-step-function">' + escapeHtml(flowEvent.function || 'anonymous') + '</span>';
-      html += '<span class="flow-step-location">' + escapeHtml(locationLabel) + '</span>';
-      html += '</div>';
-      html += '<div class="flow-step-vars">' + summariseFlowVariables(flowEvent) + '</div>';
-      html += '</div>';
-      html += '</li>';
+    const moreHtml = moreCount > 0
+      ? '<div class="var-popover-more">+' + moreCount + ' more captured for this line</div>'
+      : '';
+
+    return '<div class="var-popover" id="' + escapeAttribute(options.controlId) + '" role="dialog" aria-label="Line variables">' +
+      '<ul class="var-popover-list">' + rows + '</ul>' +
+      moreHtml +
+      '<div class="var-popover-footer">' +
+        '<button type="button" class="var-popover-inspect" data-action="open-projection" data-function="' + escapeAttribute(functionId) + '" data-file="' + escapeAttribute(file) + '" data-line="' + lineNumber + '" data-code="' + escapeAttribute(code.trim()) + '">Open inspector</button>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function refreshInlineVarPeekFor(functionId, lineNumber) {
+    if (!functionId || !Number.isFinite(lineNumber)) {
+      return;
+    }
+    const selector = '.code-line[data-function="' + escapeCss(functionId) + '"][data-line="' + lineNumber + '"]';
+    const lineNode = root.querySelector(selector);
+    if (!lineNode) {
+      return;
+    }
+    const existing = lineNode.querySelector('.var-peek');
+    if (existing) {
+      existing.remove();
+    }
+    const lineKey = makeLineKey(functionId, lineNumber);
+    const vars = state.lineVariableSnapshots.get(lineKey);
+    if (!Array.isArray(vars) || !vars.length) {
+      return;
+    }
+    const filePath = lineNode.getAttribute('data-file') || '';
+    const codeSnippet = lineNode.querySelector('.code-snippet');
+    const lineText = codeSnippet ? (codeSnippet.textContent || '') : '';
+    const html = renderInlineVarPeek({
+      functionId,
+      lineNumber,
+      vars,
+      file: filePath,
+      lineText,
     });
-    html += '</ol>';
-    html += '</section>';
-    return html;
+    const temp = document.createElement('div');
+    temp.innerHTML = html;
+    const node = temp.firstElementChild;
+    if (node) {
+      lineNode.insertBefore(node, lineNode.firstChild);
+    }
+  }
+
+  function updateInspectorDockPositionDom() {
+    const dock = root.querySelector('.projection-dock');
+    if (!dock) {
+      return;
+    }
+    const hasPosition = Boolean(
+      state.inspectorPosition &&
+      Number.isFinite(state.inspectorPosition.top) &&
+      Number.isFinite(state.inspectorPosition.left)
+    );
+    if (hasPosition) {
+      dock.style.top = state.inspectorPosition.top + 'px';
+      dock.style.left = state.inspectorPosition.left + 'px';
+      dock.style.right = 'auto';
+      dock.style.bottom = 'auto';
+      dock.classList.add('is-floating');
+    } else {
+      dock.style.top = '';
+      dock.style.left = '';
+      dock.style.right = '';
+      if (!state.inspectorSize) {
+        dock.style.bottom = '';
+      }
+      dock.classList.remove('is-floating');
+    }
+    updateInspectorDockSizeDom();
+  }
+
+  function updateInspectorDockSizeDom() {
+    const dock = root.querySelector('.projection-dock');
+    if (!dock) {
+      return;
+    }
+    const normalized = normalizeInspectorSize(state.inspectorSize);
+    if (state.inspectorSize && !normalized) {
+      state.inspectorSize = null;
+    } else if (normalized && state.inspectorSize) {
+      if (normalized.width !== state.inspectorSize.width || normalized.height !== state.inspectorSize.height) {
+        state.inspectorSize = normalized;
+      }
+    }
+
+    if (normalized) {
+      dock.style.width = normalized.width + 'px';
+      dock.style.height = normalized.height + 'px';
+      if (!state.inspectorPosition) {
+        dock.style.bottom = 'auto';
+      }
+    } else {
+      dock.style.width = '';
+      dock.style.height = '';
+      if (!state.inspectorPosition) {
+        dock.style.bottom = '';
+      }
+    }
+  }
+
+  function beginInspectorDrag(event) {
+    if (!state.projectionView) {
+      return;
+    }
+    const dock = root.querySelector('.projection-dock');
+    if (!dock) {
+      return;
+    }
+    const rect = dock.getBoundingClientRect();
+    inspectorDragState = {
+      pointerId: event.pointerId,
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top,
+      width: rect.width,
+      height: rect.height,
+    };
+    state.inspectorPosition = {
+      top: rect.top,
+      left: rect.left,
+    };
+    updateInspectorDockPositionDom();
+    dock.classList.add('is-dragging');
+    if (typeof dock.setPointerCapture === 'function') {
+      try {
+        dock.setPointerCapture(event.pointerId);
+      } catch (err) {
+        console.warn('[flowPanel] Failed to capture inspector pointer', err);
+      }
+    }
+    document.body.classList.add('is-dragging-inspector');
+    window.addEventListener('pointermove', handleInspectorDragMove);
+    window.addEventListener('pointerup', endInspectorDrag);
+    window.addEventListener('pointercancel', endInspectorDrag);
+    event.preventDefault();
+  }
+
+  function handleInspectorDragMove(event) {
+    if (!inspectorDragState || event.pointerId !== inspectorDragState.pointerId) {
+      return;
+    }
+    const margin = INSPECTOR_BOUNDARY_PADDING;
+    const maxLeft = Math.max(margin, window.innerWidth - inspectorDragState.width - margin);
+    const maxTop = Math.max(margin, window.innerHeight - inspectorDragState.height - margin);
+    const left = clampValue(event.clientX - inspectorDragState.offsetX, margin, maxLeft);
+    const top = clampValue(event.clientY - inspectorDragState.offsetY, margin, maxTop);
+    state.inspectorPosition = { top, left };
+    updateInspectorDockPositionDom();
+  }
+
+  function endInspectorDrag(event) {
+    if (!inspectorDragState) {
+      return;
+    }
+    if (event && event.pointerId !== inspectorDragState.pointerId) {
+      return;
+    }
+    const dock = root.querySelector('.projection-dock');
+    if (dock) {
+      dock.classList.remove('is-dragging');
+      if (typeof dock.releasePointerCapture === 'function') {
+        try {
+          dock.releasePointerCapture(inspectorDragState.pointerId);
+        } catch (err) {
+          // ignore
+        }
+      }
+    }
+    inspectorDragState = null;
+    document.body.classList.remove('is-dragging-inspector');
+    window.removeEventListener('pointermove', handleInspectorDragMove);
+    window.removeEventListener('pointerup', endInspectorDrag);
+    window.removeEventListener('pointercancel', endInspectorDrag);
+  }
+
+  function cancelInspectorDrag() {
+    if (!inspectorDragState) {
+      return;
+    }
+    endInspectorDrag({ pointerId: inspectorDragState.pointerId });
+  }
+
+  function beginInspectorResize(event, handleNode) {
+    if (!state.projectionView || event.button !== 0) {
+      return;
+    }
+    const dock = root.querySelector('.projection-dock');
+    if (!dock) {
+      return;
+    }
+    inspectorResizeState = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      width: dock.offsetWidth,
+      height: dock.offsetHeight,
+      captureTarget: handleNode && typeof handleNode.setPointerCapture === 'function' ? handleNode : dock,
+    };
+    dock.classList.add('is-resizing');
+    document.body.classList.add('is-resizing-inspector');
+    if (inspectorResizeState.captureTarget && typeof inspectorResizeState.captureTarget.setPointerCapture === 'function') {
+      try {
+        inspectorResizeState.captureTarget.setPointerCapture(event.pointerId);
+      } catch (err) {
+        console.warn('[flowPanel] Failed to capture inspector resize pointer', err);
+      }
+    }
+    window.addEventListener('pointermove', handleInspectorResizeMove);
+    window.addEventListener('pointerup', endInspectorResize);
+    window.addEventListener('pointercancel', endInspectorResize);
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  function handleInspectorResizeMove(event) {
+    if (!inspectorResizeState || event.pointerId !== inspectorResizeState.pointerId) {
+      return;
+    }
+    const deltaX = event.clientX - inspectorResizeState.startX;
+    const deltaY = event.clientY - inspectorResizeState.startY;
+    const nextSize = normalizeInspectorSize({
+      width: inspectorResizeState.width + deltaX,
+      height: inspectorResizeState.height + deltaY,
+    });
+    if (!nextSize) {
+      return;
+    }
+    state.inspectorSize = nextSize;
+    updateInspectorDockSizeDom();
+  }
+
+  function endInspectorResize(event) {
+    if (!inspectorResizeState || (event && event.pointerId !== inspectorResizeState.pointerId)) {
+      return;
+    }
+    const dock = root.querySelector('.projection-dock');
+    if (dock) {
+      dock.classList.remove('is-resizing');
+    }
+    document.body.classList.remove('is-resizing-inspector');
+    if (inspectorResizeState.captureTarget && typeof inspectorResizeState.captureTarget.releasePointerCapture === 'function') {
+      try {
+        inspectorResizeState.captureTarget.releasePointerCapture(inspectorResizeState.pointerId);
+      } catch (err) {
+        // ignore
+      }
+    }
+    window.removeEventListener('pointermove', handleInspectorResizeMove);
+    window.removeEventListener('pointerup', endInspectorResize);
+    window.removeEventListener('pointercancel', endInspectorResize);
+    inspectorResizeState = null;
+  }
+
+  function cancelInspectorResize() {
+    if (!inspectorResizeState) {
+      return;
+    }
+    endInspectorResize({ pointerId: inspectorResizeState.pointerId });
+  }
+
+  function handleInspectorViewportResize() {
+    if (!state.projectionView) {
+      return;
+    }
+    const dock = root.querySelector('.projection-dock');
+    if (!dock) {
+      return;
+    }
+
+    if (state.inspectorSize) {
+      const normalizedSize = normalizeInspectorSize(state.inspectorSize);
+      if (!normalizedSize) {
+        state.inspectorSize = null;
+        updateInspectorDockSizeDom();
+      } else if (
+        normalizedSize.width !== state.inspectorSize.width ||
+        normalizedSize.height !== state.inspectorSize.height
+      ) {
+        state.inspectorSize = normalizedSize;
+        updateInspectorDockSizeDom();
+      }
+    }
+
+    if (!state.inspectorPosition) {
+      return;
+    }
+
+    const previousWidth = inspectorDragState && inspectorDragState.width ? inspectorDragState.width : 0;
+    const previousHeight = inspectorDragState && inspectorDragState.height ? inspectorDragState.height : 0;
+    const width = dock.offsetWidth || previousWidth;
+    const height = dock.offsetHeight || previousHeight;
+    if (!width || !height) {
+      return;
+    }
+    const margin = INSPECTOR_BOUNDARY_PADDING;
+    const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+    const maxTop = Math.max(margin, window.innerHeight - height - margin);
+    const left = clampValue(state.inspectorPosition.left, margin, maxLeft);
+    const top = clampValue(state.inspectorPosition.top, margin, maxTop);
+    if (left !== state.inspectorPosition.left || top !== state.inspectorPosition.top) {
+      state.inspectorPosition = { top, left };
+      updateInspectorDockPositionDom();
+    }
+  }
+
+  function updateCallSiteSelectionDom(parentId, selectedIndex) {
+    if (!parentId) {
+      return;
+    }
+  const section = root.querySelector('.call-sites-section[data-call-sites-parent="' + escapeCss(parentId) + '"]');
+    if (!section) {
+      return;
+    }
+    const items = section.querySelectorAll('.call-site-item');
+    items.forEach(function(item, idx) {
+      if (!(item instanceof HTMLElement)) {
+        return;
+      }
+      item.classList.toggle('selected', idx === selectedIndex);
+    });
   }
 
   function renderProjectionPanel() {
@@ -1253,26 +2033,115 @@
       return '';
     }
 
+    const mode = state.inspectorViewMode || 'compact';
+    const collapsed = Boolean(state.inspectorCollapsed);
+    const lineKey = makeLineKey(projection.functionId, projection.line);
+    const pinnedValues = (() => {
+      const map = lineKey ? state.pinnedVariables.get(lineKey) : null;
+      return map ? Array.from(map.values()) : [];
+    })();
+
     const rows = projection.variables.length
       ? projection.variables.map(function(entry) {
-          return '<div class="projection-row">' +
-            '<span class="projection-cell projection-scope">' + escapeHtml(entry.scope) + '</span>' +
-            '<span class="projection-cell projection-name">' + escapeHtml(entry.name) + '</span>' +
-            '<code class="projection-cell projection-value tracer-var-value-' + entry.type + '">' + escapeHtml(entry.displayValue) + '</code>' +
-            '</div>';
+          const varAttrs = ' data-function="' + escapeAttribute(projection.functionId) + '" data-line="' + projection.line + '" data-var-name="' + escapeAttribute(entry.name) + '" data-var-scope="' + escapeAttribute(entry.scope) + '" data-source="inspector"';
+          const isPinned = isVariablePinned(projection.functionId, projection.line, entry.scope, entry.name);
+          const valueHtml = renderInspectorValueContent(entry.value, mode);
+          return '<div class="inspector-row' + (isPinned ? ' is-pinned' : '') + '">' +
+            '<div class="inspector-row-head">' +
+              '<div class="inspector-row-label">' +
+                '<span class="projection-scope">' + escapeHtml(entry.scope) + '</span>' +
+                '<span class="projection-name">' + escapeHtml(entry.name) + '</span>' +
+              '</div>' +
+              '<div class="inspector-row-actions">' +
+                '<button type="button" class="inspector-action-btn" data-action="pin-variable"' + varAttrs + ' aria-pressed="' + (isPinned ? 'true' : 'false') + '">' + (isPinned ? 'Unpin' : 'Pin') + '</button>' +
+                '<button type="button" class="inspector-action-btn" data-action="copy-variable"' + varAttrs + ' aria-label="Copy ' + escapeAttribute(entry.name) + '">Copy</button>' +
+              '</div>' +
+            '</div>' +
+            '<div class="inspector-row-body">' + valueHtml + '</div>' +
+          '</div>';
         }).join('')
       : '<div class="projection-empty">No variables captured for this line.</div>';
 
-    return '<section class="projection-dock" role="region" aria-label="Line values">' +
-      '<header class="projection-header">' +
-        '<div>' +
+    const pinnedSection = pinnedValues.length
+      ? '<div class="inspector-pinned">' +
+          '<div class="inspector-section-title">Pinned</div>' +
+          pinnedValues.map(function(entry) {
+            return '<div class="inspector-pinned-pill">' +
+              '<span class="inspector-pinned-name">' + escapeHtml(entry.name) + '</span>' +
+              '<span class="inspector-pinned-equals">=</span>' +
+              '<code class="inspector-pinned-value">' + escapeHtml(formatInlineValue(entry.value, 60)) + '</code>' +
+            '</div>';
+          }).join('') +
+        '</div>'
+      : '';
+
+    const viewModes = [
+      { key: 'compact', label: 'Compact view', icon: '≡' },
+      { key: 'expanded', label: 'Expanded view', icon: '↕' },
+      { key: 'structured', label: 'Structured view', icon: '{}' },
+    ];
+
+    const viewToggles = viewModes.map(function(modeEntry) {
+      const isActive = mode === modeEntry.key;
+      const ariaLabel = escapeAttribute(modeEntry.label + (isActive ? ' (selected)' : ''));
+      return '' +
+        '<button type="button" class="inspector-view-btn' + (isActive ? ' is-active' : '') + '" data-action="set-inspector-mode" data-mode="' + modeEntry.key + '" aria-label="' + ariaLabel + '" title="' + escapeAttribute(modeEntry.label) + '">' +
+          '<span class="inspector-view-icon" aria-hidden="true">' + escapeHtml(modeEntry.icon) + '</span>' +
+        '</button>';
+    }).join('');
+
+    const hasFloatingPosition = Boolean(
+      state.inspectorPosition &&
+      Number.isFinite(state.inspectorPosition.top) &&
+      Number.isFinite(state.inspectorPosition.left)
+    );
+    const dockSize = normalizeInspectorSize(state.inspectorSize);
+    if (dockSize && state.inspectorSize && (dockSize.width !== state.inspectorSize.width || dockSize.height !== state.inspectorSize.height)) {
+      state.inspectorSize = dockSize;
+    }
+    const dockClasses = ['projection-dock'];
+    if (collapsed) {
+      dockClasses.push('is-collapsed');
+    }
+    if (hasFloatingPosition) {
+      dockClasses.push('is-floating');
+    }
+    dockClasses.push('mode-' + mode);
+    const dockStyleParts = [];
+    if (hasFloatingPosition) {
+      dockStyleParts.push('top: ' + state.inspectorPosition.top + 'px');
+      dockStyleParts.push('left: ' + state.inspectorPosition.left + 'px');
+      dockStyleParts.push('right: auto');
+      dockStyleParts.push('bottom: auto');
+    }
+    if (dockSize) {
+      dockStyleParts.push('width: ' + dockSize.width + 'px');
+      dockStyleParts.push('height: ' + dockSize.height + 'px');
+      if (!hasFloatingPosition) {
+        dockStyleParts.push('bottom: auto');
+      }
+    }
+  const dockStyle = dockStyleParts.length ? ' style="' + dockStyleParts.join('; ') + '"' : '';
+
+    return '<section class="' + dockClasses.join(' ') + '" role="region" aria-label="Line inspector"' + dockStyle + '>' +
+      '<header class="projection-header" title="Drag to move the inspector">' +
+        '<div class="projection-info">' +
           '<div class="projection-title">' + escapeHtml(extractDisplayName(projection.functionId)) + '</div>' +
           '<div class="projection-subtitle">Line ' + projection.line + ' · ' + escapeHtml(projection.file || '') + '</div>' +
         '</div>' +
-        '<button type="button" class="projection-close" data-action="close-projection" aria-label="Close">×</button>' +
+        '<div class="projection-controls">' +
+          '<button type="button" class="projection-collapse" data-action="toggle-inspector-collapse" aria-expanded="' + (!collapsed) + '">' + (collapsed ? 'Expand' : 'Collapse') + '</button>' +
+          '<button type="button" class="projection-reset" data-action="reset-inspector-position"' + (hasFloatingPosition ? '' : ' disabled') + '>Dock</button>' +
+          '<div class="inspector-view-group" role="group" aria-label="Inspector view mode">' + viewToggles + '</div>' +
+          '<button type="button" class="projection-close" data-action="close-projection" aria-label="Close">×</button>' +
+        '</div>' +
       '</header>' +
-      '<pre class="projection-code"><code>' + escapeHtml(projection.code || '') + '</code></pre>' +
-      '<div class="projection-grid">' + rows + '</div>' +
+      '<div class="projection-body">' +
+        '<pre class="projection-code"><code>' + escapeHtml(projection.code || '') + '</code></pre>' +
+        pinnedSection +
+        '<div class="projection-grid">' + rows + '</div>' +
+      '</div>' +
+      '<div class="projection-resize-handle" role="separator" aria-label="Resize inspector" title="Drag to resize"></div>' +
     '</section>';
   }
 
@@ -1602,8 +2471,9 @@
     const loading = state.loadingCallSites.has(parentId);
     const selected = state.selectedCallSite.get(parentId);
     const isExpanded = state.expandedCallSites.has(parentId);
+    const pendingTrigger = state.pendingTraceTrigger;
 
-    let html = '<div class="call-sites-section">';
+  let html = '<div class="call-sites-section" data-call-sites-parent="' + escapeAttribute(parentId) + '">';
     html += '<button type="button" class="section-toggle" data-action="toggle-call-sites" data-parent-id="' + escapeAttribute(parentId) + '">';
     html += '<span class="chevron ' + (isExpanded ? 'open' : '') + '"></span>';
     
@@ -1635,14 +2505,24 @@
             : (status && status.state === 'success'
               ? 'Arguments captured'
               : '');
+          const isPendingCallSite = Boolean(
+            pendingTrigger &&
+            pendingTrigger.type === 'call-site' &&
+            pendingTrigger.parentId === parentId &&
+            pendingTrigger.index === index
+          );
+          const pendingClass = isPendingCallSite ? ' is-pending' : '';
           
-          html += '<div class="call-site-item ' + (isSelected ? 'selected' : '') + statusClass + '" data-call-site-index="' + index + '" data-action="select-call-site" data-parent-id="' + escapeAttribute(parentId) + '">';
+          html += '<div class="call-site-item ' + (isSelected ? 'selected' : '') + statusClass + pendingClass + '" data-call-site-index="' + index + '" data-action="select-call-site" data-parent-id="' + escapeAttribute(parentId) + '">';
           html += '<div class="call-site-header">';
           html += '<span class="call-site-file">' + escapeHtml(fileDisplay) + '</span>';
           html += '<span class="call-site-line">:' + callSite.line + '</span>';
           html += '<span class="call-site-function"> in ' + escapeHtml(callingFunctionName) + '()</span>';
           html += '</div>';
           html += '<div class="call-site-code">' + escapeHtml(callSite.call_line) + '</div>';
+          if (isPendingCallSite) {
+            html += '<div class="call-site-loading" role="status" aria-label="Executing"></div>';
+          }
           if (statusLabel) {
             html += '<div class="call-site-status call-site-status-' + status.state + '">' + statusLabel + '</div>';
           }
@@ -1700,6 +2580,9 @@
 
     const startLine = typeof fn.line === 'number' ? fn.line : (typeof fn.start_line === 'number' ? fn.start_line : 1);
     const lines = fn.body.split(/\r?\n/);
+    const normalisedFnFile = normalisePath(fn.file || '');
+    const lastTracerLocation = state.lastTracerLocation;
+    const pendingTrigger = state.pendingTraceTrigger;
     let html = '<div class="code-block" data-function="' + escapeAttribute(functionId) + '"' +
       (parentContext ? ' data-parent-function="' + escapeAttribute(parentContext.parentFunctionId) + '" data-parent-line="' + parentContext.parentLineNumber + '" data-call-line="' + parentContext.callLineInParent + '"' : '') +
       '>';
@@ -1712,7 +2595,6 @@
       
       // Find events for this line
       // Only match events that EXACTLY match this line number - no tolerance
-      const fnFile = fn.file || '';
       const lineEvents = state.tracerEvents ? state.tracerEvents.filter(function(e) {
         // CRITICAL: Line must match EXACTLY - no tolerance for adjacent lines
         // Check line first before doing any other checks
@@ -1723,11 +2605,10 @@
           return false; // Not this line - reject immediately
         }
         // If filename is specified in event, it must match the function's file
-        if (e.filename && fnFile) {
+        if (e.filename && normalisedFnFile) {
           const eFile = e.filename.replace(/\\/g, '/');
-          const targetFile = fnFile.replace(/\\/g, '/');
           // Match if files are the same or one ends with the other (for relative paths)
-          if (eFile !== targetFile && !targetFile.endsWith(eFile) && !eFile.endsWith(targetFile)) {
+          if (!filesRoughlyMatch(eFile, normalisedFnFile)) {
             return false;
           }
         }
@@ -1738,8 +2619,18 @@
       const regularEvents = lineEvents.filter(function(e) { return e.event !== 'error'; });
       const errorEvents = lineEvents.filter(function(e) { return e.event === 'error'; });
       
-      const isTracerLine = lineEvents.length > 0;
-      const lineClass = isTracerLine ? 'code-line tracer-active' : 'code-line';
+    const matchesByFunction = Boolean(lastTracerLocation && lastTracerLocation.functionId && lastTracerLocation.functionId === functionId);
+    const matchesByFile = Boolean(lastTracerLocation && !lastTracerLocation.functionId && lastTracerLocation.filename && normalisedFnFile && filesRoughlyMatch(lastTracerLocation.filename, normalisedFnFile));
+    const isLatestTracerLine = Boolean(lastTracerLocation) && lastTracerLocation.line === lineNumber && (matchesByFunction || matchesByFile);
+      const isPendingLine = Boolean(pendingTrigger && pendingTrigger.type === 'line' && pendingTrigger.functionId === functionId && pendingTrigger.line === lineNumber);
+      const lineClassList = ['code-line'];
+      if (isLatestTracerLine) {
+        lineClassList.push('tracer-active');
+      }
+      if (isPendingLine) {
+        lineClassList.push('is-pending');
+      }
+      const lineClass = lineClassList.join(' ');
       const callTargetValue = formatted.calls.length === 1 ? formatted.calls[0].targetId : '';
       const callTargetAttr = callTargetValue ? ' data-call-target="' + escapeAttribute(callTargetValue) + '"' : '';
       
@@ -1755,7 +2646,8 @@
 
       const wrapperAttrList = [
         'data-function="' + escapeAttribute(functionId) + '"',
-        'data-line="' + lineNumber + '"'
+        'data-line="' + lineNumber + '"',
+        'data-file="' + escapeAttribute(fn.file || '') + '"'
       ];
       if (callTargetValue) {
         wrapperAttrList.push('data-call-target="' + escapeAttribute(callTargetValue) + '"');
@@ -1763,43 +2655,41 @@
       const allLineAttrs = wrapperAttrList.concat(parentAttrList);
       const wrapperAttrs = allLineAttrs.length ? ' ' + allLineAttrs.join(' ') : '';
       
-      // Inline variable display (code-like execution view)
+      // Inline variable indicator & popover
       let inlineVarsHtml = '';
+      let hasInlineIndicator = false;
       if (regularEvents.length > 0 && !hasError) {
         const latestEvent = regularEvents[regularEvents.length - 1];
         const vars = pickVarsForLine(line, latestEvent.locals, latestEvent.globals);
+        rememberLineSnapshot(functionId, lineNumber, vars);
         if (vars && vars.length > 0) {
-          const visibleVars = vars.slice(0, INLINE_VAR_DISPLAY_LIMIT);
-          inlineVarsHtml = '<div class="tracer-inline-vars">';
-          visibleVars.forEach(function(v) {
-            const valueStr = formatInlineValue(v.value, 56);
-            const fullValue = formatValue(v.value);
-            const valueType = getValueType(v.value);
-            const tooltip = `${v.isGlobal ? 'global ' : ''}${v.key} = ${fullValue}`;
-            inlineVarsHtml += '<div class="tracer-var-pill" title="' + escapeAttribute(tooltip) + '">' +
-              (v.isGlobal ? '<span class="tracer-var-badge" title="Global value">GLOBAL</span>' : '') +
-              '<span class="tracer-var-name">' + escapeHtml(v.key) + '</span>' +
-              '<span class="tracer-var-equals">=</span>' +
-              '<code class="tracer-var-value tracer-var-value-' + valueType + '">' + escapeHtml(valueStr) + '</code>' +
-              '</div>';
+          inlineVarsHtml = renderInlineVarPeek({
+            functionId,
+            lineNumber,
+            vars,
+            file: fn.file || '',
+            lineText: line,
           });
-
-          if (vars.length > visibleVars.length) {
-            const hiddenPreview = vars.slice(visibleVars.length)
-              .map(function(v) { return `${v.key} = ${formatValue(v.value)}`; })
-              .join('\n');
-            inlineVarsHtml += '<span class="tracer-var-more" title="' + escapeAttribute(hiddenPreview) + '">+' + (vars.length - visibleVars.length) + ' more</span>';
-          }
-          inlineVarsHtml += '<button type="button" class="tracer-project-btn" data-action="open-projection" data-function="' + escapeAttribute(functionId) + '" data-file="' + escapeAttribute(fn.file || '') + '" data-line="' + lineNumber + '" data-code="' + escapeAttribute(line.trim()) + '">Projection view</button>';
-          inlineVarsHtml += '</div>';
+          hasInlineIndicator = true;
         }
+      } else {
+        rememberLineSnapshot(functionId, lineNumber, null);
       }
       
+      const traceDisabled = hasInlineIndicator || isLatestTracerLine;
+      const isButtonDisabled = traceDisabled || isPendingLine;
+      const lineNumberDisabled = isButtonDisabled ? ' disabled aria-disabled="true"' : '';
+      const lineNumberTitle = isPendingLine
+        ? 'Executing…'
+        : (traceDisabled ? 'Already executed' : 'Click to execute up to this line');
+
+      const inlineIndicatorHtml = inlineVarsHtml || '<span class="var-peek var-peek-empty" aria-hidden="true"></span>';
+
       html += '<div class="' + lineClass + '"' + wrapperAttrs + '>' +
-        '<button type="button" class="line-number" data-action="trace-line" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '"' + callTargetAttr + parentAttrs + ' title="Click to execute up to this line">' + lineNumber + '</button>' +
+        inlineIndicatorHtml +
+  '<button type="button" class="line-number" data-action="trace-line" data-function="' + escapeAttribute(functionId) + '" data-line="' + lineNumber + '"' + callTargetAttr + parentAttrs + lineNumberDisabled + ' title="' + lineNumberTitle + '">' + lineNumber + '</button>' +
         '<div class="code-snippet-wrapper">' +
         '<span class="code-snippet">' + codeHtml + '</span>' +
-        inlineVarsHtml +
         '</div>' +
         '</div>';
       
