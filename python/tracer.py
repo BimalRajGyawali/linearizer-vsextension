@@ -598,7 +598,25 @@ def extract_call_arguments_runtime(
         stop_file = ensure_abs_path(repo_root, parent_file) or abs_path
         dbg.target_file = stop_file
         dbg.pinned_target_file = True
-        dbg.run_function_once(fn, args_list, kwargs_dict)
+        # Coerce any ISO-like timestamp strings in the calling context into
+        # real datetime objects so downstream code (e.g. subtracting timestamps)
+        # behaves correctly. This avoids errors when example or extracted call
+        # arguments contain ISO date strings.
+        def coerce_timestamps(obj):
+            if isinstance(obj, str):
+                try:
+                    return datetime.fromisoformat(obj)
+                except Exception:
+                    return obj
+            if isinstance(obj, list):
+                return [coerce_timestamps(v) for v in obj]
+            if isinstance(obj, dict):
+                return {k: coerce_timestamps(v) for k, v in obj.items()}
+            return obj
+
+        coerced_args = coerce_timestamps(args_list)
+        coerced_kwargs = coerce_timestamps(kwargs_dict)
+        dbg.run_function_once(fn, coerced_args, coerced_kwargs)
         dbg.continue_until(call_line, effective_fn_name)
         if not dbg.wait_for_event(timeout=30.0):
             return {"error": f"Timed out executing {calling_entry_full_id} to line {call_line}"}
@@ -1232,6 +1250,23 @@ def main():
     dbg.repo_root = repo_root
     log(f"Created PersistentDebugger, target_file={abs_path}, flow={flow_name}")
     log(f"Starting function execution with args={args_list}, kwargs={kwargs_dict}")
+    # Coerce ISO-like timestamp strings in the provided args so the target
+    # function receives datetime objects when appropriate. This prevents
+    # binary-op errors like 'str' - 'str' when code expects datetimes.
+    def coerce_timestamps(obj):
+        if isinstance(obj, str):
+            try:
+                return datetime.fromisoformat(obj)
+            except Exception:
+                return obj
+        if isinstance(obj, list):
+            return [coerce_timestamps(v) for v in obj]
+        if isinstance(obj, dict):
+            return {k: coerce_timestamps(v) for k, v in obj.items()}
+        return obj
+
+    args_list = coerce_timestamps(args_list)
+    kwargs_dict = coerce_timestamps(kwargs_dict)
     dbg.run_function_once(fn, args_list, kwargs_dict)
 
     def emit_error(message: str, trace: Optional[str] = None, target_label: Optional[str] = None):

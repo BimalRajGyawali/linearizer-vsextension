@@ -1,7 +1,14 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { spawn, ChildProcess } from 'node:child_process';
-import { FlowTraceRequest, FlowTraceRequestOptions, TracerEvent, ExecutionContext, NormalisedCallArgs } from '../types';
+import {
+  FlowTraceRequest,
+  FlowTraceRequestOptions,
+  TracerEvent,
+  ExecutionContext,
+  NormalisedCallArgs,
+  LinearFlowEvent,
+} from '../types';
 import { clearStoredCallArgs } from '../utils/callArgs';
 import { extractDisplayNameFromId } from '../utils/identifiers';
 
@@ -9,6 +16,173 @@ let tracerOutputChannel: vscode.OutputChannel | undefined;
 const tracerManagers = new Map<string, TracerManager>();
 export const lastExecutedLineByContext = new Map<string, number>();
 export const parentExecutionContextCache = new Map<string, ExecutionContext>();
+const flowProgressByArgs = new Map<string, FlowProgressEntry>();
+
+interface CachedLineEvent {
+  event: TracerEvent;
+  linearIndex?: number;
+}
+
+interface FlowProgressEntry {
+  lastServedIndex: number;
+  eventsByFile: Map<string, Map<number, CachedLineEvent>>;
+  lastEvent?: TracerEvent;
+}
+
+function cloneTracerEvent(event: TracerEvent): TracerEvent {
+  return JSON.parse(JSON.stringify(event)) as TracerEvent;
+}
+
+function normaliseRepoPath(repoRoot: string, filePath?: string): string | undefined {
+  if (!filePath) {
+    return undefined;
+  }
+  const normalisedRoot = repoRoot.replace(/\\/g, '/');
+  let candidate = filePath.replace(/\\/g, '/');
+  if (candidate.startsWith(normalisedRoot)) {
+    candidate = candidate.slice(normalisedRoot.length);
+  }
+  if (candidate.startsWith('/')) {
+    candidate = candidate.slice(1);
+  }
+  if (!candidate) {
+    return undefined;
+  }
+  return candidate;
+}
+
+function ensureFlowProgressEntry(argsKey: string): FlowProgressEntry {
+  let entry = flowProgressByArgs.get(argsKey);
+  if (!entry) {
+    entry = {
+      lastServedIndex: -1,
+      eventsByFile: new Map(),
+    };
+    flowProgressByArgs.set(argsKey, entry);
+  }
+  return entry;
+}
+
+function convertLinearEventToTracerEvent(linearEvent: LinearFlowEvent, template: TracerEvent): TracerEvent {
+  return {
+    event: linearEvent.event ?? 'line',
+    filename: linearEvent.file ?? template.filename,
+    function: linearEvent.function ?? template.function,
+    line: linearEvent.line,
+    locals: linearEvent.locals,
+    globals: linearEvent.globals,
+    flow: template.flow,
+    entry_full_id: template.entry_full_id,
+    args_key: template.args_key,
+    target_location: template.target_location,
+    requested_line: template.requested_line,
+    requested_function: template.requested_function,
+    linear_index: linearEvent.linear_index,
+  };
+}
+
+function storeCachedEvent(
+  entry: FlowProgressEntry,
+  fileKey: string,
+  line: number,
+  cached: CachedLineEvent,
+): void {
+  if (!fileKey || !Number.isFinite(line)) {
+    return;
+  }
+  let fileMap = entry.eventsByFile.get(fileKey);
+  if (!fileMap) {
+    fileMap = new Map();
+    entry.eventsByFile.set(fileKey, fileMap);
+  }
+  const existing = fileMap.get(line);
+  if (!existing || ((cached.linearIndex ?? -1) >= (existing.linearIndex ?? -1))) {
+    fileMap.set(line, cached);
+  }
+}
+
+export function recordFlowProgress(repoRoot: string, argsKey: string, tracerEvent: TracerEvent): void {
+  if (!argsKey) {
+    return;
+  }
+  const entry = ensureFlowProgressEntry(argsKey);
+  const sanitized = cloneTracerEvent(tracerEvent);
+  delete (sanitized as { events?: LinearFlowEvent[] }).events;
+  entry.lastEvent = sanitized;
+  if (typeof tracerEvent.last_served_index === 'number') {
+    entry.lastServedIndex = Math.max(entry.lastServedIndex, tracerEvent.last_served_index);
+  } else if (typeof tracerEvent.linear_index === 'number') {
+    entry.lastServedIndex = Math.max(entry.lastServedIndex, tracerEvent.linear_index);
+  }
+
+  const events = Array.isArray(tracerEvent.events) ? tracerEvent.events : [];
+  if (events.length === 0 && typeof tracerEvent.line === 'number') {
+    const fallbackEvent: LinearFlowEvent = {
+      flow: tracerEvent.flow ?? '',
+      entry_full_id: tracerEvent.entry_full_id ?? '',
+      args_key: tracerEvent.args_key ?? '',
+      linear_index: tracerEvent.linear_index ?? entry.lastServedIndex,
+      function: tracerEvent.function,
+      line: tracerEvent.line,
+      file: tracerEvent.filename,
+      locals: tracerEvent.locals,
+      globals: tracerEvent.globals,
+      event: tracerEvent.event,
+    };
+    events.push(fallbackEvent);
+  }
+
+  for (const flowEvent of events) {
+    if (typeof flowEvent.line !== 'number') {
+      continue;
+    }
+    const converted = convertLinearEventToTracerEvent(flowEvent, tracerEvent);
+    const fileKey = normaliseRepoPath(repoRoot, converted.filename ?? flowEvent.file);
+    if (!fileKey) {
+      continue;
+    }
+    storeCachedEvent(entry, fileKey, flowEvent.line, {
+      event: converted,
+      linearIndex: flowEvent.linear_index,
+    });
+  }
+}
+
+export function getCachedLineEvent(
+  repoRoot: string,
+  argsKey: string,
+  filePath: string | undefined,
+  line: number,
+): TracerEvent | undefined {
+  if (!argsKey || !filePath || !Number.isFinite(line)) {
+    return undefined;
+  }
+  const entry = flowProgressByArgs.get(argsKey);
+  if (!entry) {
+    return undefined;
+  }
+  const fileKey = normaliseRepoPath(repoRoot, filePath);
+  if (!fileKey) {
+    return undefined;
+  }
+  const cached = entry.eventsByFile.get(fileKey)?.get(line);
+  if (!cached) {
+    return undefined;
+  }
+  return cloneTracerEvent(cached.event);
+}
+
+function clearFlowProgressForFunction(functionId: string): void {
+  if (!functionId) {
+    return;
+  }
+  const normalized = functionId.startsWith('/') ? functionId.slice(1) : functionId;
+  for (const key of Array.from(flowProgressByArgs.keys())) {
+    if (key.startsWith(`${normalized}::`) || key.startsWith(`/${normalized}::`)) {
+      flowProgressByArgs.delete(key);
+    }
+  }
+}
 
 function ensureTracerOutputChannel(context: vscode.ExtensionContext): vscode.OutputChannel {
   if (!tracerOutputChannel) {
@@ -34,6 +208,7 @@ export function stopAllTracers(): void {
   tracerManagers.clear();
   lastExecutedLineByContext.clear();
   parentExecutionContextCache.clear();
+  flowProgressByArgs.clear();
 }
 
 export function clearTracingForFunction(functionId: string): void {
@@ -59,6 +234,9 @@ export function clearTracingForFunction(functionId: string): void {
       parentExecutionContextCache.delete(cacheKey);
     }
   }
+
+  clearFlowProgressForFunction(normalizedId);
+  clearFlowProgressForFunction(withSlash);
 
   clearStoredCallArgs(functionId);
 }

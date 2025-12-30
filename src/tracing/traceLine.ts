@@ -7,6 +7,7 @@ import {
   TraceCallArgs,
   FunctionSignatureInfo,
   ExecutionContext,
+  TracerEvent,
 } from '../types';
 import {
   DEFAULT_PARENT_CALL_ARGS,
@@ -35,6 +36,8 @@ import {
   parentExecutionContextCache,
   getCacheKey,
   lastExecutedLineByContext,
+  getCachedLineEvent,
+  recordFlowProgress,
 } from './tracingService';
 import { getRepoRoot, getFlowPanel } from '../state/runtime';
 
@@ -76,7 +79,12 @@ export async function handleTraceLine(
   const pythonPath = await getPythonPath();
   const entryFullId = functionId.startsWith('/') ? functionId.slice(1) : functionId;
   const functionName = getFunctionNameForDebugger(functionId);
-  const executionLine = Number.isFinite(stopLine) ? stopLine : displayLine + 1;
+  // Use the displayed (1-based) line as the execution target. The UI sends the
+  // clicked line as `displayLine`; earlier behaviour used displayLine+1 which
+  // could cause off-by-one or unexpected continuation. To ensure we stop
+  // exactly at the clicked line, prefer displayLine unless an explicit
+  // stopLine is provided and differs.
+  const executionLine = Number.isFinite(stopLine) && stopLine !== displayLine ? stopLine : displayLine;
   const traceRequest = buildFlowTraceRequest({
     entryFullId,
     line: executionLine,
@@ -287,6 +295,22 @@ export async function handleTraceLine(
       setStoredCallArgs(functionId, resolvedArgs);
     }
 
+    const argsKey = getArgsContextKey(entryFullId, resolvedArgs);
+    const cachedEvent = getCachedLineEvent(repoRoot, argsKey, functionBody.file, displayLine);
+    if (cachedEvent) {
+      const cachedPayload: TracerEvent = {
+        ...cachedEvent,
+        line: displayLine,
+        filename: cachedEvent.filename ?? functionBody.file,
+      };
+      flowPanel?.webview.postMessage({
+        type: 'tracer-event',
+        event: cachedPayload,
+      });
+      vscode.window.showInformationMessage(`Tracer reused cached state at line ${displayLine} in ${functionId}`);
+      return;
+    }
+
     const argsJson = JSON.stringify(resolvedArgs);
     if (parentTraceDetails && !callArgs) {
       const nestedFunctionName = getFunctionNameForDebugger(functionId);
@@ -326,9 +350,9 @@ export async function handleTraceLine(
         });
 
         const nestedEntryFullId = functionId.startsWith('/') ? functionId.slice(1) : functionId;
-        const argsKey = getArgsContextKey(nestedEntryFullId, resolvedArgs);
         const prevExecutedLine = lastExecutedLineByContext.get(argsKey) ?? 0;
         lastExecutedLineByContext.set(argsKey, Math.max(prevExecutedLine, executionLine));
+        recordFlowProgress(repoRoot, argsKey, event);
 
         flowPanel?.webview.postMessage({
           type: 'tracer-event',
@@ -387,9 +411,9 @@ export async function handleTraceLine(
         file: functionBody.file,
       });
 
-      const argsKey = getArgsContextKey(entryFullId, resolvedArgs);
       const prevExecutedLine = lastExecutedLineByContext.get(argsKey) ?? 0;
       lastExecutedLineByContext.set(argsKey, Math.max(prevExecutedLine, executionLine));
+      recordFlowProgress(repoRoot, argsKey, event);
 
       flowPanel?.webview.postMessage({
         type: 'tracer-event',
