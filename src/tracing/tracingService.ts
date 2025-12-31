@@ -564,6 +564,7 @@ export class TracerManager {
     suppressWebview = false,
     traceRequest?: FlowTraceRequest,
     contextSuffix?: string,
+    forceExecute = false,
   ): Promise<TracerEvent> {
     const fallbackFunction = traceRequest?.functionName ?? extractDisplayNameFromId(entryFullId, entryFullId);
     const fallbackLine = traceRequest?.line ?? Math.max(1, Math.floor(displayLine + 1));
@@ -589,17 +590,23 @@ export class TracerManager {
     this.pendingContextKey = contextKey;
     this.pendingTraceRequest = resolvedRequest;
 
-    const cachedEvent = this.getCachedEvent(contextKey, resolvedRequest.location, displayLine, displayFile);
-    if (cachedEvent) {
+    if (!forceExecute) {
+      const cachedEvent = this.getCachedEvent(contextKey, resolvedRequest.location, displayLine, displayFile);
+      if (cachedEvent) {
+        this.outputChannel.appendLine(
+          `[Rust-like] Using cached tracer result for location=${resolvedRequest.location}`,
+        );
+        this.lastEvent = cachedEvent;
+        this.lastContextKey = contextKey;
+        this.lastLocationKey = resolvedRequest.location;
+        this.lastTraceRequest = resolvedRequest;
+        this.clearPendingDisplay();
+        return cachedEvent;
+      }
+    } else {
       this.outputChannel.appendLine(
-        `[Rust-like] Using cached tracer result for location=${resolvedRequest.location}`,
+        `[Rust-like] Bypassing cache for location=${resolvedRequest.location} (force execute)`,
       );
-      this.lastEvent = cachedEvent;
-      this.lastContextKey = contextKey;
-      this.lastLocationKey = resolvedRequest.location;
-      this.lastTraceRequest = resolvedRequest;
-      this.clearPendingDisplay();
-      return cachedEvent;
     }
 
     if (firstTime) {

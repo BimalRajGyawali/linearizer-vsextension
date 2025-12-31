@@ -40,6 +40,7 @@ import {
   recordFlowProgress,
 } from './tracingService';
 import { getRepoRoot, getFlowPanel } from '../state/runtime';
+import { getFlowRootForFunction } from '../state/runtime';
 
 function resolveAbsolutePath(repoRoot: string, filePath: string): string {
   if (path.isAbsolute(filePath)) {
@@ -79,6 +80,9 @@ export async function handleTraceLine(
   const pythonPath = await getPythonPath();
   const entryFullId = functionId.startsWith('/') ? functionId.slice(1) : functionId;
   const functionName = getFunctionNameForDebugger(functionId);
+  // Determine the flow root (entrypoint) for this function so we use a single tracer per flow
+  const flowRoot = getFlowRootForFunction(functionId);
+  const rootEntryFullId = flowRoot ? (flowRoot.startsWith('/') ? flowRoot.slice(1) : flowRoot) : entryFullId;
   // Use the displayed (1-based) line as the execution target. The UI sends the
   // clicked line as `displayLine`; earlier behaviour used displayLine+1 which
   // could cause off-by-one or unexpected continuation. To ensure we stop
@@ -95,12 +99,18 @@ export async function handleTraceLine(
 
   const flowPanel = getFlowPanel();
   const storedArgs = getStoredCallArgs(functionId);
-  let resolvedArgs = callArgs
-    ? normaliseCallArgs(callArgs)
-    : storedArgs
-      ? cloneCallArgs(storedArgs)
-      : cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+  let resolvedArgs: NormalisedCallArgs;
+  let shouldPersistResolvedArgs = false;
+  if (callArgs) {
+    resolvedArgs = normaliseCallArgs(callArgs);
+    shouldPersistResolvedArgs = true;
+  } else if (storedArgs) {
+    resolvedArgs = cloneCallArgs(storedArgs);
+  } else {
+    resolvedArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+  }
   let hasExtractedArgs = false;
+  let allowCachingForArgs = true;
 
   async function traceParentFunction(
     parentId: string,
@@ -118,7 +128,9 @@ export async function handleTraceLine(
       throw new Error(`Parent function ${parentId} not found`);
     }
 
-    const parentEntryFullId = parentId.startsWith('/') ? parentId.slice(1) : parentId;
+  const parentEntryFullId = parentId.startsWith('/') ? parentId.slice(1) : parentId;
+  const parentFlowRoot = getFlowRootForFunction(parentId);
+  const parentRootEntryFullId = parentFlowRoot ? (parentFlowRoot.startsWith('/') ? parentFlowRoot.slice(1) : parentFlowRoot) : parentEntryFullId;
     const parentSignature = await getFunctionSignature(pythonPath, repoRoot, parentEntryFullId, context.extensionPath);
     const requiredParentParams = getRequiredParameterNames(parentSignature);
     const hasRequiredParams = requiredParentParams.length > 0;
@@ -182,18 +194,18 @@ export async function handleTraceLine(
     const parentTracer = getOrCreateTracerManager(
       context,
       repoRoot,
-      parentEntryFullId,
+      parentRootEntryFullId,
       parentArgsJson,
       flowPanel?.webview,
     );
 
     const parentFunctionName = getFunctionNameForDebugger(parentEntryFullId);
     const parentRequest = buildFlowTraceRequest({
-      entryFullId: parentEntryFullId,
+      entryFullId: parentRootEntryFullId,
       line: callLine,
       functionName: parentFunctionName,
       filePath: resolveAbsolutePath(repoRoot, parentBody.file),
-      flowName: parentEntryFullId,
+      flowName: parentRootEntryFullId,
     });
 
     parentTracer.setSuppressWebviewEvents(true);
@@ -209,6 +221,7 @@ export async function handleTraceLine(
       true,
       parentRequest,
       `parent::${parentEntryFullId}::line:${callLine}`,
+      true,
     );
 
     if (parentEvent.event === 'error') {
@@ -222,7 +235,7 @@ export async function handleTraceLine(
     };
 
     parentExecutionContextCache.set(cacheKey, executionContext);
-    const parentArgsKey = getArgsContextKey(parentEntryFullId, finalParentArgs);
+  const parentArgsKey = getArgsContextKey(parentRootEntryFullId, finalParentArgs);
     const prevLine = lastExecutedLineByContext.get(parentArgsKey) ?? 0;
     lastExecutedLineByContext.set(parentArgsKey, Math.max(prevLine, callLine));
     parentTracer.setSuppressWebviewEvents(false);
@@ -231,7 +244,7 @@ export async function handleTraceLine(
       tracer: parentTracer,
       args: finalParentArgs,
       argsJson: parentArgsJson,
-      entryFullId: parentEntryFullId,
+      entryFullId: parentRootEntryFullId,
       body: parentBody,
       context: executionContext,
     };
@@ -261,15 +274,24 @@ export async function handleTraceLine(
       if (extractedArgs && !('error' in extractedArgs)) {
         resolvedArgs = normaliseCallArgs(extractedArgs);
         hasExtractedArgs = true;
+        shouldPersistResolvedArgs = true;
+        allowCachingForArgs = true;
       } else {
         const errorMsg = extractedArgs && 'error' in extractedArgs ? extractedArgs.error : 'Failed to extract call arguments';
-        vscode.window.showErrorMessage(`Error extracting arguments from parent function: ${errorMsg}`);
-        return;
+        vscode.window.showWarningMessage(
+          `Warning: Could not extract fresh arguments from parent function (${errorMsg}). Continuing with recorded execution state instead.`,
+        );
+        resolvedArgs = cloneCallArgs(DEFAULT_PARENT_CALL_ARGS);
+        hasExtractedArgs = true;
+        shouldPersistResolvedArgs = false;
+        allowCachingForArgs = false;
       }
     }
 
     if (callArgs || hasExtractedArgs) {
-      setStoredCallArgs(functionId, resolvedArgs);
+      if (shouldPersistResolvedArgs) {
+        setStoredCallArgs(functionId, resolvedArgs);
+      }
     } else {
       if (parentContext) {
         vscode.window.showErrorMessage(
@@ -295,8 +317,12 @@ export async function handleTraceLine(
       setStoredCallArgs(functionId, resolvedArgs);
     }
 
-    const argsKey = getArgsContextKey(entryFullId, resolvedArgs);
-    const cachedEvent = getCachedLineEvent(repoRoot, argsKey, functionBody.file, displayLine);
+  // Prefer stored args for the flow root when available so we resume the same flow execution
+  // that was previously executed. Fall back to the resolved args for this function.
+  const rootStoredArgs = getStoredCallArgs(rootEntryFullId);
+  const rootArgsToUse = rootStoredArgs ?? resolvedArgs;
+  const argsKey = allowCachingForArgs ? getArgsContextKey(rootEntryFullId, rootArgsToUse) : '';
+  const cachedEvent = getCachedLineEvent(repoRoot, argsKey, functionBody.file, displayLine);
     if (cachedEvent) {
       const cachedPayload: TracerEvent = {
         ...cachedEvent,
@@ -311,7 +337,7 @@ export async function handleTraceLine(
       return;
     }
 
-    const argsJson = JSON.stringify(resolvedArgs);
+  const argsJson = JSON.stringify(rootArgsToUse);
     if (parentTraceDetails && !callArgs) {
       const nestedFunctionName = getFunctionNameForDebugger(functionId);
       const nestedRequest = buildFlowTraceRequest({
@@ -335,6 +361,7 @@ export async function handleTraceLine(
           false,
           nestedRequest,
           `nested::${parentTraceDetails.entryFullId}::${functionId}`,
+          true,
         );
 
         if (event.event === 'error') {
@@ -350,8 +377,10 @@ export async function handleTraceLine(
         });
 
         const nestedEntryFullId = functionId.startsWith('/') ? functionId.slice(1) : functionId;
-        const prevExecutedLine = lastExecutedLineByContext.get(argsKey) ?? 0;
-        lastExecutedLineByContext.set(argsKey, Math.max(prevExecutedLine, executionLine));
+        if (argsKey) {
+          const prevExecutedLine = lastExecutedLineByContext.get(argsKey) ?? 0;
+          lastExecutedLineByContext.set(argsKey, Math.max(prevExecutedLine, executionLine));
+        }
         recordFlowProgress(repoRoot, argsKey, event);
 
         flowPanel?.webview.postMessage({
@@ -380,7 +409,7 @@ export async function handleTraceLine(
     const tracerManager = getOrCreateTracerManager(
       context,
       repoRoot,
-      entryFullId,
+      rootEntryFullId,
       argsJson,
       flowPanel?.webview,
     );
@@ -411,8 +440,10 @@ export async function handleTraceLine(
         file: functionBody.file,
       });
 
-      const prevExecutedLine = lastExecutedLineByContext.get(argsKey) ?? 0;
-      lastExecutedLineByContext.set(argsKey, Math.max(prevExecutedLine, executionLine));
+      if (argsKey) {
+        const prevExecutedLine = lastExecutedLineByContext.get(argsKey) ?? 0;
+        lastExecutedLineByContext.set(argsKey, Math.max(prevExecutedLine, executionLine));
+      }
       recordFlowProgress(repoRoot, argsKey, event);
 
       flowPanel?.webview.postMessage({

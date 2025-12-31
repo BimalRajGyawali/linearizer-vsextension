@@ -28,6 +28,7 @@ import {
   getFlowPanelDisposable,
   setFlowPanelDisposable,
   resetRuntimeState,
+  setFlowEntries,
   getRepoRoot,
 } from '../state/runtime';
 import {
@@ -52,6 +53,8 @@ export async function showFlowPanel(
   setRepoRoot(repoRoot);
   const hydratedFunctionBodies = await hydrateFunctionBodies(functionBodies);
   setFunctionBodies(hydratedFunctionBodies);
+  // Register flow entries so the runtime knows which entrypoint (root) a function belongs to
+  setFlowEntries(flows);
 
   let panel = getFlowPanel();
   if (!panel) {
@@ -451,6 +454,7 @@ async function executeFromCallSite(
           false,
           callSiteRequest,
           callingParentId,
+          true,
         );
 
         console.log('Call site execution event:', callSiteEvent);
